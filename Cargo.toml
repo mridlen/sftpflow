@@ -5,3 +5,7 @@ edition = "2024"
 
 [dependencies]
 rustyline = "15"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+log = "0.4"
+env_logger = "0.11"

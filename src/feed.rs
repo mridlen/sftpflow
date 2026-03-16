@@ -1,0 +1,458 @@
+// ============================================================
+// feed.rs - Data models and YAML persistence
+// ============================================================
+
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::PathBuf;
+
+use log::info;
+
+// ============================================================
+// Endpoint - connection details
+// ============================================================
+
+/// Supported transfer protocols.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum Protocol {
+    Sftp,
+    Ftp,
+    Http,
+    Https,
+}
+
+impl Default for Protocol {
+    fn default() -> Self {
+        Protocol::Sftp
+    }
+}
+
+impl std::fmt::Display for Protocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Protocol::Sftp  => write!(f, "sftp"),
+            Protocol::Ftp   => write!(f, "ftp"),
+            Protocol::Http  => write!(f, "http"),
+            Protocol::Https => write!(f, "https"),
+        }
+    }
+}
+
+/// An endpoint with connection credentials.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Endpoint {
+    #[serde(default)]
+    pub protocol: Protocol,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_key: Option<String>,
+}
+
+impl Endpoint {
+    pub fn new() -> Self {
+        Endpoint::default()
+    }
+
+    /// Pretty-print the endpoint configuration.
+    pub fn display(&self, name: &str) {
+        println!("Endpoint: {}", name);
+        println!("  protocol    {}", self.protocol);
+        println!("  host        {}", self.host.as_deref().unwrap_or("(not set)"));
+        println!("  port        {}", self.port.map_or("(not set)".to_string(), |p| p.to_string()));
+        println!("  username    {}", self.username.as_deref().unwrap_or("(not set)"));
+        // Mask password in display
+        println!("  password    {}", if self.password.is_some() { "********" } else { "(not set)" });
+        println!("  ssh_key     {}", self.ssh_key.as_deref().unwrap_or("(not set)"));
+    }
+}
+
+// ============================================================
+// PGP Key - key management
+// ============================================================
+
+/// The type of PGP key (public for encrypt, private for decrypt).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum KeyType {
+    Public,
+    Private,
+}
+
+impl std::fmt::Display for KeyType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KeyType::Public  => write!(f, "public"),
+            KeyType::Private => write!(f, "private"),
+        }
+    }
+}
+
+/// A PGP key with its contents stored in the config.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PgpKey {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_type: Option<KeyType>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contents: Option<String>,
+}
+
+impl PgpKey {
+    pub fn new() -> Self {
+        PgpKey::default()
+    }
+
+    /// Pretty-print the key configuration.
+    pub fn display(&self, name: &str) {
+        println!("Key: {}", name);
+        println!("  type        {}",
+            self.key_type.as_ref().map_or("(not set)".to_string(), |t| t.to_string()));
+        match &self.contents {
+            Some(c) => {
+                // Show first line and length as a summary
+                let first_line = c.lines().next().unwrap_or("(empty)");
+                let line_count = c.lines().count();
+                println!("  contents    {} ({} lines)", first_line, line_count);
+            }
+            None => println!("  contents    (not set)"),
+        }
+    }
+}
+
+// ============================================================
+// Feed - transfer definition referencing endpoints
+// ============================================================
+
+/// A source or destination: an endpoint name + remote path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeedPath {
+    pub endpoint: String,
+    pub path: String,
+}
+
+impl std::fmt::Display for FeedPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.endpoint, self.path)
+    }
+}
+
+/// Helper module for serializing bools as "yes"/"no" strings in YAML.
+mod yes_no {
+    use serde::{self, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &bool, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(if *value { "yes" } else { "no" })
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<bool, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_lowercase().as_str() {
+            "yes" | "true" | "on"  => Ok(true),
+            "no" | "false" | "off" => Ok(false),
+            _ => Err(serde::de::Error::custom(format!("expected yes/no, got '{}'", s))),
+        }
+    }
+}
+
+/// Boolean flags that control feed behavior.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeedFlags {
+    #[serde(with = "yes_no")]
+    pub enabled: bool,
+    #[serde(with = "yes_no")]
+    pub delete_source_after_transfer: bool,
+}
+
+impl Default for FeedFlags {
+    fn default() -> Self {
+        FeedFlags {
+            enabled: true,
+            delete_source_after_transfer: false,
+        }
+    }
+}
+
+impl FeedFlags {
+    /// Pretty-print the flags.
+    pub fn display(&self) {
+        println!("  flags");
+        println!("    enabled                      {}",
+            if self.enabled { "yes" } else { "no" });
+        println!("    delete_source_after_transfer  {}",
+            if self.delete_source_after_transfer { "yes" } else { "no" });
+    }
+}
+
+// ============================================================
+// Process steps - ordered pipeline between source and destination
+// ============================================================
+
+/// A processing step that runs between source retrieval and destination delivery.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "action")]
+pub enum ProcessStep {
+    /// Encrypt files using a PGP public key.
+    #[serde(rename = "encrypt")]
+    Encrypt { key: String },
+    /// Decrypt files using a PGP private key.
+    #[serde(rename = "decrypt")]
+    Decrypt { key: String },
+}
+
+impl std::fmt::Display for ProcessStep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProcessStep::Encrypt { key } => write!(f, "encrypt key:{}", key),
+            ProcessStep::Decrypt { key } => write!(f, "decrypt key:{}", key),
+        }
+    }
+}
+
+// ============================================================
+// Next steps - actions triggered after feed completion
+// ============================================================
+
+/// Conditions that trigger a next step.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[serde(rename_all = "lowercase")]
+pub enum TriggerCondition {
+    Success,
+    Noaction,
+    Failed,
+}
+
+impl std::fmt::Display for TriggerCondition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TriggerCondition::Success  => write!(f, "success"),
+            TriggerCondition::Noaction => write!(f, "noaction"),
+            TriggerCondition::Failed   => write!(f, "failed"),
+        }
+    }
+}
+
+/// The action type for a next step.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "action")]
+pub enum NextStepAction {
+    /// Run another feed.
+    #[serde(rename = "feed")]
+    RunFeed { feed: String },
+    /// Send an email notification.
+    #[serde(rename = "email")]
+    SendEmail { emails: Vec<String> },
+    /// Sleep for a number of seconds before continuing.
+    #[serde(rename = "sleep")]
+    Sleep { seconds: u64 },
+}
+
+impl std::fmt::Display for NextStepAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NextStepAction::RunFeed { feed } => write!(f, "run feed '{}'", feed),
+            NextStepAction::SendEmail { emails } => write!(f, "email {}", emails.join(",")),
+            NextStepAction::Sleep { seconds } => write!(f, "sleep {}s", seconds),
+        }
+    }
+}
+
+/// A next step: an action + the conditions that trigger it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NextStep {
+    #[serde(flatten)]
+    pub action: NextStepAction,
+    pub on: Vec<TriggerCondition>,
+}
+
+impl NextStep {
+    /// Pretty-print the next step.
+    pub fn display_inline(&self) -> String {
+        let conditions: Vec<String> = self.on.iter().map(|c| c.to_string()).collect();
+        format!("{} on: {}", self.action, conditions.join(", "))
+    }
+}
+
+/// A feed definition (many sources → many destinations, multiple schedules).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Feed {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<FeedPath>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub process: Vec<ProcessStep>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub destinations: Vec<FeedPath>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nextsteps: Vec<NextStep>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub schedules: Vec<String>,
+    #[serde(default)]
+    pub flags: FeedFlags,
+}
+
+impl Feed {
+    pub fn new() -> Self {
+        Feed::default()
+    }
+
+    /// Pretty-print the feed configuration.
+    pub fn display(&self, name: &str) {
+        println!("Feed: {}", name);
+
+        // Sources
+        if self.sources.is_empty() {
+            println!("  sources       (none)");
+        } else {
+            for (i, src) in self.sources.iter().enumerate() {
+                if i == 0 {
+                    println!("  sources       {}", src);
+                } else {
+                    println!("                {}", src);
+                }
+            }
+        }
+
+        // Process pipeline
+        if self.process.is_empty() {
+            println!("  process       (none)");
+        } else {
+            for (i, step) in self.process.iter().enumerate() {
+                if i == 0 {
+                    println!("  process       {}", step);
+                } else {
+                    println!("                {}", step);
+                }
+            }
+        }
+
+        // Destinations
+        if self.destinations.is_empty() {
+            println!("  destinations  (none)");
+        } else {
+            for (i, dst) in self.destinations.iter().enumerate() {
+                if i == 0 {
+                    println!("  destinations  {}", dst);
+                } else {
+                    println!("                {}", dst);
+                }
+            }
+        }
+
+        // Next steps
+        if self.nextsteps.is_empty() {
+            println!("  nextsteps     (none)");
+        } else {
+            for (i, ns) in self.nextsteps.iter().enumerate() {
+                if i == 0 {
+                    println!("  nextsteps     [{}] {}", i + 1, ns.display_inline());
+                } else {
+                    println!("                [{}] {}", i + 1, ns.display_inline());
+                }
+            }
+        }
+
+        // Schedules
+        if self.schedules.is_empty() {
+            println!("  schedules     (none)");
+        } else {
+            for (i, sched) in self.schedules.iter().enumerate() {
+                if i == 0 {
+                    println!("  schedules     {}", sched);
+                } else {
+                    println!("                {}", sched);
+                }
+            }
+        }
+
+        // Flags
+        self.flags.display();
+    }
+}
+
+// ============================================================
+// Config - top-level persistence
+// ============================================================
+
+/// Top-level config containing endpoints, keys, and feeds.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Config {
+    #[serde(default)]
+    pub endpoints: BTreeMap<String, Endpoint>,
+    #[serde(default)]
+    pub keys: BTreeMap<String, PgpKey>,
+    #[serde(default)]
+    pub feeds: BTreeMap<String, Feed>,
+}
+
+impl Config {
+    /// Load config from the YAML file, or return a default if it doesn't exist.
+    pub fn load() -> Self {
+        let path = config_path();
+        if !path.exists() {
+            info!("No config file found at {}, using defaults", path.display());
+            return Config::default();
+        }
+
+        let contents = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("% Warning: could not read config file: {}", e);
+                return Config::default();
+            }
+        };
+
+        match serde_yaml::from_str(&contents) {
+            Ok(cfg) => {
+                info!("Loaded config from {}", path.display());
+                cfg
+            }
+            Err(e) => {
+                eprintln!("% Warning: could not parse config file: {}", e);
+                Config::default()
+            }
+        }
+    }
+
+    /// Save the config to the YAML file.
+    pub fn save(&self) -> Result<(), String> {
+        let path = config_path();
+
+        // Ensure parent directory exists
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("Could not create config directory: {}", e))?;
+        }
+
+        let yaml = serde_yaml::to_string(self)
+            .map_err(|e| format!("Could not serialize config: {}", e))?;
+
+        fs::write(&path, &yaml)
+            .map_err(|e| format!("Could not write config file: {}", e))?;
+
+        info!("Config saved to {}", path.display());
+        Ok(())
+    }
+}
+
+/// Return the path to the config file: ~/.sftpflow/config.yaml
+fn config_path() -> PathBuf {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    home.join(".sftpflow").join("config.yaml")
+}
