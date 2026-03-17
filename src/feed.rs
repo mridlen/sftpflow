@@ -383,12 +383,39 @@ impl Feed {
 }
 
 // ============================================================
+// Server connection - SSH settings for client→server
+// ============================================================
+
+/// SSH connection settings for reaching the SFTPflow server.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ServerConnection {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+}
+
+impl ServerConnection {
+    /// Pretty-print the server connection settings.
+    pub fn display(&self) {
+        println!("Server connection:");
+        println!("  host        {}", self.host.as_deref().unwrap_or("(not set)"));
+        println!("  port        {}", self.port.map_or("(not set)".to_string(), |p| p.to_string()));
+        println!("  username    {}", self.username.as_deref().unwrap_or("(not set)"));
+    }
+}
+
+// ============================================================
 // Config - top-level persistence
 // ============================================================
 
-/// Top-level config containing endpoints, keys, and feeds.
+/// Top-level config containing server connection, endpoints, keys, and feeds.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
+    #[serde(default)]
+    pub server: ServerConnection,
     #[serde(default)]
     pub endpoints: BTreeMap<String, Endpoint>,
     #[serde(default)]

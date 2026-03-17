@@ -6,7 +6,7 @@ use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
 use crate::commands; // commands.rs
-use crate::feed::{Config, Endpoint, Feed, NextStep, PgpKey}; // feed.rs
+use crate::feed::{Config, Endpoint, Feed, NextStep, PgpKey, ServerConnection}; // feed.rs
 
 /// Shell modes, similar to Cisco IOS privilege levels.
 #[derive(Debug, Clone, PartialEq)]
@@ -21,6 +21,8 @@ pub enum Mode {
     FeedEdit(String),
     /// Editing a next step within a feed (feed name stored).
     NextStepEdit(String),
+    /// Editing the server connection settings.
+    ConfigEdit,
 }
 
 /// Shared state passed into every command handler.
@@ -36,6 +38,8 @@ pub struct ShellState {
     pub pending_key: Option<PgpKey>,
     /// Staging area: next step being built in the nextstep submenu.
     pub pending_nextstep: Option<NextStep>,
+    /// Staging area: uncommitted edits to the server connection.
+    pub pending_server: Option<ServerConnection>,
 }
 
 impl ShellState {
@@ -49,6 +53,7 @@ impl ShellState {
             pending_endpoint: None,
             pending_key: None,
             pending_nextstep: None,
+            pending_server: None,
         }
     }
 
@@ -60,6 +65,7 @@ impl ShellState {
             Mode::KeyEdit(name) => format!("sftpflow(config-key:{})# ", name),
             Mode::FeedEdit(name) => format!("sftpflow(config-feed:{})# ", name),
             Mode::NextStepEdit(name) => format!("sftpflow(config-feed:{}/nextstep)# ", name),
+            Mode::ConfigEdit => "sftpflow(config-server)# ".to_string(),
         }
     }
 }
@@ -121,6 +127,7 @@ fn dispatch(line: &str, state: &mut ShellState) {
         Mode::KeyEdit(_)       => dispatch_key_edit(cmd, args, state),
         Mode::FeedEdit(_)      => dispatch_feed_edit(cmd, args, state),
         Mode::NextStepEdit(_)  => dispatch_nextstep_edit(cmd, args, state),
+        Mode::ConfigEdit       => dispatch_config_edit(cmd, args, state),
     }
 }
 
@@ -134,6 +141,7 @@ fn dispatch_exec(cmd: &str, args: &[&str], state: &mut ShellState) {
         "rename"           => commands::rename(args, state),
         "show"             => commands::show(args, state),
         "run"              => commands::run(args, state),
+        "config"           => commands::enter_config(state),
         "exit" | "quit"    => commands::exit_shell(state),
         "version"          => commands::version(),
         _ => println!("% Unknown command: '{}'. Type 'help' for available commands.", cmd),
@@ -206,6 +214,22 @@ fn dispatch_nextstep_edit(cmd: &str, args: &[&str], state: &mut ShellState) {
         "show"             => commands::show_pending_nextstep(state),
         "done"             => commands::done_nextstep(state),
         "abort"            => commands::abort_nextstep(state),
+        _ => println!("% Unknown command: '{}'. Type 'help' for available commands.", cmd),
+    }
+}
+
+/// Dispatch commands available in config-edit mode (server connection).
+fn dispatch_config_edit(cmd: &str, args: &[&str], state: &mut ShellState) {
+    match cmd {
+        "help" | "?"       => commands::help_config_edit(),
+        "host"             => commands::set_server_host(args, state),
+        "port"             => commands::set_server_port(args, state),
+        "username"         => commands::set_server_username(args, state),
+        "no"               => commands::no_server_command(args, state),
+        "show"             => commands::show_pending_server(state),
+        "commit"           => commands::commit_server(state),
+        "abort"            => commands::abort_server(state),
+        "exit" | "end"     => commands::exit_config_edit(state),
         _ => println!("% Unknown command: '{}'. Type 'help' for available commands.", cmd),
     }
 }

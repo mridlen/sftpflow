@@ -25,6 +25,7 @@ pub fn help_exec() {
     println!("  show version                 Show SFTPflow version");
     println!();
     println!("  run feed <name>              Manually run a feed (outside of schedule)");
+    println!("  config                       Edit server connection settings");
     println!();
     println!("  exit                         Exit SFTPflow");
     println!("  help / ?                     Show this help");
@@ -444,6 +445,135 @@ fn run_feed(name: &str, state: &ShellState) {
 
     println!();
     println!("% Feed run is not yet implemented. This is a preview of what would execute.");
+}
+
+// ============================================================
+// Config-edit mode commands (server connection)
+// ============================================================
+
+/// Enter the server config edit mode.
+pub fn enter_config(state: &mut ShellState) {
+    state.pending_server = Some(state.config.server.clone());
+    state.mode = Mode::ConfigEdit;
+    println!("Editing server connection settings. Type 'help' for options.");
+}
+
+/// Print help for config-edit mode.
+pub fn help_config_edit() {
+    println!("Server connection configuration:");
+    println!("  host <address>           Set the server hostname or IP");
+    println!("  port <number>            Set the SSH port (default: 22)");
+    println!("  username <user>          Set the SSH username");
+    println!("  no <property>            Clear a property (host, port, username)");
+    println!("  show                     Show pending configuration");
+    println!("  commit                   Save changes to config file");
+    println!("  abort                    Discard changes and return to exec mode");
+    println!("  exit / end               Same as abort (warns if uncommitted changes)");
+    println!("  help / ?                 Show this help");
+}
+
+/// Set the server host.
+pub fn set_server_host(args: &[&str], state: &mut ShellState) {
+    if args.is_empty() {
+        println!("% Usage: host <address>");
+        return;
+    }
+    if let Some(ref mut server) = state.pending_server {
+        info!("Set server host = {}", args[0]);
+        server.host = Some(args[0].to_string());
+        println!("  host → {}", args[0]);
+    }
+}
+
+/// Set the server port.
+pub fn set_server_port(args: &[&str], state: &mut ShellState) {
+    if args.is_empty() {
+        println!("% Usage: port <number>");
+        return;
+    }
+    match args[0].parse::<u16>() {
+        Ok(p) => {
+            if let Some(ref mut server) = state.pending_server {
+                info!("Set server port = {}", p);
+                server.port = Some(p);
+                println!("  port → {}", p);
+            }
+        }
+        Err(_) => println!("% Invalid port number: '{}'", args[0]),
+    }
+}
+
+/// Set the server username.
+pub fn set_server_username(args: &[&str], state: &mut ShellState) {
+    if args.is_empty() {
+        println!("% Usage: username <user>");
+        return;
+    }
+    if let Some(ref mut server) = state.pending_server {
+        info!("Set server username = {}", args[0]);
+        server.username = Some(args[0].to_string());
+        println!("  username → {}", args[0]);
+    }
+}
+
+/// Handle 'no <property>' in config-edit mode.
+pub fn no_server_command(args: &[&str], state: &mut ShellState) {
+    if args.is_empty() {
+        println!("% Usage: no <host|port|username>");
+        return;
+    }
+
+    if let Some(ref mut server) = state.pending_server {
+        match args[0] {
+            "host"     => { server.host = None;     println!("  host cleared."); }
+            "port"     => { server.port = None;     println!("  port cleared."); }
+            "username" => { server.username = None;  println!("  username cleared."); }
+            _ => println!("% Unknown property: '{}'", args[0]),
+        }
+    }
+}
+
+/// Show the pending server connection settings.
+pub fn show_pending_server(state: &ShellState) {
+    match &state.pending_server {
+        Some(server) => server.display(),
+        None => println!("% No pending configuration."),
+    }
+}
+
+/// Commit the pending server connection to disk.
+pub fn commit_server(state: &mut ShellState) {
+    if let Some(server) = state.pending_server.take() {
+        state.config.server = server;
+        match state.config.save() {
+            Ok(()) => {
+                info!("Committed server connection settings");
+                println!("Server connection settings committed.");
+            }
+            Err(e) => {
+                eprintln!("% Error saving config: {}", e);
+                return;
+            }
+        }
+        state.mode = Mode::Exec;
+    }
+}
+
+/// Abort server config editing, discard pending changes.
+pub fn abort_server(state: &mut ShellState) {
+    info!("Aborted server config edit, discarding changes");
+    println!("Changes discarded.");
+    state.pending_server = None;
+    state.mode = Mode::Exec;
+}
+
+/// Exit config-edit mode (warns if uncommitted changes).
+pub fn exit_config_edit(state: &mut ShellState) {
+    if state.pending_server.is_some() {
+        println!("% You have uncommitted changes. Use 'commit' to save or 'abort' to discard.");
+        return;
+    }
+    state.mode = Mode::Exec;
 }
 
 // ============================================================
@@ -1578,12 +1708,14 @@ pub fn show(args: &[&str], state: &ShellState) {
         println!("  key <name>         Show key details");
         println!("  feeds              List all feeds");
         println!("  feed <name>        Show feed details");
+        println!("  server             Show server connection settings");
         println!("  version            Show SFTPflow version");
         return;
     }
 
     match args[0] {
         "version"   => version(),
+        "server"    => state.config.server.display(),
         "endpoints" => show_endpoints(state),
         "endpoint"  => {
             if args.len() < 2 {
