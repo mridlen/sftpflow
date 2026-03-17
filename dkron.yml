@@ -1,0 +1,35 @@
+# Dkron configuration
+# https://dkron.io/docs/usage/configuration
+
+# Node name (defaults to hostname if unset)
+# node-name: "dkron-1"
+
+# HTTP listen address
+http-addr: "0.0.0.0:8080"
+
+# gRPC listen address
+grpc-addr: "0.0.0.0:6868"
+
+# Data directory for raft and serf state
+data-dir: "/var/lib/dkron"
+
+# Log level: debug, info, warn, error
+log-level: "info"
+
+# Server mode (runs scheduler + agent)
+server: true
+
+# Bootstrap cluster (set to true for first node only)
+bootstrap-expect: 1
+
+# Tags for job targeting.
+# Server nodes are not targeted by sftpflow jobs — workers handle execution.
+tags:
+  role: "server"
+
+# Join existing cluster members (set on nodes that join after the first)
+# join:
+#   - "dkron-server:8946"
+
+# Encryption key for Serf (generate with: dkron keygen)
+# encrypt: ""

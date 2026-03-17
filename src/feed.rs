@@ -395,6 +395,9 @@ pub struct ServerConnection {
     pub port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
+    /// URL of the dkron scheduler API (e.g. http://dkron-server:8080).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dkron_url: Option<String>,
 }
 
 impl ServerConnection {
@@ -404,6 +407,7 @@ impl ServerConnection {
         println!("  host        {}", self.host.as_deref().unwrap_or("(not set)"));
         println!("  port        {}", self.port.map_or("(not set)".to_string(), |p| p.to_string()));
         println!("  username    {}", self.username.as_deref().unwrap_or("(not set)"));
+        println!("  dkron       {}", self.dkron_url.as_deref().unwrap_or("(not set)"));
     }
 }
 
@@ -474,8 +478,13 @@ impl Config {
     }
 }
 
-/// Return the path to the config file: ~/.sftpflow/config.yaml
+/// Return the path to the config file.
+/// Checks SFTPFLOW_CONFIG env var first, then falls back to ~/.sftpflow/config.yaml.
 fn config_path() -> PathBuf {
+    if let Ok(p) = std::env::var("SFTPFLOW_CONFIG") {
+        return PathBuf::from(p);
+    }
+
     let home = std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
         .map(PathBuf::from)

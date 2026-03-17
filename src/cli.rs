@@ -225,6 +225,7 @@ fn dispatch_config_edit(cmd: &str, args: &[&str], state: &mut ShellState) {
         "host"             => commands::set_server_host(args, state),
         "port"             => commands::set_server_port(args, state),
         "username"         => commands::set_server_username(args, state),
+        "dkron"            => commands::set_dkron_url(args, state),
         "no"               => commands::no_server_command(args, state),
         "show"             => commands::show_pending_server(state),
         "commit"           => commands::commit_server(state),

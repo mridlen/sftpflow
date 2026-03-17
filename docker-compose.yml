@@ -1,0 +1,95 @@
+# docker-compose.yml — sftpflow + dkron cluster
+#
+# Architecture:
+#   dkron-server   - Raft leader / scheduler; exposes HTTP API on :8080
+#   dkron-worker-1 - Agent node; executes feed jobs via "sftpflow run <feed>"
+#   dkron-worker-2 - Agent node; same as above (scale as needed)
+#
+# Workers bind-mount ~/.sftpflow (read-only) so they share feed config with
+# the sftpflow CLI running on the host.  They also bind-mount the compiled
+# sftpflow binary from ./target/release/sftpflow.
+#
+# Quick start:
+#   cargo build --release
+#   docker compose build dkron-server
+#   docker compose up -d
+#
+# Point sftpflow at the scheduler:
+#   sftpflow> config
+#   sftpflow(config-server)# dkron http://localhost:8080
+#   sftpflow(config-server)# commit
+
+services:
+
+  # ---- Dkron server: scheduler + Raft leader ----
+  dkron-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.dkron
+    command:
+      - agent
+      - --config=/etc/dkron/dkron.yml
+      - --node-name=dkron-server
+      - --bootstrap-expect=1
+    ports:
+      - "8080:8080"    # HTTP API / UI
+    volumes:
+      - dkron-server-data:/var/lib/dkron
+    networks:
+      - dkron-net
+    restart: unless-stopped
+
+  # ---- Dkron worker 1 ----
+  dkron-worker-1:
+    build:
+      context: .
+      dockerfile: Dockerfile.dkron-worker
+    command:
+      - agent
+      - --config=/etc/dkron/dkron.yml
+      - --node-name=dkron-worker-1
+      - --join=dkron-server:8946
+    volumes:
+      - dkron-worker-1-data:/var/lib/dkron
+      # Share the compiled sftpflow binary from the host build output
+      - ./target/release/sftpflow:/usr/local/bin/sftpflow:ro
+      # Share the sftpflow config (feeds, endpoints, keys) — read-only for workers
+      - ${HOME}/.sftpflow:/home/dkron/.sftpflow:ro
+    environment:
+      - SFTPFLOW_CONFIG=/home/dkron/.sftpflow/config.yaml
+    networks:
+      - dkron-net
+    depends_on:
+      - dkron-server
+    restart: unless-stopped
+
+  # ---- Dkron worker 2 ----
+  dkron-worker-2:
+    build:
+      context: .
+      dockerfile: Dockerfile.dkron-worker
+    command:
+      - agent
+      - --config=/etc/dkron/dkron.yml
+      - --node-name=dkron-worker-2
+      - --join=dkron-server:8946
+    volumes:
+      - dkron-worker-2-data:/var/lib/dkron
+      - ./target/release/sftpflow:/usr/local/bin/sftpflow:ro
+      - ${HOME}/.sftpflow:/home/dkron/.sftpflow:ro
+    environment:
+      - SFTPFLOW_CONFIG=/home/dkron/.sftpflow/config.yaml
+    networks:
+      - dkron-net
+    depends_on:
+      - dkron-server
+    restart: unless-stopped
+
+volumes:
+  dkron-server-data:
+  dkron-worker-1-data:
+  dkron-worker-2-data:
+
+networks:
+  dkron-net:
+    driver: bridge

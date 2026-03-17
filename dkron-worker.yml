@@ -1,0 +1,22 @@
+# Dkron agent (worker) configuration
+# Used by sftpflow-worker nodes that execute feed jobs.
+
+# HTTP listen address
+http-addr: "0.0.0.0:8080"
+
+# gRPC listen address
+grpc-addr: "0.0.0.0:6868"
+
+# Data directory for serf state
+data-dir: "/var/lib/dkron"
+
+# Log level: debug, info, warn, error
+log-level: "info"
+
+# Agent mode only — scheduling is handled by the dkron server node
+server: false
+
+# Tags used to target this node when submitting jobs.
+# Jobs created by sftpflow use "role: sftpflow-worker:1".
+tags:
+  role: "sftpflow-worker"

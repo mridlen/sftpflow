@@ -1,0 +1,59 @@
+# Dockerfile.dkron-worker
+# Builds a dkron agent image that also contains the sftpflow binary.
+# The dkron executor calls "sftpflow run <feed>" to execute scheduled feeds.
+
+# ---- Stage 1: build sftpflow ----
+FROM rust:1-slim-bookworm AS sftpflow-builder
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY src/ ./src/
+RUN cargo build --release
+
+# ---- Stage 2: fetch dkron ----
+FROM debian:bookworm-slim AS dkron-fetcher
+
+ARG DKRON_VERSION=4.0.0
+ARG TARGETARCH=amd64
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL \
+    "https://github.com/distribworks/dkron/releases/download/v${DKRON_VERSION}/dkron_${DKRON_VERSION}_linux_${TARGETARCH}.tar.gz" \
+    -o /tmp/dkron.tar.gz \
+    && tar -xzf /tmp/dkron.tar.gz -C /usr/local/bin dkron \
+    && rm /tmp/dkron.tar.gz \
+    && chmod +x /usr/local/bin/dkron
+
+# ---- Stage 3: final image ----
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=dkron-fetcher /usr/local/bin/dkron /usr/local/bin/dkron
+COPY --from=sftpflow-builder /build/target/release/sftpflow /usr/local/bin/sftpflow
+
+RUN groupadd -r dkron && useradd -r -g dkron -m dkron \
+    && mkdir -p /etc/dkron /var/lib/dkron /home/dkron/.sftpflow \
+    && chown -R dkron:dkron /etc/dkron /var/lib/dkron /home/dkron
+
+COPY dkron-worker.yml /etc/dkron/dkron.yml
+
+USER dkron
+
+ENV HOME=/home/dkron
+
+VOLUME ["/var/lib/dkron"]
+VOLUME ["/home/dkron/.sftpflow"]
+
+# Serf (cluster) and gRPC
+EXPOSE 8946
+EXPOSE 6868
+
+ENTRYPOINT ["/usr/local/bin/dkron"]
+CMD ["agent", "--config=/etc/dkron/dkron.yml"]

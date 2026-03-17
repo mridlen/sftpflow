@@ -205,6 +205,15 @@ fn delete_feed(name: &str, state: &mut ShellState) {
         return;
     }
 
+    // Remove dkron jobs before saving (dkron_url still in config at this point).
+    if let Some(ref dkron_url) = state.config.server.dkron_url.clone() {
+        let client = crate::dkron::DkronClient::new(dkron_url);
+        match client.delete_feed_jobs(name) {
+            Ok(()) => println!("  Removed dkron jobs for feed '{}'.", name),
+            Err(e) => eprintln!("% Warning: dkron cleanup failed: {}", e),
+        }
+    }
+
     match state.config.save() {
         Ok(()) => {
             info!("Deleted feed '{}'", name);
@@ -464,7 +473,8 @@ pub fn help_config_edit() {
     println!("  host <address>           Set the server hostname or IP");
     println!("  port <number>            Set the SSH port (default: 22)");
     println!("  username <user>          Set the SSH username");
-    println!("  no <property>            Clear a property (host, port, username)");
+    println!("  dkron <url>              Set the dkron scheduler API URL");
+    println!("  no <property>            Clear a property (host, port, username, dkron)");
     println!("  show                     Show pending configuration");
     println!("  commit                   Save changes to config file");
     println!("  abort                    Discard changes and return to exec mode");
@@ -516,18 +526,32 @@ pub fn set_server_username(args: &[&str], state: &mut ShellState) {
     }
 }
 
+/// Set the dkron scheduler API URL.
+pub fn set_dkron_url(args: &[&str], state: &mut ShellState) {
+    if args.is_empty() {
+        println!("% Usage: dkron <url>  (e.g. http://dkron-server:8080)");
+        return;
+    }
+    if let Some(ref mut server) = state.pending_server {
+        info!("Set dkron_url = {}", args[0]);
+        server.dkron_url = Some(args[0].to_string());
+        println!("  dkron → {}", args[0]);
+    }
+}
+
 /// Handle 'no <property>' in config-edit mode.
 pub fn no_server_command(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
-        println!("% Usage: no <host|port|username>");
+        println!("% Usage: no <host|port|username|dkron>");
         return;
     }
 
     if let Some(ref mut server) = state.pending_server {
         match args[0] {
-            "host"     => { server.host = None;     println!("  host cleared."); }
-            "port"     => { server.port = None;     println!("  port cleared."); }
+            "host"     => { server.host = None;      println!("  host cleared."); }
+            "port"     => { server.port = None;      println!("  port cleared."); }
             "username" => { server.username = None;  println!("  username cleared."); }
+            "dkron"    => { server.dkron_url = None; println!("  dkron cleared."); }
             _ => println!("% Unknown property: '{}'", args[0]),
         }
     }
@@ -1357,7 +1381,7 @@ pub fn show_pending_feed(state: &ShellState) {
     }
 }
 
-/// Commit the pending feed to disk.
+/// Commit the pending feed to disk and sync its schedules to dkron.
 pub fn commit_feed(state: &mut ShellState) {
     let feed_name = match &state.mode {
         Mode::FeedEdit(name) => name.clone(),
@@ -1376,6 +1400,20 @@ pub fn commit_feed(state: &mut ShellState) {
                 return;
             }
         }
+
+        // Sync schedules to dkron if a URL is configured.
+        if let Some(ref dkron_url) = state.config.server.dkron_url.clone() {
+            let feed = state.config.feeds.get(&feed_name).unwrap();
+            let client = crate::dkron::DkronClient::new(dkron_url);
+            match client.upsert_feed_jobs(&feed_name, &feed.schedules, feed.flags.enabled) {
+                Ok(()) => println!(
+                    "  Synced {} schedule(s) to dkron.",
+                    feed.schedules.len()
+                ),
+                Err(e) => eprintln!("% Warning: dkron sync failed: {}", e),
+            }
+        }
+
         state.mode = Mode::Exec;
     }
 }
