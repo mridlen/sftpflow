@@ -1,0 +1,24 @@
+# ============================================================
+# sftpflow-core
+# ============================================================
+#
+# Shared data models (Endpoint, PgpKey, Feed, NextStep, ...) and
+# YAML config persistence. Used by every other crate in the
+# workspace so the CLI, daemon, and transport engines all speak
+# the same types.
+
+[package]
+name = "sftpflow-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+serde      = { workspace = true }
+serde_yaml = { workspace = true }
+log        = { workspace = true }

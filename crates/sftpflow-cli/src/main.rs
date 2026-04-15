@@ -1,9 +1,13 @@
 use std::process;
 
+// sftpflow-core provides the shared data models (Endpoint, Feed, Config, ...)
+// so the future daemon and transport crates can reuse them. Aliasing to
+// `feed` keeps the existing `feed::Config` call sites in this crate unchanged.
+pub use sftpflow_core as feed;
+
 mod cli;      // cli.rs - interactive shell loop and command dispatch
 mod commands; // commands.rs - command implementations
 mod dkron;    // dkron.rs - dkron scheduler API client
-mod feed;     // feed.rs - feed data model and YAML persistence
 
 fn main() {
     // Initialize logging (set RUST_LOG=info to see log output)

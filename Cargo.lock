@@ -704,7 +704,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "sftpflow"
+name = "sftpflow-cli"
 version = "0.1.1"
 dependencies = [
  "env_logger",
@@ -713,7 +713,26 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sftpflow-core",
  "ureq",
+]
+
+[[package]]
+name = "sftpflow-core"
+version = "0.1.1"
+dependencies = [
+ "log",
+ "serde",
+ "serde_yaml",
+]
+
+[[package]]
+name = "sftpflow-proto"
+version = "0.1.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sftpflow-core",
 ]
 
 [[package]]

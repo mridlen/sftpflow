@@ -1,0 +1,34 @@
+# ============================================================
+# sftpflow-cli
+# ============================================================
+#
+# The interactive shell binary (Cisco IOS / cmsh style).
+# Depends on sftpflow-core for the data models and config I/O.
+#
+# For now this crate also contains the dkron client; it will
+# move into sftpflowd once the daemon lands.
+
+[package]
+name = "sftpflow-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The binary is still named `sftpflow` so user-facing invocation
+# (`sftpflow run <feed>`, `sftpflow` interactive shell) is unchanged.
+[[bin]]
+name = "sftpflow"
+path = "src/main.rs"
+
+[dependencies]
+sftpflow-core = { path = "../sftpflow-core" }
+
+rustyline   = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+serde_yaml  = { workspace = true }
+ureq        = { workspace = true }
+log         = { workspace = true }
+env_logger  = { workspace = true }

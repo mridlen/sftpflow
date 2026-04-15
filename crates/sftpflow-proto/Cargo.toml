@@ -1,0 +1,33 @@
+# ============================================================
+# sftpflow-proto
+# ============================================================
+#
+# JSON-RPC message types shared between the CLI and the daemon.
+# Deliberately has no I/O dependencies: just `serde` + the core
+# data models. This lets us compile it into both the CLI (client
+# side) and sftpflowd (server side) without dragging in a
+# transport layer.
+#
+# Wire format: NDJSON (newline-delimited JSON). One request per
+# line, one response per line. Simple to debug — you can pipe
+# `echo '{"id":1,"method":"Ping"}'` into `sftpflow-shell` by hand.
+
+[package]
+name = "sftpflow-proto"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+sftpflow-core = { path = "../sftpflow-core" }
+
+serde      = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# (serde_json already pulled in above; tests use it directly)

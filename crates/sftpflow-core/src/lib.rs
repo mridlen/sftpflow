@@ -41,7 +41,7 @@ impl std::fmt::Display for Protocol {
 }
 
 /// An endpoint with connection credentials.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct Endpoint {
     #[serde(default)]
     pub protocol: Protocol,
@@ -97,7 +97,7 @@ impl std::fmt::Display for KeyType {
 }
 
 /// A PGP key with its contents stored in the config.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct PgpKey {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key_type: Option<KeyType>,
@@ -132,7 +132,7 @@ impl PgpKey {
 // ============================================================
 
 /// A source or destination: an endpoint name + remote path.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FeedPath {
     pub endpoint: String,
     pub path: String,
@@ -169,7 +169,7 @@ mod yes_no {
 }
 
 /// Boolean flags that control feed behavior.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FeedFlags {
     #[serde(with = "yes_no")]
     pub enabled: bool,
@@ -271,7 +271,7 @@ impl std::fmt::Display for NextStepAction {
 }
 
 /// A next step: an action + the conditions that trigger it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NextStep {
     #[serde(flatten)]
     pub action: NextStepAction,
@@ -287,7 +287,7 @@ impl NextStep {
 }
 
 /// A feed definition (many sources → many destinations, multiple schedules).
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct Feed {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<FeedPath>,
