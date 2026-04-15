@@ -19,6 +19,7 @@ members = [
     "crates/sftpflow-proto",
     "crates/sftpflow-cli",
     "crates/sftpflowd",
+    "crates/sftpflow-shell",
 ]
 
 [workspace.package]

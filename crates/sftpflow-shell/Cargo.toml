@@ -1,0 +1,28 @@
+# ============================================================
+# sftpflow-shell
+# ============================================================
+#
+# A tiny byte pipe between an SSH session and the local daemon
+# socket. Installed on the server and set as `ForceCommand` in
+# the user's `authorized_keys`, so an SSH login automatically
+# proxies the session's stdin/stdout to `sftpflowd`.
+#
+# This crate is deliberately RPC-unaware — it just moves bytes.
+# That way we can change the RPC protocol without touching the
+# ForceCommand shim, and the shim stays small/auditable.
+
+[package]
+name = "sftpflow-shell"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "sftpflow-shell"
+path = "src/main.rs"
+
+[dependencies]
+log        = { workspace = true }
+env_logger = { workspace = true }
