@@ -1,1 +1,5 @@
 /target
+
+# Editor/tool temp files (e.g. *.tmp.<pid>.<timestamp> left by the
+# Claude Code Edit tool on Windows when Dropbox/AV blocks the replace).
+*.tmp.*

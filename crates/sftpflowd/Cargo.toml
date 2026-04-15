@@ -1,0 +1,30 @@
+# ============================================================
+# sftpflowd
+# ============================================================
+#
+# The long-running daemon. Owns the config, the scheduler, and
+# (later) the transfer engine. Speaks the NDJSON RPC protocol
+# defined in sftpflow-proto.
+#
+# Listens on a Unix socket on Linux (the production target) or
+# TCP loopback on Windows (so it can be developed locally).
+
+[package]
+name = "sftpflowd"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "sftpflowd"
+path = "src/main.rs"
+
+[dependencies]
+sftpflow-core  = { path = "../sftpflow-core" }
+sftpflow-proto = { path = "../sftpflow-proto" }
+
+serde_json = { workspace = true }
+log        = { workspace = true }
+env_logger = { workspace = true }
