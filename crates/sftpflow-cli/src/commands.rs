@@ -1,11 +1,35 @@
 // ============================================================
 // commands.rs - Command implementations
 // ============================================================
+//
+// Commands that read or mutate daemon state go through RPC.
+// The staging pattern (pending_*) stays local — only commit
+// sends the final object to the daemon via PutEndpoint/Key/Feed.
+// Server connection settings are CLI-local (not managed by daemon).
 
 use log::info;
 
+use sftpflow_proto::{Request, Response}; // lib.rs (sftpflow-proto)
+
 use crate::cli::{Mode, ShellState};
 use crate::feed::{Endpoint, Feed, FeedPath, KeyType, NextStep, NextStepAction, PgpKey, ProcessStep, Protocol, TriggerCondition}; // feed.rs
+use crate::rpc::RpcError; // rpc.rs
+
+// ============================================================
+// RPC helper
+// ============================================================
+
+/// Print a standard "not connected" message. Returns true if
+/// an RPC connection is available, false if not. Callers should
+/// return early on false.
+fn has_rpc(state: &ShellState) -> bool {
+    if state.rpc.is_some() {
+        true
+    } else {
+        println!("% Not connected to daemon. Use 'config' to set server settings, then 'connect'.");
+        false
+    }
+}
 
 // ============================================================
 // Exec mode commands
@@ -25,10 +49,18 @@ pub fn help_exec() {
     println!("  show version                 Show SFTPflow version");
     println!();
     println!("  run feed <name>              Manually run a feed (outside of schedule)");
+    println!("  connect                      Connect (or reconnect) to the daemon");
     println!("  config                       Edit server connection settings");
     println!();
     println!("  exit                         Exit SFTPflow");
     println!("  help / ?                     Show this help");
+}
+
+// ---- connect ----
+
+/// Connect (or reconnect) to the daemon.
+pub fn connect(state: &mut ShellState) {
+    state.try_connect(); // cli.rs - ShellState::try_connect()
 }
 
 // ---- create <type> <name> ----
@@ -49,9 +81,19 @@ pub fn create(args: &[&str], state: &mut ShellState) {
 }
 
 fn create_endpoint(name: &str, state: &mut ShellState) {
-    if state.config.endpoints.contains_key(name) {
-        println!("% Endpoint '{}' already exists. Use 'edit endpoint {}' to modify it.", name, name);
-        return;
+    if !has_rpc(state) { return; }
+
+    {
+        let rpc = state.rpc.as_mut().unwrap();
+        match rpc.call(Request::GetEndpoint { name: name.to_string() }) {
+            Ok(Response::Endpoint(Some(_))) => {
+                println!("% Endpoint '{}' already exists. Use 'edit endpoint {}' to modify it.", name, name);
+                return;
+            }
+            Ok(Response::Endpoint(None)) => {}
+            Err(e) => { println!("% Error: {}", e); return; }
+            _ => return,
+        }
     }
 
     info!("Creating new endpoint '{}'", name);
@@ -62,9 +104,19 @@ fn create_endpoint(name: &str, state: &mut ShellState) {
 }
 
 fn create_key(name: &str, state: &mut ShellState) {
-    if state.config.keys.contains_key(name) {
-        println!("% Key '{}' already exists. Use 'edit key {}' to modify it.", name, name);
-        return;
+    if !has_rpc(state) { return; }
+
+    {
+        let rpc = state.rpc.as_mut().unwrap();
+        match rpc.call(Request::GetKey { name: name.to_string() }) {
+            Ok(Response::Key(Some(_))) => {
+                println!("% Key '{}' already exists. Use 'edit key {}' to modify it.", name, name);
+                return;
+            }
+            Ok(Response::Key(None)) => {}
+            Err(e) => { println!("% Error: {}", e); return; }
+            _ => return,
+        }
     }
 
     info!("Creating new key '{}'", name);
@@ -75,9 +127,19 @@ fn create_key(name: &str, state: &mut ShellState) {
 }
 
 fn create_feed(name: &str, state: &mut ShellState) {
-    if state.config.feeds.contains_key(name) {
-        println!("% Feed '{}' already exists. Use 'edit feed {}' to modify it.", name, name);
-        return;
+    if !has_rpc(state) { return; }
+
+    {
+        let rpc = state.rpc.as_mut().unwrap();
+        match rpc.call(Request::GetFeed { name: name.to_string() }) {
+            Ok(Response::Feed(Some(_))) => {
+                println!("% Feed '{}' already exists. Use 'edit feed {}' to modify it.", name, name);
+                return;
+            }
+            Ok(Response::Feed(None)) => {}
+            Err(e) => { println!("% Error: {}", e); return; }
+            _ => return,
+        }
     }
 
     info!("Creating new feed '{}'", name);
@@ -105,11 +167,18 @@ pub fn edit(args: &[&str], state: &mut ShellState) {
 }
 
 fn edit_endpoint(name: &str, state: &mut ShellState) {
-    let endpoint = match state.config.endpoints.get(name) {
-        Some(e) => e.clone(),
-        None => {
-            println!("% Endpoint '{}' does not exist. Use 'create endpoint {}' to create it.", name, name);
-            return;
+    if !has_rpc(state) { return; }
+
+    let endpoint = {
+        let rpc = state.rpc.as_mut().unwrap();
+        match rpc.call(Request::GetEndpoint { name: name.to_string() }) {
+            Ok(Response::Endpoint(Some(ep))) => ep,
+            Ok(Response::Endpoint(None)) => {
+                println!("% Endpoint '{}' does not exist. Use 'create endpoint {}' to create it.", name, name);
+                return;
+            }
+            Err(e) => { println!("% Error: {}", e); return; }
+            _ => return,
         }
     };
 
@@ -121,11 +190,18 @@ fn edit_endpoint(name: &str, state: &mut ShellState) {
 }
 
 fn edit_key(name: &str, state: &mut ShellState) {
-    let key = match state.config.keys.get(name) {
-        Some(k) => k.clone(),
-        None => {
-            println!("% Key '{}' does not exist. Use 'create key {}' to create it.", name, name);
-            return;
+    if !has_rpc(state) { return; }
+
+    let key = {
+        let rpc = state.rpc.as_mut().unwrap();
+        match rpc.call(Request::GetKey { name: name.to_string() }) {
+            Ok(Response::Key(Some(k))) => k,
+            Ok(Response::Key(None)) => {
+                println!("% Key '{}' does not exist. Use 'create key {}' to create it.", name, name);
+                return;
+            }
+            Err(e) => { println!("% Error: {}", e); return; }
+            _ => return,
         }
     };
 
@@ -137,11 +213,18 @@ fn edit_key(name: &str, state: &mut ShellState) {
 }
 
 fn edit_feed(name: &str, state: &mut ShellState) {
-    let feed = match state.config.feeds.get(name) {
-        Some(f) => f.clone(),
-        None => {
-            println!("% Feed '{}' does not exist. Use 'create feed {}' to create it.", name, name);
-            return;
+    if !has_rpc(state) { return; }
+
+    let feed = {
+        let rpc = state.rpc.as_mut().unwrap();
+        match rpc.call(Request::GetFeed { name: name.to_string() }) {
+            Ok(Response::Feed(Some(f))) => f,
+            Ok(Response::Feed(None)) => {
+                println!("% Feed '{}' does not exist. Use 'create feed {}' to create it.", name, name);
+                return;
+            }
+            Err(e) => { println!("% Error: {}", e); return; }
+            _ => return,
         }
     };
 
@@ -170,56 +253,56 @@ pub fn delete(args: &[&str], state: &mut ShellState) {
 }
 
 fn delete_endpoint(name: &str, state: &mut ShellState) {
-    if state.config.endpoints.remove(name).is_none() {
-        println!("% Endpoint '{}' does not exist.", name);
-        return;
-    }
+    if !has_rpc(state) { return; }
+    let rpc = state.rpc.as_mut().unwrap();
 
-    match state.config.save() {
-        Ok(()) => {
+    match rpc.call(Request::DeleteEndpoint { name: name.to_string() }) {
+        Ok(Response::Ok) => {
             info!("Deleted endpoint '{}'", name);
             println!("Endpoint '{}' deleted.", name);
         }
-        Err(e) => eprintln!("% Error saving config: {}", e),
+        Err(RpcError::Proto(e)) => println!("% {}", e.message),
+        Err(e) => println!("% Error: {}", e),
+        _ => {}
     }
 }
 
 fn delete_key(name: &str, state: &mut ShellState) {
-    if state.config.keys.remove(name).is_none() {
-        println!("% Key '{}' does not exist.", name);
-        return;
-    }
+    if !has_rpc(state) { return; }
+    let rpc = state.rpc.as_mut().unwrap();
 
-    match state.config.save() {
-        Ok(()) => {
+    match rpc.call(Request::DeleteKey { name: name.to_string() }) {
+        Ok(Response::Ok) => {
             info!("Deleted key '{}'", name);
             println!("Key '{}' deleted.", name);
         }
-        Err(e) => eprintln!("% Error saving config: {}", e),
+        Err(RpcError::Proto(e)) => println!("% {}", e.message),
+        Err(e) => println!("% Error: {}", e),
+        _ => {}
     }
 }
 
 fn delete_feed(name: &str, state: &mut ShellState) {
-    if state.config.feeds.remove(name).is_none() {
-        println!("% Feed '{}' does not exist.", name);
-        return;
-    }
-
-    // Remove dkron jobs before saving (dkron_url still in config at this point).
+    // Dkron cleanup (best-effort, before daemon delete)
     if let Some(ref dkron_url) = state.config.server.dkron_url.clone() {
-        let client = crate::dkron::DkronClient::new(dkron_url);
+        let client = crate::dkron::DkronClient::new(&dkron_url); // dkron.rs
         match client.delete_feed_jobs(name) {
             Ok(()) => println!("  Removed dkron jobs for feed '{}'.", name),
             Err(e) => eprintln!("% Warning: dkron cleanup failed: {}", e),
         }
     }
 
-    match state.config.save() {
-        Ok(()) => {
+    if !has_rpc(state) { return; }
+    let rpc = state.rpc.as_mut().unwrap();
+
+    match rpc.call(Request::DeleteFeed { name: name.to_string() }) {
+        Ok(Response::Ok) => {
             info!("Deleted feed '{}'", name);
             println!("Feed '{}' deleted.", name);
         }
-        Err(e) => eprintln!("% Error saving config: {}", e),
+        Err(RpcError::Proto(e)) => println!("% {}", e.message),
+        Err(e) => println!("% Error: {}", e),
+        _ => {}
     }
 }
 
@@ -241,138 +324,47 @@ pub fn rename(args: &[&str], state: &mut ShellState) {
 }
 
 fn rename_endpoint(old_name: &str, new_name: &str, state: &mut ShellState) {
-    let endpoint = match state.config.endpoints.remove(old_name) {
-        Some(ep) => ep,
-        None => {
-            println!("% Endpoint '{}' does not exist.", old_name);
-            return;
-        }
-    };
+    if !has_rpc(state) { return; }
+    let rpc = state.rpc.as_mut().unwrap();
 
-    if state.config.endpoints.contains_key(new_name) {
-        state.config.endpoints.insert(old_name.to_string(), endpoint);
-        println!("% Endpoint '{}' already exists.", new_name);
-        return;
-    }
-
-    state.config.endpoints.insert(new_name.to_string(), endpoint);
-
-    // Update all feed source/destination references
-    let mut ref_count = 0;
-    for (_feed_name, feed) in state.config.feeds.iter_mut() {
-        for src in feed.sources.iter_mut() {
-            if src.endpoint == old_name {
-                src.endpoint = new_name.to_string();
-                ref_count += 1;
-            }
-        }
-        for dst in feed.destinations.iter_mut() {
-            if dst.endpoint == old_name {
-                dst.endpoint = new_name.to_string();
-                ref_count += 1;
-            }
-        }
-    }
-
-    match state.config.save() {
-        Ok(()) => {
-            info!("Renamed endpoint '{}' → '{}', updated {} feed reference(s)", old_name, new_name, ref_count);
+    match rpc.call(Request::RenameEndpoint { from: old_name.to_string(), to: new_name.to_string() }) {
+        Ok(Response::Ok) => {
+            info!("Renamed endpoint '{}' → '{}'", old_name, new_name);
             println!("Endpoint '{}' renamed to '{}'.", old_name, new_name);
-            if ref_count > 0 {
-                println!("  Updated {} feed reference(s).", ref_count);
-            }
         }
-        Err(e) => eprintln!("% Error saving config: {}", e),
+        Err(RpcError::Proto(e)) => println!("% {}", e.message),
+        Err(e) => println!("% Error: {}", e),
+        _ => {}
     }
 }
 
 fn rename_key(old_name: &str, new_name: &str, state: &mut ShellState) {
-    let key = match state.config.keys.remove(old_name) {
-        Some(k) => k,
-        None => {
-            println!("% Key '{}' does not exist.", old_name);
-            return;
-        }
-    };
+    if !has_rpc(state) { return; }
+    let rpc = state.rpc.as_mut().unwrap();
 
-    if state.config.keys.contains_key(new_name) {
-        state.config.keys.insert(old_name.to_string(), key);
-        println!("% Key '{}' already exists.", new_name);
-        return;
-    }
-
-    state.config.keys.insert(new_name.to_string(), key);
-
-    // Update all feed process step references
-    let mut ref_count = 0;
-    for (_feed_name, feed) in state.config.feeds.iter_mut() {
-        for step in feed.process.iter_mut() {
-            match step {
-                ProcessStep::Encrypt { key } | ProcessStep::Decrypt { key } => {
-                    if key == old_name {
-                        *key = new_name.to_string();
-                        ref_count += 1;
-                    }
-                }
-            }
-        }
-    }
-
-    match state.config.save() {
-        Ok(()) => {
-            info!("Renamed key '{}' → '{}', updated {} process reference(s)", old_name, new_name, ref_count);
+    match rpc.call(Request::RenameKey { from: old_name.to_string(), to: new_name.to_string() }) {
+        Ok(Response::Ok) => {
+            info!("Renamed key '{}' → '{}'", old_name, new_name);
             println!("Key '{}' renamed to '{}'.", old_name, new_name);
-            if ref_count > 0 {
-                println!("  Updated {} process reference(s).", ref_count);
-            }
         }
-        Err(e) => eprintln!("% Error saving config: {}", e),
+        Err(RpcError::Proto(e)) => println!("% {}", e.message),
+        Err(e) => println!("% Error: {}", e),
+        _ => {}
     }
 }
 
 fn rename_feed(old_name: &str, new_name: &str, state: &mut ShellState) {
-    let feed = match state.config.feeds.remove(old_name) {
-        Some(f) => f,
-        None => {
-            println!("% Feed '{}' does not exist.", old_name);
-            return;
-        }
-    };
+    if !has_rpc(state) { return; }
+    let rpc = state.rpc.as_mut().unwrap();
 
-    if state.config.feeds.contains_key(new_name) {
-        state.config.feeds.insert(old_name.to_string(), feed);
-        println!("% Feed '{}' already exists.", new_name);
-        return;
-    }
-
-    state.config.feeds.insert(new_name.to_string(), feed);
-
-    // Update nextstep references in all feeds
-    let mut ref_count = 0;
-    for (_feed_name, f) in state.config.feeds.iter_mut() {
-        for ns in f.nextsteps.iter_mut() {
-            match &mut ns.action {
-                NextStepAction::RunFeed { feed } => {
-                    if feed == old_name {
-                        *feed = new_name.to_string();
-                        ref_count += 1;
-                    }
-                }
-                NextStepAction::SendEmail { .. } => {}  // no feed references to update
-                NextStepAction::Sleep { .. } => {}     // no feed references to update
-            }
-        }
-    }
-
-    match state.config.save() {
-        Ok(()) => {
+    match rpc.call(Request::RenameFeed { from: old_name.to_string(), to: new_name.to_string() }) {
+        Ok(Response::Ok) => {
             info!("Renamed feed '{}' → '{}'", old_name, new_name);
             println!("Feed '{}' renamed to '{}'.", old_name, new_name);
-            if ref_count > 0 {
-                println!("  Updated {} nextstep reference(s).", ref_count);
-            }
         }
-        Err(e) => eprintln!("% Error saving config: {}", e),
+        Err(RpcError::Proto(e)) => println!("% {}", e.message),
+        Err(e) => println!("% Error: {}", e),
+        _ => {}
     }
 }
 
@@ -390,7 +382,7 @@ pub fn exit_shell(state: &mut ShellState) {
 // ---- run feed <name> ----
 
 /// Route 'run feed <name>'.
-pub fn run(args: &[&str], state: &ShellState) {
+pub fn run(args: &[&str], state: &mut ShellState) {
     if args.len() < 2 {
         println!("% Usage: run feed <name>");
         return;
@@ -402,63 +394,33 @@ pub fn run(args: &[&str], state: &ShellState) {
     }
 }
 
-/// Simulate running a feed manually (interface mockup).
-fn run_feed(name: &str, state: &ShellState) {
-    let feed = match state.config.feeds.get(name) {
-        Some(f) => f,
-        None => {
-            println!("% Feed '{}' does not exist.", name);
-            return;
+fn run_feed(name: &str, state: &mut ShellState) {
+    if !has_rpc(state) { return; }
+    let rpc = state.rpc.as_mut().unwrap();
+
+    match rpc.call(Request::RunFeedNow { name: name.to_string() }) {
+        Ok(Response::RunResult(result)) => {
+            info!("Run result for '{}': {:?}", name, result.status);
+            println!("Feed '{}': {:?}", name, result.status);
+            if let Some(msg) = result.message {
+                println!("  {}", msg);
+            }
+            if result.files_transferred > 0 {
+                println!("  {} file(s) transferred.", result.files_transferred);
+            }
         }
-    };
-
-    if !feed.flags.enabled {
-        println!("% Feed '{}' is disabled. Enable it first with: edit feed {} → flag enabled yes", name, name);
-        return;
+        Err(RpcError::Proto(e)) => println!("% {}", e.message),
+        Err(e) => println!("% Error: {}", e),
+        _ => {}
     }
-
-    // Validate that the feed has the minimum required configuration
-    if feed.sources.is_empty() {
-        println!("% Feed '{}' has no sources configured.", name);
-        return;
-    }
-    if feed.destinations.is_empty() {
-        println!("% Feed '{}' has no destinations configured.", name);
-        return;
-    }
-
-    // Display what would happen (mockup)
-    info!("Manual run requested for feed '{}'", name);
-    println!("Running feed '{}'...", name);
-    println!();
-
-    // Sources
-    for src in &feed.sources {
-        println!("  [source]      Fetch from {}", src);
-    }
-
-    // Process steps
-    for step in &feed.process {
-        println!("  [process]     {}", step);
-    }
-
-    // Destinations
-    for dst in &feed.destinations {
-        println!("  [destination] Deliver to {}", dst);
-    }
-
-    // Next steps
-    for ns in &feed.nextsteps {
-        println!("  [nextstep]    {}", ns.display_inline());
-    }
-
-    println!();
-    println!("% Feed run is not yet implemented. This is a preview of what would execute.");
 }
 
 // ============================================================
 // Config-edit mode commands (server connection)
 // ============================================================
+//
+// Server connection settings are CLI-local (not daemon-managed).
+// They control how the CLI connects to the daemon.
 
 /// Enter the server config edit mode.
 pub fn enter_config(state: &mut ShellState) {
@@ -621,7 +583,6 @@ pub fn help_endpoint_edit() {
     println!("  help / ?                 Show this help");
 }
 
-/// Set the host on the pending endpoint.
 /// Set the protocol on the pending endpoint.
 pub fn set_protocol(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
@@ -762,25 +723,32 @@ pub fn show_pending_endpoint(state: &ShellState) {
     }
 }
 
-/// Commit the pending endpoint to disk.
+/// Commit the pending endpoint to the daemon via RPC.
 pub fn commit_endpoint(state: &mut ShellState) {
     let ep_name = match &state.mode {
         Mode::EndpointEdit(name) => name.clone(),
         _ => return,
     };
 
-    if let Some(ep) = state.pending_endpoint.take() {
-        state.config.endpoints.insert(ep_name.clone(), ep);
-        match state.config.save() {
-            Ok(()) => {
-                info!("Committed endpoint '{}'", ep_name);
-                println!("Endpoint '{}' committed.", ep_name);
-            }
-            Err(e) => {
-                eprintln!("% Error saving config: {}", e);
-                return;
-            }
+    let ep = match &state.pending_endpoint {
+        Some(ep) => ep.clone(),
+        None => return,
+    };
+
+    let success = {
+        if !has_rpc(state) { return; }
+        let rpc = state.rpc.as_mut().unwrap();
+        match rpc.call(Request::PutEndpoint { name: ep_name.clone(), endpoint: ep }) {
+            Ok(Response::Ok) => true,
+            Err(e) => { eprintln!("% Error: {}", e); false }
+            _ => false,
         }
+    };
+
+    if success {
+        state.pending_endpoint = None;
+        info!("Committed endpoint '{}'", ep_name);
+        println!("Endpoint '{}' committed.", ep_name);
         state.mode = Mode::Exec;
     }
 }
@@ -859,7 +827,6 @@ pub fn set_key_contents(_args: &[&str], state: &mut ShellState) {
         match stdin.read_line(&mut line) {
             Ok(0) => break, // EOF
             Ok(_) => {
-                // Strip trailing newline for comparison
                 let trimmed = line.trim_end_matches(|c| c == '\n' || c == '\r');
                 if trimmed == "." {
                     break;
@@ -941,25 +908,32 @@ pub fn show_pending_key(state: &ShellState) {
     }
 }
 
-/// Commit the pending key to disk.
+/// Commit the pending key to the daemon via RPC.
 pub fn commit_key(state: &mut ShellState) {
     let key_name = match &state.mode {
         Mode::KeyEdit(name) => name.clone(),
         _ => return,
     };
 
-    if let Some(k) = state.pending_key.take() {
-        state.config.keys.insert(key_name.clone(), k);
-        match state.config.save() {
-            Ok(()) => {
-                info!("Committed key '{}'", key_name);
-                println!("Key '{}' committed.", key_name);
-            }
-            Err(e) => {
-                eprintln!("% Error saving config: {}", e);
-                return;
-            }
+    let k = match &state.pending_key {
+        Some(k) => k.clone(),
+        None => return,
+    };
+
+    let success = {
+        if !has_rpc(state) { return; }
+        let rpc = state.rpc.as_mut().unwrap();
+        match rpc.call(Request::PutKey { name: key_name.clone(), key: k }) {
+            Ok(Response::Ok) => true,
+            Err(e) => { eprintln!("% Error: {}", e); false }
+            _ => false,
         }
+    };
+
+    if success {
+        state.pending_key = None;
+        info!("Committed key '{}'", key_name);
+        println!("Key '{}' committed.", key_name);
         state.mode = Mode::Exec;
     }
 }
@@ -1043,9 +1017,11 @@ pub fn set_source(args: &[&str], state: &mut ShellState) {
         }
     };
 
-    // Warn if endpoint doesn't exist yet
-    if !state.config.endpoints.contains_key(&feed_path.endpoint) {
-        println!("  (warning: endpoint '{}' does not exist yet)", feed_path.endpoint);
+    // Warn if endpoint doesn't exist (best-effort RPC check)
+    if let Some(ref mut rpc) = state.rpc {
+        if let Ok(Response::Endpoint(None)) = rpc.call(Request::GetEndpoint { name: feed_path.endpoint.clone() }) {
+            println!("  (warning: endpoint '{}' does not exist yet)", feed_path.endpoint);
+        }
     }
 
     if let Some(ref mut feed) = state.pending_feed {
@@ -1076,9 +1052,11 @@ pub fn set_destination(args: &[&str], state: &mut ShellState) {
         }
     };
 
-    // Warn if endpoint doesn't exist yet
-    if !state.config.endpoints.contains_key(&feed_path.endpoint) {
-        println!("  (warning: endpoint '{}' does not exist yet)", feed_path.endpoint);
+    // Warn if endpoint doesn't exist (best-effort RPC check)
+    if let Some(ref mut rpc) = state.rpc {
+        if let Ok(Response::Endpoint(None)) = rpc.call(Request::GetEndpoint { name: feed_path.endpoint.clone() }) {
+            println!("  (warning: endpoint '{}' does not exist yet)", feed_path.endpoint);
+        }
     }
 
     if let Some(ref mut feed) = state.pending_feed {
@@ -1106,28 +1084,27 @@ pub fn add_process(args: &[&str], state: &mut ShellState) {
     let action = args[0];
     let key_name = args[1].to_string();
 
-    // Validate key exists and is the right type
-    let step = match action {
-        "encrypt" => {
-            if let Some(k) = state.config.keys.get(&key_name) {
-                if k.key_type.as_ref() != Some(&KeyType::Public) {
+    // Validate key exists and is the right type (best-effort RPC check)
+    if let Some(ref mut rpc) = state.rpc {
+        match rpc.call(Request::GetKey { name: key_name.clone() }) {
+            Ok(Response::Key(Some(k))) => {
+                if action == "encrypt" && k.key_type.as_ref() != Some(&KeyType::Public) {
                     println!("  (warning: key '{}' is not marked as public — encrypt requires a public key)", key_name);
                 }
-            } else {
-                println!("  (warning: key '{}' does not exist yet)", key_name);
-            }
-            ProcessStep::Encrypt { key: key_name }
-        }
-        "decrypt" => {
-            if let Some(k) = state.config.keys.get(&key_name) {
-                if k.key_type.as_ref() != Some(&KeyType::Private) {
+                if action == "decrypt" && k.key_type.as_ref() != Some(&KeyType::Private) {
                     println!("  (warning: key '{}' is not marked as private — decrypt requires a private key)", key_name);
                 }
-            } else {
+            }
+            Ok(Response::Key(None)) => {
                 println!("  (warning: key '{}' does not exist yet)", key_name);
             }
-            ProcessStep::Decrypt { key: key_name }
+            _ => {}
         }
+    }
+
+    let step = match action {
+        "encrypt" => ProcessStep::Encrypt { key: key_name },
+        "decrypt" => ProcessStep::Decrypt { key: key_name },
         _ => {
             println!("% Unknown process action '{}'. Use 'encrypt' or 'decrypt'.", action);
             return;
@@ -1244,12 +1221,10 @@ pub fn no_feed_command(args: &[&str], state: &mut ShellState) {
             }
             "process" => {
                 if value_args.is_empty() {
-                    // Clear all process steps
                     let count = feed.process.len();
                     feed.process.clear();
                     println!("  All process steps removed ({} cleared).", count);
                 } else {
-                    // Remove by 1-based index
                     let index_str = value_args[0];
                     match index_str.parse::<usize>() {
                         Ok(idx) if idx >= 1 && idx <= feed.process.len() => {
@@ -1361,7 +1336,6 @@ pub fn move_nextstep(args: &[&str], state: &mut ShellState) {
         info!("Moved nextstep from position {} to {}", from, to);
         println!("  Moved nextstep [{}] → [{}].", from, to);
 
-        // Show the new order
         for (i, ns) in feed.nextsteps.iter().enumerate() {
             println!("    [{}] {}", i + 1, ns.display_inline());
         }
@@ -1381,35 +1355,41 @@ pub fn show_pending_feed(state: &ShellState) {
     }
 }
 
-/// Commit the pending feed to disk and sync its schedules to dkron.
+/// Commit the pending feed to the daemon via RPC.
 pub fn commit_feed(state: &mut ShellState) {
     let feed_name = match &state.mode {
         Mode::FeedEdit(name) => name.clone(),
         _ => return,
     };
 
-    if let Some(feed) = state.pending_feed.take() {
-        state.config.feeds.insert(feed_name.clone(), feed);
-        match state.config.save() {
-            Ok(()) => {
-                info!("Committed feed '{}'", feed_name);
-                println!("Feed '{}' committed.", feed_name);
-            }
-            Err(e) => {
-                eprintln!("% Error saving config: {}", e);
-                return;
-            }
-        }
+    let feed = match &state.pending_feed {
+        Some(f) => f.clone(),
+        None => return,
+    };
 
-        // Sync schedules to dkron if a URL is configured.
+    let schedules = feed.schedules.clone();
+    let enabled = feed.flags.enabled;
+
+    let success = {
+        if !has_rpc(state) { return; }
+        let rpc = state.rpc.as_mut().unwrap();
+        match rpc.call(Request::PutFeed { name: feed_name.clone(), feed }) {
+            Ok(Response::Ok) => true,
+            Err(e) => { eprintln!("% Error: {}", e); false }
+            _ => false,
+        }
+    };
+
+    if success {
+        state.pending_feed = None;
+        info!("Committed feed '{}'", feed_name);
+        println!("Feed '{}' committed.", feed_name);
+
+        // Sync schedules to dkron if configured
         if let Some(ref dkron_url) = state.config.server.dkron_url.clone() {
-            let feed = state.config.feeds.get(&feed_name).unwrap();
-            let client = crate::dkron::DkronClient::new(dkron_url);
-            match client.upsert_feed_jobs(&feed_name, &feed.schedules, feed.flags.enabled) {
-                Ok(()) => println!(
-                    "  Synced {} schedule(s) to dkron.",
-                    feed.schedules.len()
-                ),
+            let client = crate::dkron::DkronClient::new(&dkron_url); // dkron.rs
+            match client.upsert_feed_jobs(&feed_name, &schedules, enabled) {
+                Ok(()) => println!("  Synced {} schedule(s) to dkron.", schedules.len()),
                 Err(e) => eprintln!("% Warning: dkron sync failed: {}", e),
             }
         }
@@ -1511,26 +1491,34 @@ pub fn set_nextstep_target(args: &[&str], state: &mut ShellState) {
         return;
     }
 
+    // For RunFeed targets, check if the feed exists (best-effort RPC check)
+    let is_run_feed = matches!(
+        state.pending_nextstep.as_ref().map(|ns| &ns.action),
+        Some(NextStepAction::RunFeed { .. })
+    );
+    if is_run_feed {
+        let target = args[0].to_string();
+        let editing_self = match &state.mode {
+            Mode::NextStepEdit(name) => name == &target,
+            _ => false,
+        };
+        if !editing_self {
+            if let Some(ref mut rpc) = state.rpc {
+                if let Ok(Response::Feed(None)) = rpc.call(Request::GetFeed { name: target.clone() }) {
+                    println!("  (warning: feed '{}' does not exist yet)", target);
+                }
+            }
+        }
+    }
+
     if let Some(ref mut ns) = state.pending_nextstep {
         match &mut ns.action {
             NextStepAction::RunFeed { feed } => {
                 let target = args[0].to_string();
-                // Warn if feed doesn't exist (it might be the current feed being edited, which is ok)
-                if !state.config.feeds.contains_key(&target) {
-                    // Check if it matches the feed we're currently editing
-                    let editing_self = match &state.mode {
-                        Mode::NextStepEdit(name) => name == &target,
-                        _ => false,
-                    };
-                    if !editing_self {
-                        println!("  (warning: feed '{}' does not exist yet)", target);
-                    }
-                }
                 *feed = target.clone();
                 println!("  target → {}", target);
             }
             NextStepAction::SendEmail { emails } => {
-                // Join all args in case spaces around commas, then split on commas
                 let raw = args.join(" ");
                 let parsed: Vec<String> = raw
                     .split(',')
@@ -1608,7 +1596,6 @@ pub fn no_nextstep_command(args: &[&str], state: &mut ShellState) {
     }
 
     if args.len() < 2 {
-        // Clear all conditions
         if let Some(ref mut ns) = state.pending_nextstep {
             ns.on.clear();
             println!("  All conditions cleared.");
@@ -1679,9 +1666,7 @@ pub fn done_nextstep(state: &mut ShellState) {
         _ => return,
     };
 
-    // Validate the nextstep
     if let Some(ref ns) = state.pending_nextstep {
-        // Check target is set
         match &ns.action {
             NextStepAction::RunFeed { feed } => {
                 if feed.is_empty() {
@@ -1703,7 +1688,6 @@ pub fn done_nextstep(state: &mut ShellState) {
             }
         }
 
-        // Check at least one condition is set
         if ns.on.is_empty() {
             println!("% No trigger conditions set. Use 'on <success|noaction|failed>'.");
             return;
@@ -1733,11 +1717,14 @@ pub fn abort_nextstep(state: &mut ShellState) {
 }
 
 // ============================================================
-// Shared / show commands
+// Shared / show commands (exec mode)
 // ============================================================
+//
+// Show commands fetch data from the daemon via RPC.
+// "show server" stays local (CLI connection settings).
 
 /// Handle 'show' subcommands in exec mode.
-pub fn show(args: &[&str], state: &ShellState) {
+pub fn show(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
         println!("Usage: show <subcommand>");
         println!("  endpoints          List all endpoints");
@@ -1782,84 +1769,131 @@ pub fn show(args: &[&str], state: &ShellState) {
     }
 }
 
-/// List all configured endpoints.
-fn show_endpoints(state: &ShellState) {
-    if state.config.endpoints.is_empty() {
+/// List all configured endpoints (fetched from daemon).
+fn show_endpoints(state: &mut ShellState) {
+    if !has_rpc(state) { return; }
+    let rpc = state.rpc.as_mut().unwrap();
+
+    let names = match rpc.call(Request::ListEndpoints) {
+        Ok(Response::Names(n)) => n,
+        Err(e) => { println!("% Error: {}", e); return; }
+        _ => return,
+    };
+
+    if names.is_empty() {
         println!("No endpoints configured.");
         return;
     }
 
     println!("Configured endpoints:");
-    for (name, ep) in &state.config.endpoints {
-        let host = ep.host.as_deref().unwrap_or("(no host)");
-        let port = ep.port.map_or(String::new(), |p| format!(":{}", p));
-        let user = ep.username.as_deref().unwrap_or("(no user)");
-        println!("  {:20} {}@{}{}", name, user, host, port);
+    for name in &names {
+        match rpc.call(Request::GetEndpoint { name: name.clone() }) {
+            Ok(Response::Endpoint(Some(ep))) => {
+                let host = ep.host.as_deref().unwrap_or("(no host)");
+                let port = ep.port.map_or(String::new(), |p| format!(":{}", p));
+                let user = ep.username.as_deref().unwrap_or("(no user)");
+                println!("  {:20} {}@{}{}", name, user, host, port);
+            }
+            _ => println!("  {:20} (error fetching details)", name),
+        }
     }
 }
 
-/// Show detail for a single endpoint.
-fn show_endpoint_detail(name: &str, state: &ShellState) {
-    match state.config.endpoints.get(name) {
-        Some(ep) => ep.display(name),
-        None => println!("% Endpoint '{}' does not exist.", name),
+/// Show detail for a single endpoint (fetched from daemon).
+fn show_endpoint_detail(name: &str, state: &mut ShellState) {
+    if !has_rpc(state) { return; }
+    let rpc = state.rpc.as_mut().unwrap();
+
+    match rpc.call(Request::GetEndpoint { name: name.to_string() }) {
+        Ok(Response::Endpoint(Some(ep))) => ep.display(name),
+        Ok(Response::Endpoint(None)) => println!("% Endpoint '{}' does not exist.", name),
+        Err(e) => println!("% Error: {}", e),
+        _ => {}
     }
 }
 
-/// List all configured keys.
-fn show_keys(state: &ShellState) {
-    if state.config.keys.is_empty() {
+/// List all configured keys (fetched from daemon).
+fn show_keys(state: &mut ShellState) {
+    if !has_rpc(state) { return; }
+    let rpc = state.rpc.as_mut().unwrap();
+
+    let names = match rpc.call(Request::ListKeys) {
+        Ok(Response::Names(n)) => n,
+        Err(e) => { println!("% Error: {}", e); return; }
+        _ => return,
+    };
+
+    if names.is_empty() {
         println!("No keys configured.");
         return;
     }
 
     println!("Configured keys:");
-    for (name, key) in &state.config.keys {
-        let ktype = key.key_type.as_ref().map_or("(no type)", |t| match t {
-            KeyType::Public  => "public",
-            KeyType::Private => "private",
-        });
-        let has_contents = if key.contents.is_some() { "loaded" } else { "empty" };
-        println!("  {:20} {:10} {}", name, ktype, has_contents);
+    for name in &names {
+        match rpc.call(Request::GetKey { name: name.clone() }) {
+            Ok(Response::Key(Some(key))) => {
+                let ktype = key.key_type.as_ref().map_or("(no type)", |t| match t {
+                    KeyType::Public  => "public",
+                    KeyType::Private => "private",
+                });
+                let has_contents = if key.contents.is_some() { "loaded" } else { "empty" };
+                println!("  {:20} {:10} {}", name, ktype, has_contents);
+            }
+            _ => println!("  {:20} (error fetching details)", name),
+        }
     }
 }
 
-/// Show detail for a single key.
-fn show_key_detail(name: &str, state: &ShellState) {
-    match state.config.keys.get(name) {
-        Some(key) => key.display(name),
-        None => println!("% Key '{}' does not exist.", name),
+/// Show detail for a single key (fetched from daemon).
+fn show_key_detail(name: &str, state: &mut ShellState) {
+    if !has_rpc(state) { return; }
+    let rpc = state.rpc.as_mut().unwrap();
+
+    match rpc.call(Request::GetKey { name: name.to_string() }) {
+        Ok(Response::Key(Some(key))) => key.display(name),
+        Ok(Response::Key(None)) => println!("% Key '{}' does not exist.", name),
+        Err(e) => println!("% Error: {}", e),
+        _ => {}
     }
 }
 
-/// List all configured feeds.
-fn show_feeds(state: &ShellState) {
-    if state.config.feeds.is_empty() {
+/// List all configured feeds (fetched from daemon via FeedSummaries).
+fn show_feeds(state: &mut ShellState) {
+    if !has_rpc(state) { return; }
+    let rpc = state.rpc.as_mut().unwrap();
+
+    let summaries = match rpc.call(Request::ListFeeds) {
+        Ok(Response::FeedSummaries(s)) => s,
+        Err(e) => { println!("% Error: {}", e); return; }
+        _ => return,
+    };
+
+    if summaries.is_empty() {
         println!("No feeds configured.");
         return;
     }
 
     println!("Configured feeds:");
-    for (name, feed) in &state.config.feeds {
-        let src_count = feed.sources.len();
-        let proc_count = feed.process.len();
-        let dst_count = feed.destinations.len();
-        let sched_count = feed.schedules.len();
-        // Green for enabled, red for disabled
-        let colored_name = if feed.flags.enabled {
-            format!("\x1b[32m{:20}\x1b[0m", name)
+    for fs in &summaries {
+        let colored_name = if fs.enabled {
+            format!("\x1b[32m{:20}\x1b[0m", fs.name)
         } else {
-            format!("\x1b[31m{:20}\x1b[0m", name)
+            format!("\x1b[31m{:20}\x1b[0m", fs.name)
         };
-        println!("  {} {} source(s), {} process(es), {} destination(s), {} schedule(s)",
-            colored_name, src_count, proc_count, dst_count, sched_count);
+        println!("  {} {} source(s), {} destination(s), {} schedule(s)",
+            colored_name, fs.sources, fs.destinations, fs.schedules);
     }
 }
 
-/// Show detail for a single feed.
-fn show_feed_detail(name: &str, state: &ShellState) {
-    match state.config.feeds.get(name) {
-        Some(feed) => feed.display(name),
-        None => println!("% Feed '{}' does not exist.", name),
+/// Show detail for a single feed (fetched from daemon).
+fn show_feed_detail(name: &str, state: &mut ShellState) {
+    if !has_rpc(state) { return; }
+    let rpc = state.rpc.as_mut().unwrap();
+
+    match rpc.call(Request::GetFeed { name: name.to_string() }) {
+        Ok(Response::Feed(Some(feed))) => feed.display(name),
+        Ok(Response::Feed(None)) => println!("% Feed '{}' does not exist.", name),
+        Err(e) => println!("% Error: {}", e),
+        _ => {}
     }
 }

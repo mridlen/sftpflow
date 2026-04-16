@@ -7,6 +7,7 @@ use rustyline::DefaultEditor;
 
 use crate::commands; // commands.rs
 use crate::feed::{Config, Endpoint, Feed, NextStep, PgpKey, ServerConnection}; // feed.rs
+use crate::rpc::RpcClient; // rpc.rs
 
 /// Shell modes, similar to Cisco IOS privilege levels.
 #[derive(Debug, Clone, PartialEq)]
@@ -30,6 +31,10 @@ pub struct ShellState {
     pub mode: Mode,
     pub running: bool,
     pub config: Config,
+    /// RPC connection to the daemon.
+    pub rpc: Option<RpcClient>,
+    /// Socket address for direct-connect (dev) mode; None = use SSH.
+    pub socket_addr: Option<String>,
     /// Staging area: uncommitted edits to the feed being configured.
     pub pending_feed: Option<Feed>,
     /// Staging area: uncommitted edits to the endpoint being configured.
@@ -43,18 +48,61 @@ pub struct ShellState {
 }
 
 impl ShellState {
-    pub fn new() -> Self {
+    pub fn new(socket_addr: Option<String>) -> Self {
         let config = Config::load();
-        ShellState {
+        let mut state = ShellState {
             mode: Mode::Exec,
             running: true,
             config,
+            rpc: None,
+            socket_addr,
             pending_feed: None,
             pending_endpoint: None,
             pending_key: None,
             pending_nextstep: None,
             pending_server: None,
+        };
+        state.try_connect();
+        state
+    }
+
+    /// Attempt to connect to the daemon. Uses socket_addr (dev) or
+    /// SSH via ServerConnection (prod).
+    pub fn try_connect(&mut self) {
+        self.rpc = None;
+
+        let mut rpc = if let Some(ref addr) = self.socket_addr {
+            match RpcClient::connect_socket(addr) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("% Could not connect to {}: {}", addr, e);
+                    return;
+                }
+            }
+        } else {
+            let server = self.config.server.clone();
+            match RpcClient::connect_ssh(&server) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("% Could not connect to daemon: {}", e);
+                    eprintln!("% Use 'config' to set server settings, then 'connect'.");
+                    return;
+                }
+            }
+        };
+
+        // Verify with GetServerInfo
+        use sftpflow_proto::{Request, Response};
+        match rpc.call(Request::GetServerInfo) {
+            Ok(Response::ServerInfo(info)) => {
+                println!("Connected to sftpflowd v{} ({}, up {}s)",
+                    info.version, info.hostname, info.uptime_seconds);
+            }
+            Ok(_) => println!("Connected to daemon."),
+            Err(e) => eprintln!("% Warning: server info unavailable: {}", e),
         }
+
+        self.rpc = Some(rpc);
     }
 
     /// Build the prompt string based on the current mode.
@@ -71,9 +119,9 @@ impl ShellState {
 }
 
 /// Main entry point for the interactive shell.
-pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+pub fn run(socket_addr: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
     let mut rl = DefaultEditor::new()?;
-    let mut state = ShellState::new();
+    let mut state = ShellState::new(socket_addr);
 
     // Load history if available
     let history_path = history_path();
@@ -141,6 +189,7 @@ fn dispatch_exec(cmd: &str, args: &[&str], state: &mut ShellState) {
         "rename"           => commands::rename(args, state),
         "show"             => commands::show(args, state),
         "run"              => commands::run(args, state),
+        "connect"          => commands::connect(state),
         "config"           => commands::enter_config(state),
         "exit" | "quit"    => commands::exit_shell(state),
         "version"          => commands::version(),

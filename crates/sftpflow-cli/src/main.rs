@@ -16,6 +16,9 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
 
+    // Parse --socket <addr> for dev/direct-connect mode.
+    let socket_addr = parse_socket_arg(&args);
+
     // Non-interactive mode: sftpflow run <feed-name>
     // This is how dkron worker nodes invoke sftpflow.
     if args.len() >= 3 && args[1] == "run" {
@@ -37,11 +40,27 @@ fn main() {
     }
 
     // Interactive shell
-    println!("SFTPflow v0.1.1");
+    println!("SFTPflow v{}", env!("CARGO_PKG_VERSION"));
     println!("Type 'help' for a list of commands.\n");
 
-    if let Err(e) = cli::run() {
+    if let Err(e) = cli::run(socket_addr) {
         eprintln!("Error: {}", e);
         process::exit(1);
     }
+}
+
+// ============================================================
+// Argument helpers
+// ============================================================
+
+/// Scan for `--socket <addr>`. Returns Some(addr) if present.
+fn parse_socket_arg(args: &[String]) -> Option<String> {
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--socket" && i + 1 < args.len() {
+            return Some(args[i + 1].clone());
+        }
+        i += 1;
+    }
+    None
 }
