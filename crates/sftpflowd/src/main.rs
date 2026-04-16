@@ -20,7 +20,8 @@ use log::{error, info};
 
 use sftpflow_core::Config;
 
-mod server; // server.rs - listener + connection handling + dispatch
+mod handlers; // handlers.rs - RPC method implementations
+mod server;   // server.rs - listener + connection handling + dispatch
 
 // ============================================================
 // main

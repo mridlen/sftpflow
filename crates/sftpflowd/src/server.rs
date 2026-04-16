@@ -25,13 +25,12 @@ use sftpflow_core::Config;
 use sftpflow_proto::{
     error_code,
     framing,
-    FeedSummary,
     Request,
     RequestEnvelope,
-    Response,
     ResponseEnvelope,
-    ServerInfo,
 };
+
+use crate::handlers; // handlers.rs - RPC method implementations
 
 // ============================================================
 // Shared daemon state
@@ -204,12 +203,9 @@ where
 // Request dispatch
 // ============================================================
 //
-// Milestone 3 implements the read-only introspection methods:
-//   Ping, GetServerInfo, ListFeeds, ListEndpoints, ListKeys,
-//   GetEndpoint, GetKey, GetFeed
-//
-// Mutating methods (Put/Delete/Rename/RunFeedNow) return a
-// "not yet implemented" error; they'll land in later milestones.
+// Thin routing layer: reads from state, calls into handlers.rs for
+// actual business logic. Read-only RPCs lock briefly and release;
+// mutating RPCs hold the lock through the full mutation + save.
 
 fn dispatch(env: RequestEnvelope, state: &Arc<Mutex<DaemonState>>) -> ResponseEnvelope {
     let id = env.id;
@@ -217,92 +213,101 @@ fn dispatch(env: RequestEnvelope, state: &Arc<Mutex<DaemonState>>) -> ResponseEn
 
     match env.request {
         // ---- liveness / introspection ----
-        Request::Ping => ResponseEnvelope::success(id, Response::Pong),
+        Request::Ping => ResponseEnvelope::success(id, handlers::ping()),
 
         Request::GetServerInfo => {
             let guard = state.lock().unwrap();
-            let info = ServerInfo {
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                hostname: hostname(),
-                uptime_seconds: guard.started.elapsed().as_secs(),
-            };
-            ResponseEnvelope::success(id, Response::ServerInfo(info))
+            ResponseEnvelope::success(id, handlers::get_server_info(guard.started))
         }
 
-        // ---- endpoints (read-only) ----
+        // ---- endpoints (read) ----
         Request::ListEndpoints => {
             let guard = state.lock().unwrap();
-            let names: Vec<String> = guard.config.endpoints.keys().cloned().collect();
-            ResponseEnvelope::success(id, Response::Names(names))
+            ResponseEnvelope::success(id, handlers::list_endpoints(&guard))
         }
         Request::GetEndpoint { name } => {
             let guard = state.lock().unwrap();
-            let ep = guard.config.endpoints.get(&name).cloned();
-            ResponseEnvelope::success(id, Response::Endpoint(ep))
+            ResponseEnvelope::success(id, handlers::get_endpoint(&guard, &name))
         }
 
-        // ---- keys (read-only) ----
+        // ---- endpoints (mutate) ----
+        Request::PutEndpoint { name, endpoint } => {
+            let mut guard = state.lock().unwrap();
+            result_to_envelope(id, handlers::put_endpoint(&mut guard, name, endpoint))
+        }
+        Request::DeleteEndpoint { name } => {
+            let mut guard = state.lock().unwrap();
+            result_to_envelope(id, handlers::delete_endpoint(&mut guard, &name))
+        }
+        Request::RenameEndpoint { from, to } => {
+            let mut guard = state.lock().unwrap();
+            result_to_envelope(id, handlers::rename_endpoint(&mut guard, from, to))
+        }
+
+        // ---- keys (read) ----
         Request::ListKeys => {
             let guard = state.lock().unwrap();
-            let names: Vec<String> = guard.config.keys.keys().cloned().collect();
-            ResponseEnvelope::success(id, Response::Names(names))
+            ResponseEnvelope::success(id, handlers::list_keys(&guard))
         }
         Request::GetKey { name } => {
             let guard = state.lock().unwrap();
-            let key = guard.config.keys.get(&name).cloned();
-            ResponseEnvelope::success(id, Response::Key(key))
+            ResponseEnvelope::success(id, handlers::get_key(&guard, &name))
         }
 
-        // ---- feeds (read-only) ----
+        // ---- keys (mutate) ----
+        Request::PutKey { name, key } => {
+            let mut guard = state.lock().unwrap();
+            result_to_envelope(id, handlers::put_key(&mut guard, name, key))
+        }
+        Request::DeleteKey { name } => {
+            let mut guard = state.lock().unwrap();
+            result_to_envelope(id, handlers::delete_key(&mut guard, &name))
+        }
+        Request::RenameKey { from, to } => {
+            let mut guard = state.lock().unwrap();
+            result_to_envelope(id, handlers::rename_key(&mut guard, from, to))
+        }
+
+        // ---- feeds (read) ----
         Request::ListFeeds => {
             let guard = state.lock().unwrap();
-            let summaries: Vec<FeedSummary> = guard
-                .config
-                .feeds
-                .iter()
-                .map(|(name, feed)| FeedSummary {
-                    name: name.clone(),
-                    enabled: feed.flags.enabled,
-                    sources: feed.sources.len(),
-                    destinations: feed.destinations.len(),
-                    schedules: feed.schedules.len(),
-                })
-                .collect();
-            ResponseEnvelope::success(id, Response::FeedSummaries(summaries))
+            ResponseEnvelope::success(id, handlers::list_feeds(&guard))
         }
         Request::GetFeed { name } => {
             let guard = state.lock().unwrap();
-            let feed = guard.config.feeds.get(&name).cloned();
-            ResponseEnvelope::success(id, Response::Feed(feed))
+            ResponseEnvelope::success(id, handlers::get_feed(&guard, &name))
         }
 
-        // ---- mutating methods (not yet implemented) ----
-        Request::PutEndpoint { .. }
-        | Request::DeleteEndpoint { .. }
-        | Request::RenameEndpoint { .. }
-        | Request::PutKey { .. }
-        | Request::DeleteKey { .. }
-        | Request::RenameKey { .. }
-        | Request::PutFeed { .. }
-        | Request::DeleteFeed { .. }
-        | Request::RenameFeed { .. }
-        | Request::RunFeedNow { .. } => ResponseEnvelope::failure(
-            id,
-            error_code::INTERNAL_ERROR,
-            "not yet implemented",
-        ),
+        // ---- feeds (mutate) ----
+        Request::PutFeed { name, feed } => {
+            let mut guard = state.lock().unwrap();
+            result_to_envelope(id, handlers::put_feed(&mut guard, name, feed))
+        }
+        Request::DeleteFeed { name } => {
+            let mut guard = state.lock().unwrap();
+            result_to_envelope(id, handlers::delete_feed(&mut guard, &name))
+        }
+        Request::RenameFeed { from, to } => {
+            let mut guard = state.lock().unwrap();
+            result_to_envelope(id, handlers::rename_feed(&mut guard, from, to))
+        }
+
+        // ---- execution ----
+        Request::RunFeedNow { name } => {
+            let guard = state.lock().unwrap();
+            result_to_envelope(id, handlers::run_feed_now(&guard, &name))
+        }
     }
 }
 
-// ============================================================
-// Helpers
-// ============================================================
-
-/// Best-effort hostname: $HOSTNAME, $COMPUTERNAME, or "unknown".
-/// We avoid pulling in a dedicated crate for this — the value is
-/// informational only (shown in `show server info`).
-fn hostname() -> String {
-    std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("COMPUTERNAME"))
-        .unwrap_or_else(|_| "unknown".to_string())
+/// Convert a handler `Result<Response, ProtoError>` into the wire
+/// envelope, attaching the request's correlation id.
+fn result_to_envelope(
+    id: u64,
+    result: Result<sftpflow_proto::Response, sftpflow_proto::ProtoError>,
+) -> ResponseEnvelope {
+    match result {
+        Ok(response) => ResponseEnvelope::success(id, response),
+        Err(error) => ResponseEnvelope::failure(id, error.code, error.message),
+    }
 }
