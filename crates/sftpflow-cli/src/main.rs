@@ -8,6 +8,7 @@ pub use sftpflow_core as feed;
 mod cli;      // cli.rs - interactive shell loop and command dispatch
 mod commands; // commands.rs - command implementations
 mod dkron;    // dkron.rs - dkron scheduler API client
+pub mod rpc;  // rpc.rs - RPC client for talking to sftpflowd
 
 fn main() {
     // Initialize logging (set RUST_LOG=info to see log output)

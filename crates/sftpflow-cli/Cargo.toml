@@ -23,7 +23,8 @@ name = "sftpflow"
 path = "src/main.rs"
 
 [dependencies]
-sftpflow-core = { path = "../sftpflow-core" }
+sftpflow-core  = { path = "../sftpflow-core" }
+sftpflow-proto = { path = "../sftpflow-proto" }
 
 rustyline   = { workspace = true }
 serde       = { workspace = true }
