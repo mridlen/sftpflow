@@ -1,0 +1,55 @@
+# ============================================================
+# docker/sshd_config - sftpflow test server
+# ============================================================
+#
+# Intentionally minimal. The only account allowed in is the
+# "sftpflow" user, and every session for that user is pinned to
+# the sftpflow-shell bridge via ForceCommand. No interactive
+# shell access is possible.
+
+Port 22
+AddressFamily inet
+ListenAddress 0.0.0.0
+
+# Persistent host keys live in a volume-backed directory so restarts
+# don't invalidate the CLI's known_hosts entry. entrypoint.sh creates
+# them on first boot.
+HostKey /etc/ssh/keys/ssh_host_ed25519_key
+HostKey /etc/ssh/keys/ssh_host_rsa_key
+
+# ---- Auth ----
+PermitRootLogin no
+PasswordAuthentication no
+ChallengeResponseAuthentication no
+PubkeyAuthentication yes
+PermitEmptyPasswords no
+UsePAM no
+
+# Only the sftpflow user is allowed in. The atmoz/sftp peers run
+# their own sshd — they are not reachable through this one.
+AllowUsers sftpflow
+
+# Authorized keys live in the user's home (entrypoint.sh copies the
+# mounted test key into place on boot).
+AuthorizedKeysFile .ssh/authorized_keys
+
+# Keep the test container lightweight.
+X11Forwarding no
+AllowTcpForwarding no
+AllowAgentForwarding no
+GatewayPorts no
+PermitTunnel no
+
+# ---- Logging (global — MUST come before any Match block) ----
+# sshd only allows a small whitelist of directives inside a Match
+# block; LogLevel/SyslogFacility aren't on it, so set them up here
+# where they apply globally.
+LogLevel INFO
+SyslogFacility AUTH
+
+# ---- The bridge ----
+# Every session (including `ssh -T`) is replaced with sftpflow-shell,
+# which pipes the SSH channel to the daemon socket. Everything below
+# this Match line applies only to the sftpflow user.
+Match User sftpflow
+    ForceCommand /usr/local/bin/sftpflow-shell --socket unix:/run/sftpflow/sftpflow.sock

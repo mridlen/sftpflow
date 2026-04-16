@@ -1,0 +1,105 @@
+# ============================================================
+# docker/Dockerfile.sftpflow-server
+# ============================================================
+#
+# Test image: packages sftpflowd + sftpflow-shell + OpenSSH into
+# one container that mirrors the production deployment shape.
+#
+# Layout inside the running container:
+#   sshd              - listens on :22 (exposed as :2222 by compose)
+#   sftpflowd         - listens on unix:/run/sftpflow/sftpflow.sock
+#   sftpflow-shell    - ForceCommand'd for the "sftpflow" SSH user;
+#                       bridges the SSH channel to the daemon socket.
+#
+# On the host, the CLI connects like this:
+#   sftpflow> config
+#   sftpflow(config-server)# name test
+#   sftpflow(config-server)# ssh sftpflow@localhost:2222
+#   sftpflow(config-server)# identity-file docker/test-keys/id_ed25519
+#   sftpflow(config-server)# commit
+#   sftpflow# connect test
+#
+# Build:
+#   docker compose -f docker/compose.test.yml build sftpflow-server
+# Run:
+#   make test-up
+#
+# Intentionally NOT production-ready:
+#   - sshd runs as PID 1 with sftpflowd as a background child (no
+#     supervisor). If the daemon dies, sshd will keep accepting
+#     connections but the bridge will fail. Good enough for tests.
+#   - Host keys are persisted in a named volume so repeated starts
+#     don't invalidate the client's known_hosts entry.
+
+# ------------------------------------------------------------
+# Stage 1: build sftpflowd and sftpflow-shell from the workspace
+# ------------------------------------------------------------
+FROM rust:1-slim-bookworm AS builder
+
+WORKDIR /build
+
+# Copy the whole workspace. We could be cleverer with layer caching
+# by copying Cargo.toml files first, but the workspace is small and
+# this keeps the Dockerfile obvious.
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+# Only build the two binaries we need in the final image. The CLI
+# (sftpflow) lives on the developer's host, not in the server image.
+RUN cargo build --release -p sftpflowd -p sftpflow-shell
+
+# ------------------------------------------------------------
+# Stage 2: runtime image (Debian + OpenSSH + our binaries)
+# ------------------------------------------------------------
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        openssh-server \
+        ca-certificates \
+        tini \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---- sftpflow user (owns the daemon, runs the forced shell) ----
+# Fixed uid/gid keep bind-mount permissions predictable on Linux hosts.
+#
+# Login shell is /bin/sh (NOT /usr/sbin/nologin): sshd's ForceCommand
+# invokes the command via "<login-shell> -c <cmd>", so nologin would
+# short-circuit with "account not available" before sftpflow-shell
+# ever ran. AllowUsers + ForceCommand in sshd_config still prevent
+# any interactive access.
+#
+# usermod -p '*' replaces the default "!" placeholder (which sshd
+# reads as "account locked" and refuses even pubkey auth) with "*"
+# — still no valid password hash, but the account is no longer locked.
+RUN groupadd --system --gid 2000 sftpflow \
+    && useradd  --system --uid 2000 --gid sftpflow \
+                --home-dir /home/sftpflow --create-home \
+                --shell /bin/sh \
+                sftpflow \
+    && usermod -p '*' sftpflow
+
+# ---- Runtime directories ----
+# /run/sftpflow        - holds the daemon's unix socket
+# /var/lib/sftpflow    - config.yaml lives here (persisted in a volume)
+# /etc/ssh/keys        - sshd host keys (persisted in a volume)
+# /home/sftpflow/.ssh  - authorized_keys for the sftpflow SSH user
+RUN mkdir -p /run/sftpflow /var/lib/sftpflow /etc/ssh/keys /home/sftpflow/.ssh /var/run/sshd \
+    && chown -R sftpflow:sftpflow /run/sftpflow /var/lib/sftpflow /home/sftpflow/.ssh \
+    && chmod 700 /home/sftpflow/.ssh
+
+# ---- Binaries ----
+COPY --from=builder /build/target/release/sftpflowd      /usr/local/bin/sftpflowd
+COPY --from=builder /build/target/release/sftpflow-shell /usr/local/bin/sftpflow-shell
+RUN chmod +x /usr/local/bin/sftpflowd /usr/local/bin/sftpflow-shell
+
+# ---- sshd configuration + entrypoint ----
+COPY docker/sshd_config /etc/ssh/sshd_config
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+# SSH listens on 22 inside the container; compose maps it to :2222.
+EXPOSE 22
+
+# tini reaps zombies so the backgrounded sftpflowd gets cleaned up
+# when the container stops.
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]
