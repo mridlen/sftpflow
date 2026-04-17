@@ -22,9 +22,11 @@ name = "sftpflowd"
 path = "src/main.rs"
 
 [dependencies]
-sftpflow-core  = { path = "../sftpflow-core" }
-sftpflow-proto = { path = "../sftpflow-proto" }
+sftpflow-core      = { path = "../sftpflow-core" }
+sftpflow-proto     = { path = "../sftpflow-proto" }
+sftpflow-transport = { path = "../sftpflow-transport" }
 
 serde_json = { workspace = true }
 log        = { workspace = true }
 env_logger = { workspace = true }
+tokio      = { workspace = true }

@@ -1,0 +1,35 @@
+# ============================================================
+# sftpflow-transport
+# ============================================================
+#
+# Transfer engine crate. Defines the Transport trait and
+# protocol-specific implementations. v1 ships SFTP only
+# (via russh + russh-sftp); FTP/HTTP/HTTPS come later.
+#
+# This crate is async (tokio). The daemon bridges into it
+# with tokio::runtime::Runtime::block_on() from its sync
+# thread-per-connection model.
+
+[package]
+name = "sftpflow-transport"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "sftpflow_transport"
+path = "src/lib.rs"
+
+[dependencies]
+sftpflow-core  = { path = "../sftpflow-core" }
+sftpflow-proto = { path = "../sftpflow-proto" }
+
+serde_json  = { workspace = true }
+log         = { workspace = true }
+async-trait = { workspace = true }
+tokio       = { workspace = true }
+russh       = { workspace = true }
+russh-sftp  = { workspace = true }
+tempfile    = { workspace = true }

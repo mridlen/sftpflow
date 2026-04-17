@@ -20,7 +20,7 @@
 
 use std::time::Instant;
 
-use log::info;
+use log::{error, info};
 
 use sftpflow_core::{Config, Endpoint, NextStepAction, PgpKey, ProcessStep};
 use sftpflow_proto::{
@@ -28,8 +28,6 @@ use sftpflow_proto::{
     FeedSummary,
     ProtoError,
     Response,
-    RunResult,
-    RunStatus,
     ServerInfo,
 };
 
@@ -339,23 +337,51 @@ pub fn rename_feed(
     Ok(Response::Ok)
 }
 
-/// Stub: verifies the feed exists, then returns a RunResult that
-/// signals nothing happened because the transfer engine isn't wired
-/// yet. Real implementation arrives in milestone 7.
+/// Execute a feed: download from sources, upload to destinations,
+/// optionally delete source files afterward.
+///
+/// Creates a short-lived tokio runtime to bridge into the async
+/// transport layer (russh/russh-sftp). The runtime is dropped
+/// when this function returns.
 pub fn run_feed_now(
     state: &DaemonState,
     name: &str,
 ) -> Result<Response, ProtoError> {
-    if !state.config.feeds.contains_key(name) {
-        return Err(not_found("feed", name));
-    }
-    info!("run_feed_now requested for '{}' (stub)", name);
-    Ok(Response::RunResult(RunResult {
-        feed: name.to_string(),
-        status: RunStatus::Noaction,
-        files_transferred: 0,
-        message: Some(
-            "transfer engine not yet implemented (milestone 7)".to_string(),
-        ),
-    }))
+    let feed = state.config.feeds.get(name).ok_or_else(|| {
+        not_found("feed", name)
+    })?;
+
+    info!("run_feed_now requested for '{}'", name);
+
+    // Clone the data we need so we can release the DaemonState
+    // lock before blocking on async I/O.
+    let feed = feed.clone();
+    let endpoints = state.config.endpoints.clone();
+    let feed_name = name.to_string();
+
+    // Build a single-threaded tokio runtime for the transfer.
+    // The daemon is thread-per-connection, so each RunFeedNow
+    // gets its own runtime. This keeps the sync↔async boundary
+    // clean and self-contained.
+    let rt = tokio::runtime::Runtime::new().map_err(|e| {
+        error!("run_feed_now '{}': failed to create tokio runtime: {}", feed_name, e);
+        ProtoError {
+            code: error_code::INTERNAL_ERROR,
+            message: format!("failed to create async runtime: {}", e),
+        }
+    })?;
+
+    // run_feed() in sftpflow-transport (lib.rs)
+    let result = rt.block_on(sftpflow_transport::run_feed(
+        &feed_name,
+        &feed,
+        &endpoints,
+    ));
+
+    info!(
+        "run_feed_now '{}': completed — status={:?}, files={}",
+        feed_name, result.status, result.files_transferred
+    );
+
+    Ok(Response::RunResult(result))
 }

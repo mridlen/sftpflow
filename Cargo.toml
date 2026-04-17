@@ -3,13 +3,11 @@
 # ============================================================
 #
 # Crates:
-#   sftpflow-core - shared data models and YAML persistence
-#   sftpflow-cli  - interactive shell binary (current `sftpflow`)
-#
-# Future crates (milestones ahead):
+#   sftpflow-core      - shared data models and YAML persistence
 #   sftpflow-proto     - JSON-RPC message types (CLI <-> daemon)
-#   sftpflow-shell     - thin ForceCommand bridge (stdin <-> unix socket)
+#   sftpflow-cli       - interactive shell binary (current `sftpflow`)
 #   sftpflowd          - long-running daemon (scheduler + transfer engine)
+#   sftpflow-shell     - thin ForceCommand bridge (stdin <-> unix socket)
 #   sftpflow-transport - transfer engines (SFTP first, then FTP/HTTP/HTTPS)
 
 [workspace]
@@ -20,6 +18,7 @@ members = [
     "crates/sftpflow-cli",
     "crates/sftpflowd",
     "crates/sftpflow-shell",
+    "crates/sftpflow-transport",
 ]
 
 [workspace.package]
@@ -41,3 +40,8 @@ log        = "0.4"
 env_logger = "0.11"
 rustyline  = "15"
 ureq       = { version = "2", features = ["json"] }
+async-trait = "0.1"
+tokio      = { version = "1", features = ["rt", "macros", "io-util", "fs"] }
+russh      = "0.50"
+russh-sftp = "2.1"
+tempfile   = "3"
