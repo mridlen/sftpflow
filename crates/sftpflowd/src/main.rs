@@ -16,10 +16,11 @@
 
 use std::process;
 
-use log::{error, info};
+use log::{error, info, warn};
 
 use sftpflow_core::Config;
 
+pub mod dkron;    // dkron.rs - Dkron scheduler reconciliation
 mod handlers; // handlers.rs - RPC method implementations
 mod server;   // server.rs - listener + connection handling + dispatch
 
@@ -58,6 +59,24 @@ fn main() {
         config.keys.len(),
         config.feeds.len(),
     );
+    // Startup scheduler reconciliation: sync feed schedules to dkron
+    // if a dkron_url is configured. Best-effort — warn on errors but
+    // don't prevent the daemon from starting.
+    if let Some(ref dkron_url) = config.server.dkron_url {
+        info!("dkron startup sync → {}", dkron_url);
+        let client = dkron::DkronClient::new(dkron_url); // dkron.rs
+        let report = client.reconcile_all(&config.feeds);
+        info!(
+            "dkron startup sync complete: created={}, updated={}, deleted={}, errors={}",
+            report.created, report.updated, report.deleted, report.errors.len()
+        );
+        for err in &report.errors {
+            warn!("dkron startup sync error: {}", err);
+        }
+    } else {
+        info!("no dkron_url configured; scheduler sync disabled");
+    }
+
     info!("listening on {}", socket_addr);
 
     // server::run() - server.rs

@@ -190,6 +190,7 @@ fn dispatch_exec(cmd: &str, args: &[&str], state: &mut ShellState) {
         "show"             => commands::show(args, state),
         "run"              => commands::run(args, state),
         "connect"          => commands::connect(state),
+        "sync"             => commands::sync(args, state),
         "config"           => commands::enter_config(state),
         "exit" | "quit"    => commands::exit_shell(state),
         "version"          => commands::version(),

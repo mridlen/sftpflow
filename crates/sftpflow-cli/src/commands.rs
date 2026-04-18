@@ -49,6 +49,7 @@ pub fn help_exec() {
     println!("  show version                 Show SFTPflow version");
     println!();
     println!("  run feed <name>              Manually run a feed (outside of schedule)");
+    println!("  sync schedules               Reconcile feed schedules with dkron");
     println!("  connect                      Connect (or reconnect) to the daemon");
     println!("  config                       Edit server connection settings");
     println!();
@@ -283,15 +284,7 @@ fn delete_key(name: &str, state: &mut ShellState) {
 }
 
 fn delete_feed(name: &str, state: &mut ShellState) {
-    // Dkron cleanup (best-effort, before daemon delete)
-    if let Some(ref dkron_url) = state.config.server.dkron_url.clone() {
-        let client = crate::dkron::DkronClient::new(&dkron_url); // dkron.rs
-        match client.delete_feed_jobs(name) {
-            Ok(()) => println!("  Removed dkron jobs for feed '{}'.", name),
-            Err(e) => eprintln!("% Warning: dkron cleanup failed: {}", e),
-        }
-    }
-
+    // Dkron cleanup is handled daemon-side after DeleteFeed.
     if !has_rpc(state) { return; }
     let rpc = state.rpc.as_mut().unwrap();
 
@@ -407,6 +400,51 @@ fn run_feed(name: &str, state: &mut ShellState) {
             }
             if result.files_transferred > 0 {
                 println!("  {} file(s) transferred.", result.files_transferred);
+            }
+        }
+        Err(RpcError::Proto(e)) => println!("% {}", e.message),
+        Err(e) => println!("% Error: {}", e),
+        _ => {}
+    }
+}
+
+// ============================================================
+// Scheduler sync
+// ============================================================
+
+/// Handle `sync <target>` in exec mode.
+pub fn sync(args: &[&str], state: &mut ShellState) {
+    if args.is_empty() {
+        println!("% Usage: sync schedules");
+        return;
+    }
+
+    match args[0] {
+        "schedules" => sync_schedules(state),
+        _ => println!("% Unknown sync target '{}'. Usage: sync schedules", args[0]),
+    }
+}
+
+/// Send SyncSchedules RPC and print the report.
+fn sync_schedules(state: &mut ShellState) {
+    if !has_rpc(state) { return; }
+    let rpc = state.rpc.as_mut().unwrap();
+
+    match rpc.call(Request::SyncSchedules) {
+        Ok(Response::SyncReport(report)) => {
+            info!(
+                "sync schedules: created={}, updated={}, deleted={}, errors={}",
+                report.created, report.updated, report.deleted, report.errors.len()
+            );
+            println!("Schedule sync complete:");
+            println!("  Created: {}", report.created);
+            println!("  Updated: {}", report.updated);
+            println!("  Deleted: {}", report.deleted);
+            if !report.errors.is_empty() {
+                println!("  Errors:");
+                for err in &report.errors {
+                    println!("    - {}", err);
+                }
             }
         }
         Err(RpcError::Proto(e)) => println!("% {}", e.message),
@@ -1367,9 +1405,6 @@ pub fn commit_feed(state: &mut ShellState) {
         None => return,
     };
 
-    let schedules = feed.schedules.clone();
-    let enabled = feed.flags.enabled;
-
     let success = {
         if !has_rpc(state) { return; }
         let rpc = state.rpc.as_mut().unwrap();
@@ -1384,15 +1419,7 @@ pub fn commit_feed(state: &mut ShellState) {
         state.pending_feed = None;
         info!("Committed feed '{}'", feed_name);
         println!("Feed '{}' committed.", feed_name);
-
-        // Sync schedules to dkron if configured
-        if let Some(ref dkron_url) = state.config.server.dkron_url.clone() {
-            let client = crate::dkron::DkronClient::new(&dkron_url); // dkron.rs
-            match client.upsert_feed_jobs(&feed_name, &schedules, enabled) {
-                Ok(()) => println!("  Synced {} schedule(s) to dkron.", schedules.len()),
-                Err(e) => eprintln!("% Warning: dkron sync failed: {}", e),
-            }
-        }
+        // Dkron schedule sync is handled daemon-side after PutFeed.
 
         state.mode = Mode::Exec;
     }

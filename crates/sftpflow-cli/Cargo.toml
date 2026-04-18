@@ -4,9 +4,6 @@
 #
 # The interactive shell binary (Cisco IOS / cmsh style).
 # Depends on sftpflow-core for the data models and config I/O.
-#
-# For now this crate also contains the dkron client; it will
-# move into sftpflowd once the daemon lands.
 
 [package]
 name = "sftpflow-cli"
@@ -30,6 +27,5 @@ rustyline   = { workspace = true }
 serde       = { workspace = true }
 serde_json  = { workspace = true }
 serde_yaml  = { workspace = true }
-ureq        = { workspace = true }
 log         = { workspace = true }
 env_logger  = { workspace = true }

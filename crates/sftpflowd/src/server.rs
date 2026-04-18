@@ -41,6 +41,9 @@ use crate::handlers; // handlers.rs - RPC method implementations
 pub struct DaemonState {
     pub config: Config,
     pub started: Instant,
+    /// Dkron scheduler API URL (cloned from config.server.dkron_url
+    /// at startup). None means scheduler sync is disabled.
+    pub dkron_url: Option<String>,
 }
 
 // ============================================================
@@ -50,9 +53,11 @@ pub struct DaemonState {
 /// Parse `addr` ("unix:/path", "tcp:host:port", or "host:port") and
 /// run the appropriate accept loop until the listener errors out.
 pub fn run(addr: &str, config: Config) -> std::io::Result<()> {
+    let dkron_url = config.server.dkron_url.clone();
     let state = Arc::new(Mutex::new(DaemonState {
         config,
         started: Instant::now(),
+        dkron_url,
     }));
 
     // Split into (scheme, rest). Anything without a known scheme
@@ -296,6 +301,12 @@ fn dispatch(env: RequestEnvelope, state: &Arc<Mutex<DaemonState>>) -> ResponseEn
         Request::RunFeedNow { name } => {
             let guard = state.lock().unwrap();
             result_to_envelope(id, handlers::run_feed_now(&guard, &name))
+        }
+
+        // ---- scheduler ----
+        Request::SyncSchedules => {
+            let guard = state.lock().unwrap();
+            ResponseEnvelope::success(id, handlers::sync_schedules(&guard))
         }
     }
 }

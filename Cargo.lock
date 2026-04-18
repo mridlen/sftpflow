@@ -2028,7 +2028,6 @@ dependencies = [
  "serde_yaml",
  "sftpflow-core",
  "sftpflow-proto",
- "ureq",
 ]
 
 [[package]]
@@ -2078,11 +2077,13 @@ version = "0.1.1"
 dependencies = [
  "env_logger",
  "log",
+ "serde",
  "serde_json",
  "sftpflow-core",
  "sftpflow-proto",
  "sftpflow-transport",
  "tokio",
+ "ureq",
 ]
 
 [[package]]

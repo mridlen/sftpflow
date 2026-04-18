@@ -20,7 +20,7 @@
 
 use std::time::Instant;
 
-use log::{error, info};
+use log::{error, info, warn};
 
 use sftpflow_core::{Config, Endpoint, NextStepAction, PgpKey, ProcessStep};
 use sftpflow_proto::{
@@ -29,8 +29,10 @@ use sftpflow_proto::{
     ProtoError,
     Response,
     ServerInfo,
+    SyncReport,
 };
 
+use crate::dkron::DkronClient; // dkron.rs
 use crate::server::DaemonState;
 
 // ============================================================
@@ -246,6 +248,33 @@ pub fn rename_key(
 }
 
 // ============================================================
+// Scheduler sync (best-effort after feed mutations)
+// ============================================================
+
+/// If a dkron_url is configured, sync a single feed's schedules
+/// to dkron. Logs warnings on failure but never propagates errors.
+fn maybe_sync_feed(state: &DaemonState, feed_name: &str) {
+    if let Some(ref dkron_url) = state.dkron_url {
+        let client = DkronClient::new(dkron_url); // dkron.rs
+        if let Some(feed) = state.config.feeds.get(feed_name) {
+            client.sync_feed(feed_name, feed);
+        }
+    }
+}
+
+/// If a dkron_url is configured, delete all dkron jobs for a feed.
+fn maybe_delete_feed_jobs(state: &DaemonState, feed_name: &str) {
+    if let Some(ref dkron_url) = state.dkron_url {
+        let client = DkronClient::new(dkron_url); // dkron.rs
+        if let Err(e) = client.delete_feed_jobs(feed_name) {
+            warn!("dkron: failed to delete jobs for '{}': {}", feed_name, e);
+        } else {
+            info!("dkron: deleted jobs for '{}'", feed_name);
+        }
+    }
+}
+
+// ============================================================
 // Feeds
 // ============================================================
 
@@ -282,6 +311,7 @@ pub fn put_feed(
         name,
         if existed { "updated" } else { "created" }
     );
+    maybe_sync_feed(state, &name);
     Ok(Response::Ok)
 }
 
@@ -294,6 +324,7 @@ pub fn delete_feed(
     }
     save(&state.config)?;
     info!("deleted feed '{}'", name);
+    maybe_delete_feed_jobs(state, name);
     Ok(Response::Ok)
 }
 
@@ -334,6 +365,8 @@ pub fn rename_feed(
         "renamed feed '{}' -> '{}', updated {} nextstep reference(s)",
         from, to, ref_count
     );
+    maybe_delete_feed_jobs(state, &from);
+    maybe_sync_feed(state, &to);
     Ok(Response::Ok)
 }
 
@@ -384,4 +417,31 @@ pub fn run_feed_now(
     );
 
     Ok(Response::RunResult(result))
+}
+
+// ============================================================
+// Scheduler
+// ============================================================
+
+/// Full reconciliation of feed schedules ↔ dkron jobs.
+/// Returns a SyncReport with counts. If no dkron_url is configured,
+/// returns a report with all zeros and an informational error.
+pub fn sync_schedules(state: &DaemonState) -> Response {
+    match &state.dkron_url {
+        Some(dkron_url) => {
+            info!("sync_schedules: reconciling against {}", dkron_url);
+            let client = DkronClient::new(dkron_url); // dkron.rs
+            let report = client.reconcile_all(&state.config.feeds);
+            Response::SyncReport(report)
+        }
+        None => {
+            info!("sync_schedules: no dkron_url configured");
+            Response::SyncReport(SyncReport {
+                created: 0,
+                updated: 0,
+                deleted: 0,
+                errors: vec!["no dkron_url configured; scheduler sync disabled".to_string()],
+            })
+        }
+    }
 }

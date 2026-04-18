@@ -21,6 +21,23 @@
 
 services:
 
+  # ---- sftpflowd: SFTP automation daemon ----
+  sftpflowd:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.sftpflow-server
+    command: ["sftpflowd", "--socket", "tcp:0.0.0.0:7777"]
+    ports:
+      - "7777:7777"    # RPC (TCP)
+    volumes:
+      - ${HOME}/.sftpflow:/home/sftpflow/.sftpflow:rw
+    environment:
+      - SFTPFLOW_CONFIG=/home/sftpflow/.sftpflow/config.yaml
+      - RUST_LOG=info
+    networks:
+      - dkron-net
+    restart: unless-stopped
+
   # ---- Dkron server: scheduler + Raft leader ----
   dkron-server:
     build:
@@ -57,10 +74,13 @@ services:
       - ${HOME}/.sftpflow:/home/dkron/.sftpflow:ro
     environment:
       - SFTPFLOW_CONFIG=/home/dkron/.sftpflow/config.yaml
+      # Workers connect to sftpflowd via TCP for RunFeedNow callbacks
+      - SFTPFLOW_SOCKET=tcp:sftpflowd:7777
     networks:
       - dkron-net
     depends_on:
       - dkron-server
+      - sftpflowd
     restart: unless-stopped
 
   # ---- Dkron worker 2 ----
@@ -79,10 +99,12 @@ services:
       - ${HOME}/.sftpflow:/home/dkron/.sftpflow:ro
     environment:
       - SFTPFLOW_CONFIG=/home/dkron/.sftpflow/config.yaml
+      - SFTPFLOW_SOCKET=tcp:sftpflowd:7777
     networks:
       - dkron-net
     depends_on:
       - dkron-server
+      - sftpflowd
     restart: unless-stopped
 
 volumes:

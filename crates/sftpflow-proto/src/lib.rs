@@ -54,6 +54,9 @@ pub enum Request {
 
     /// Kick off a feed immediately, outside its cron schedule.
     RunFeedNow { name: String },
+
+    /// Trigger a full reconciliation of feed schedules ↔ dkron jobs.
+    SyncSchedules,
 }
 
 // ============================================================
@@ -89,6 +92,8 @@ pub enum Response {
     Ok,
     /// Reply to RunFeedNow.
     RunResult(RunResult),
+    /// Reply to SyncSchedules.
+    SyncReport(SyncReport),
 }
 
 /// Server identity and version, returned by GetServerInfo.
@@ -133,6 +138,19 @@ pub enum RunStatus {
     Noaction,
     /// Feed encountered an error.
     Failed,
+}
+
+/// Outcome of a SyncSchedules reconciliation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SyncReport {
+    /// Number of dkron jobs created.
+    pub created: usize,
+    /// Number of dkron jobs updated (schedule or enabled state changed).
+    pub updated: usize,
+    /// Number of orphan dkron jobs deleted (no matching feed).
+    pub deleted: usize,
+    /// Non-fatal errors encountered during sync.
+    pub errors: Vec<String>,
 }
 
 // ============================================================

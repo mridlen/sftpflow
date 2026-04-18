@@ -7,7 +7,6 @@ pub use sftpflow_core as feed;
 
 mod cli;      // cli.rs - interactive shell loop and command dispatch
 mod commands; // commands.rs - command implementations
-mod dkron;    // dkron.rs - dkron scheduler API client
 pub mod rpc;  // rpc.rs - RPC client for talking to sftpflowd
 
 fn main() {
@@ -17,23 +16,58 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     // Parse --socket <addr> for dev/direct-connect mode.
-    let socket_addr = parse_socket_arg(&args);
+    // Falls back to SFTPFLOW_SOCKET env var (used by dkron workers).
+    let socket_addr = parse_socket_arg(&args)
+        .or_else(|| std::env::var("SFTPFLOW_SOCKET").ok());
 
     // Non-interactive mode: sftpflow run <feed-name>
-    // This is how dkron worker nodes invoke sftpflow.
+    // This is how dkron worker nodes invoke sftpflow. Connects to
+    // the daemon via RPC and sends RunFeedNow.
     if args.len() >= 3 && args[1] == "run" {
         let feed_name = &args[2];
         let config = feed::Config::load();
 
-        match config.feeds.get(feed_name.as_str()) {
-            Some(_feed) => {
-                // TODO: implement actual file transfer execution
-                println!("Executing feed '{}'...", feed_name);
-                eprintln!("% Feed execution is not yet implemented.");
-                process::exit(0);
+        // Connect to daemon: prefer --socket if given, otherwise SSH
+        let mut client = if let Some(ref addr) = socket_addr {
+            match rpc::RpcClient::connect_socket(addr) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("% Failed to connect to daemon at {}: {}", addr, e);
+                    process::exit(1);
+                }
             }
-            None => {
-                eprintln!("% Feed '{}' not found in config.", feed_name);
+        } else {
+            match rpc::RpcClient::connect_ssh(&config.server) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("% Failed to connect to daemon via SSH: {}", e);
+                    process::exit(1);
+                }
+            }
+        };
+
+        // Send RunFeedNow RPC
+        use sftpflow_proto::{Request, Response, RunStatus};
+        match client.call(Request::RunFeedNow { name: feed_name.to_string() }) {
+            Ok(Response::RunResult(result)) => {
+                println!(
+                    "Feed '{}': status={:?}, files_transferred={}",
+                    result.feed, result.status, result.files_transferred
+                );
+                if let Some(ref msg) = result.message {
+                    println!("  {}", msg);
+                }
+                match result.status {
+                    RunStatus::Success | RunStatus::Noaction => process::exit(0),
+                    RunStatus::Failed => process::exit(1),
+                }
+            }
+            Ok(other) => {
+                eprintln!("% Unexpected response: {:?}", other);
+                process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("% RPC error: {}", e);
                 process::exit(1);
             }
         }
