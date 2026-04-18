@@ -31,6 +31,8 @@ use sftpflow_proto::{
 };
 
 use crate::handlers; // handlers.rs - RPC method implementations
+use crate::history::RunDb; // history.rs - SQLite run history
+use crate::secrets::SecretStore; // secrets.rs - sealed credential store
 
 // ============================================================
 // Shared daemon state
@@ -44,6 +46,13 @@ pub struct DaemonState {
     /// Dkron scheduler API URL (cloned from config.server.dkron_url
     /// at startup). None means scheduler sync is disabled.
     pub dkron_url: Option<String>,
+    /// SQLite run history database. None if DB failed to open
+    /// (runs still execute, just not recorded).
+    pub run_db: Option<RunDb>,
+    /// Sealed credential store. None if no passphrase was configured
+    /// at startup — secret RPCs then fail with CONFIG_ERROR and feeds
+    /// that use `*_ref` fields will fail to resolve at run time.
+    pub secrets: Option<SecretStore>,
 }
 
 // ============================================================
@@ -52,12 +61,19 @@ pub struct DaemonState {
 
 /// Parse `addr` ("unix:/path", "tcp:host:port", or "host:port") and
 /// run the appropriate accept loop until the listener errors out.
-pub fn run(addr: &str, config: Config) -> std::io::Result<()> {
+pub fn run(
+    addr: &str,
+    config: Config,
+    run_db: Option<RunDb>,
+    secrets: Option<SecretStore>,
+) -> std::io::Result<()> {
     let dkron_url = config.server.dkron_url.clone();
     let state = Arc::new(Mutex::new(DaemonState {
         config,
         started: Instant::now(),
         dkron_url,
+        run_db,
+        secrets,
     }));
 
     // Split into (scheme, rest). Anything without a known scheme
@@ -307,6 +323,26 @@ fn dispatch(env: RequestEnvelope, state: &Arc<Mutex<DaemonState>>) -> ResponseEn
         Request::SyncSchedules => {
             let guard = state.lock().unwrap();
             ResponseEnvelope::success(id, handlers::sync_schedules(&guard))
+        }
+
+        // ---- run history ----
+        Request::GetRunHistory { feed, limit } => {
+            let guard = state.lock().unwrap();
+            result_to_envelope(id, handlers::get_run_history(&guard, &feed, limit))
+        }
+
+        // ---- sealed secrets ----
+        Request::PutSecret { name, value } => {
+            let mut guard = state.lock().unwrap();
+            result_to_envelope(id, handlers::put_secret(&mut guard, name, value))
+        }
+        Request::DeleteSecret { name } => {
+            let mut guard = state.lock().unwrap();
+            result_to_envelope(id, handlers::delete_secret(&mut guard, &name))
+        }
+        Request::ListSecrets => {
+            let guard = state.lock().unwrap();
+            result_to_envelope(id, handlers::list_secrets(&guard))
         }
     }
 }

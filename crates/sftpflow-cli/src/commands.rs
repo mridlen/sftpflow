@@ -45,8 +45,14 @@ pub fn help_exec() {
     println!("  rename <type> <old> <new>    Rename (updates all references)");
     println!();
     println!("  show endpoints|keys|feeds    List all of a type");
+    println!("  show secrets                 List sealed secret names");
     println!("  show <type> <name>           Show details for one object");
+    println!("  show runs <feed> [limit]     Show run history for a feed");
     println!("  show version                 Show SFTPflow version");
+    println!();
+    println!("  secret add <name>            Add/replace a sealed secret (prompts for value)");
+    println!("  secret delete <name>         Remove a sealed secret");
+    println!("  secret list                  List sealed secret names");
     println!();
     println!("  run feed <name>              Manually run a feed (outside of schedule)");
     println!("  sync schedules               Reconcile feed schedules with dkron");
@@ -611,8 +617,10 @@ pub fn help_endpoint_edit() {
     println!("  host <address>           Set the hostname or IP address");
     println!("  port <number>            Set the port");
     println!("  username <user>          Set the username");
-    println!("  password <pass>          Set the password");
-    println!("  ssh_key <path>           Set the path to an SSH private key");
+    println!("  password <pass>          Set an inline password (plaintext in YAML)");
+    println!("  password_ref <name>      Set a sealed-store secret name for the password");
+    println!("  ssh_key <path>           Set an inline SSH private key (plaintext in YAML)");
+    println!("  ssh_key_ref <name>       Set a sealed-store secret name for the SSH key");
     println!("  no <property>            Clear a property");
     println!("  show                     Show pending configuration");
     println!("  commit                   Save changes to config file");
@@ -731,18 +739,20 @@ pub fn set_ssh_key(args: &[&str], state: &mut ShellState) {
 /// Handle 'no <property>' in endpoint-edit mode.
 pub fn no_endpoint_command(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
-        println!("% Usage: no <protocol|host|port|username|password|ssh_key>");
+        println!("% Usage: no <protocol|host|port|username|password|password_ref|ssh_key|ssh_key_ref>");
         return;
     }
 
     if let Some(ref mut ep) = state.pending_endpoint {
         match args[0] {
-            "protocol" => { ep.protocol = Protocol::Sftp; println!("  protocol reset to sftp (default)."); }
-            "host"     => { ep.host = None;     println!("  host cleared."); }
-            "port"     => { ep.port = None;     println!("  port cleared."); }
-            "username" => { ep.username = None;  println!("  username cleared."); }
-            "password" => { ep.password = None;  println!("  password cleared."); }
-            "ssh_key"  => { ep.ssh_key = None;   println!("  ssh_key cleared."); }
+            "protocol"     => { ep.protocol = Protocol::Sftp; println!("  protocol reset to sftp (default)."); }
+            "host"         => { ep.host = None;         println!("  host cleared."); }
+            "port"         => { ep.port = None;         println!("  port cleared."); }
+            "username"     => { ep.username = None;     println!("  username cleared."); }
+            "password"     => { ep.password = None;     println!("  password cleared."); }
+            "password_ref" => { ep.password_ref = None; println!("  password_ref cleared."); }
+            "ssh_key"      => { ep.ssh_key = None;      println!("  ssh_key cleared."); }
+            "ssh_key_ref"  => { ep.ssh_key_ref = None;  println!("  ssh_key_ref cleared."); }
             _ => println!("% Unknown property: '{}'", args[0]),
         }
     }
@@ -817,8 +827,9 @@ pub fn help_key_edit() {
     println!("Key configuration commands:");
     println!("  type <public|private>    Set the key type");
     println!("  contents                 Enter multi-line paste mode (end with '.' on its own line)");
-    println!("  load <filepath>          Load key contents from a file");
-    println!("  no <property>            Clear a property (type, contents)");
+    println!("  load <filepath>          Load key contents inline from a file (plaintext in YAML)");
+    println!("  contents_ref <name>      Set a sealed-store secret name for the key material");
+    println!("  no <property>            Clear a property (type, contents, contents_ref)");
     println!("  show                     Show pending configuration");
     println!("  commit                   Save changes to config file");
     println!("  abort                    Discard changes and return to exec mode");
@@ -920,14 +931,15 @@ pub fn load_key_file(args: &[&str], state: &mut ShellState) {
 /// Handle 'no <property>' in key-edit mode.
 pub fn no_key_command(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
-        println!("% Usage: no <type|contents>");
+        println!("% Usage: no <type|contents|contents_ref>");
         return;
     }
 
     if let Some(ref mut k) = state.pending_key {
         match args[0] {
-            "type"     => { k.key_type = None;  println!("  type cleared."); }
-            "contents" => { k.contents = None;   println!("  contents cleared."); }
+            "type"         => { k.key_type = None;     println!("  type cleared."); }
+            "contents"     => { k.contents = None;     println!("  contents cleared."); }
+            "contents_ref" => { k.contents_ref = None; println!("  contents_ref cleared."); }
             _ => println!("% Unknown property: '{}'", args[0]),
         }
     }
@@ -1760,6 +1772,7 @@ pub fn show(args: &[&str], state: &mut ShellState) {
         println!("  key <name>         Show key details");
         println!("  feeds              List all feeds");
         println!("  feed <name>        Show feed details");
+        println!("  runs <feed> [N]    Show run history for a feed (default: 25)");
         println!("  server             Show server connection settings");
         println!("  version            Show SFTPflow version");
         return;
@@ -1768,6 +1781,7 @@ pub fn show(args: &[&str], state: &mut ShellState) {
     match args[0] {
         "version"   => version(),
         "server"    => state.config.server.display(),
+        "secrets"   => show_secrets(state),
         "endpoints" => show_endpoints(state),
         "endpoint"  => {
             if args.len() < 2 {
@@ -1791,6 +1805,14 @@ pub fn show(args: &[&str], state: &mut ShellState) {
                 return;
             }
             show_feed_detail(args[1], state);
+        }
+        "runs"      => {
+            if args.len() < 2 {
+                println!("% Usage: show runs <feed> [limit]");
+                return;
+            }
+            let limit = args.get(2).and_then(|s| s.parse::<u32>().ok());
+            show_runs(args[1], limit, state);
         }
         _ => println!("% Unknown show subcommand: '{}'", args[0]),
     }
@@ -1922,5 +1944,259 @@ fn show_feed_detail(name: &str, state: &mut ShellState) {
         Ok(Response::Feed(None)) => println!("% Feed '{}' does not exist.", name),
         Err(e) => println!("% Error: {}", e),
         _ => {}
+    }
+}
+
+/// Show run history for a feed (fetched from daemon).
+fn show_runs(feed: &str, limit: Option<u32>, state: &mut ShellState) {
+    if !has_rpc(state) { return; }
+    let rpc = state.rpc.as_mut().unwrap();
+
+    match rpc.call(Request::GetRunHistory { feed: feed.to_string(), limit }) {
+        Ok(Response::RunHistory(entries)) => {
+            if entries.is_empty() {
+                println!("No run history for feed '{}'.", feed);
+                return;
+            }
+
+            println!("Run history for '{}' ({} entries):", feed, entries.len());
+            println!(
+                "  {:<4} {:<22} {:>8} {:>9} {:>6}  {}",
+                "#", "Started", "Duration", "Status", "Files", "Message"
+            );
+            println!("  {}", "-".repeat(76));
+
+            for entry in &entries {
+                let status_str = match entry.status {
+                    sftpflow_proto::RunStatus::Success  => "\x1b[32msuccess\x1b[0m ",
+                    sftpflow_proto::RunStatus::Noaction => "\x1b[33mnoaction\x1b[0m",
+                    sftpflow_proto::RunStatus::Failed   => "\x1b[31mfailed\x1b[0m  ",
+                };
+                let duration = format_duration(entry.duration_secs);
+                let msg = entry.message.as_deref().unwrap_or("");
+                println!(
+                    "  {:<4} {:<22} {:>8} {:>9} {:>6}  {}",
+                    entry.id,
+                    &entry.started_at[..19.min(entry.started_at.len())],
+                    duration,
+                    status_str,
+                    entry.files_transferred,
+                    msg
+                );
+            }
+        }
+        Err(RpcError::Proto(e)) => println!("% {}", e.message),
+        Err(e) => println!("% Error: {}", e),
+        _ => {}
+    }
+}
+
+/// Format a duration in seconds as a human-readable string.
+fn format_duration(secs: f64) -> String {
+    if secs < 1.0 {
+        format!("{:.0}ms", secs * 1000.0)
+    } else if secs < 60.0 {
+        format!("{:.1}s", secs)
+    } else if secs < 3600.0 {
+        let m = (secs / 60.0).floor();
+        let s = secs - m * 60.0;
+        format!("{}m{:.0}s", m as u32, s)
+    } else {
+        let h = (secs / 3600.0).floor();
+        let m = ((secs - h * 3600.0) / 60.0).floor();
+        format!("{}h{}m", h as u32, m as u32)
+    }
+}
+
+// ============================================================
+// Sealed secrets (top-level `secret` command)
+// ============================================================
+//
+// `secret add <name>` prompts for the value on stdin without
+// echo (via rpassword) so it never touches shell history. The
+// value is sent to the daemon over the already-encrypted RPC
+// channel, where it's re-sealed into the credential store.
+
+/// Route 'secret add|list|delete ...' in exec mode.
+pub fn secret(args: &[&str], state: &mut ShellState) {
+    if args.is_empty() {
+        println!("% Usage: secret <add|list|delete> [name]");
+        return;
+    }
+
+    match args[0] {
+        "add"    => {
+            if args.len() < 2 {
+                println!("% Usage: secret add <name>");
+                return;
+            }
+            secret_add(args[1], state);
+        }
+        "list"   => secret_list(state),
+        "delete" => {
+            if args.len() < 2 {
+                println!("% Usage: secret delete <name>");
+                return;
+            }
+            secret_delete(args[1], state);
+        }
+        _ => println!("% Unknown secret subcommand '{}'. Use add, list, or delete.", args[0]),
+    }
+}
+
+/// Prompt for a secret value (hidden) and send a PutSecret RPC.
+fn secret_add(name: &str, state: &mut ShellState) {
+    if !has_rpc(state) { return; }
+
+    // Prompt twice and require both to match, so typos don't silently
+    // seal the wrong value into the store.
+    let value = match rpassword::prompt_password(format!("Value for '{}': ", name)) {
+        Ok(v) => v,
+        Err(e) => { println!("% Could not read value: {}", e); return; }
+    };
+    if value.is_empty() {
+        println!("% Empty value — aborting.");
+        return;
+    }
+    let confirm = match rpassword::prompt_password("Confirm: ") {
+        Ok(v) => v,
+        Err(e) => { println!("% Could not read confirmation: {}", e); return; }
+    };
+    if confirm != value {
+        println!("% Values did not match — aborting.");
+        return;
+    }
+
+    let rpc = state.rpc.as_mut().unwrap();
+    match rpc.call(Request::PutSecret { name: name.to_string(), value }) {
+        Ok(Response::Ok) => {
+            info!("Stored secret '{}'", name);
+            println!("Secret '{}' stored.", name);
+        }
+        Err(RpcError::Proto(e)) => println!("% {}", e.message),
+        Err(e) => println!("% Error: {}", e),
+        _ => {}
+    }
+}
+
+/// Send a ListSecrets RPC and print the names.
+fn secret_list(state: &mut ShellState) {
+    if !has_rpc(state) { return; }
+    let rpc = state.rpc.as_mut().unwrap();
+
+    match rpc.call(Request::ListSecrets) {
+        Ok(Response::Names(names)) => {
+            if names.is_empty() {
+                println!("No secrets configured.");
+                return;
+            }
+            println!("Configured secrets ({} total):", names.len());
+            for name in &names {
+                println!("  {}", name);
+            }
+        }
+        Err(RpcError::Proto(e)) => println!("% {}", e.message),
+        Err(e) => println!("% Error: {}", e),
+        _ => {}
+    }
+}
+
+/// Send a DeleteSecret RPC.
+fn secret_delete(name: &str, state: &mut ShellState) {
+    if !has_rpc(state) { return; }
+    let rpc = state.rpc.as_mut().unwrap();
+
+    match rpc.call(Request::DeleteSecret { name: name.to_string() }) {
+        Ok(Response::Ok) => {
+            info!("Deleted secret '{}'", name);
+            println!("Secret '{}' deleted.", name);
+        }
+        Err(RpcError::Proto(e)) => println!("% {}", e.message),
+        Err(e) => println!("% Error: {}", e),
+        _ => {}
+    }
+}
+
+/// `show secrets` implementation — identical wire call to `secret list`,
+/// printed in the same style as the other show handlers.
+fn show_secrets(state: &mut ShellState) {
+    secret_list(state);
+}
+
+// ============================================================
+// Ref-field setters for endpoint and key edit modes
+// ============================================================
+
+/// `password_ref <name>` — store a ref to the sealed password by name.
+/// Clears any inline plaintext password so the YAML stays clean.
+pub fn set_password_ref(args: &[&str], state: &mut ShellState) {
+    if args.is_empty() {
+        println!("% Usage: password_ref <secret-name>");
+        return;
+    }
+    let name = args[0].to_string();
+
+    // Warn if the secret doesn't exist yet (best-effort RPC check).
+    if let Some(ref mut rpc) = state.rpc {
+        if let Ok(Response::Names(names)) = rpc.call(Request::ListSecrets) {
+            if !names.iter().any(|n| n == &name) {
+                println!("  (warning: secret '{}' does not exist yet — use 'secret add {}' first)", name, name);
+            }
+        }
+    }
+
+    if let Some(ref mut ep) = state.pending_endpoint {
+        ep.password_ref = Some(name.clone());
+        ep.password = None;
+        info!("Set password_ref = '{}'", name);
+        println!("  password_ref → {}", name);
+    }
+}
+
+/// `ssh_key_ref <name>` — store a ref to a sealed SSH key by name.
+pub fn set_ssh_key_ref(args: &[&str], state: &mut ShellState) {
+    if args.is_empty() {
+        println!("% Usage: ssh_key_ref <secret-name>");
+        return;
+    }
+    let name = args[0].to_string();
+
+    if let Some(ref mut rpc) = state.rpc {
+        if let Ok(Response::Names(names)) = rpc.call(Request::ListSecrets) {
+            if !names.iter().any(|n| n == &name) {
+                println!("  (warning: secret '{}' does not exist yet — use 'secret add {}' first)", name, name);
+            }
+        }
+    }
+
+    if let Some(ref mut ep) = state.pending_endpoint {
+        ep.ssh_key_ref = Some(name.clone());
+        ep.ssh_key = None;
+        info!("Set ssh_key_ref = '{}'", name);
+        println!("  ssh_key_ref → {}", name);
+    }
+}
+
+/// `contents_ref <name>` — store a ref to sealed PGP key material.
+pub fn set_key_contents_ref(args: &[&str], state: &mut ShellState) {
+    if args.is_empty() {
+        println!("% Usage: contents_ref <secret-name>");
+        return;
+    }
+    let name = args[0].to_string();
+
+    if let Some(ref mut rpc) = state.rpc {
+        if let Ok(Response::Names(names)) = rpc.call(Request::ListSecrets) {
+            if !names.iter().any(|n| n == &name) {
+                println!("  (warning: secret '{}' does not exist yet — use 'secret add {}' first)", name, name);
+            }
+        }
+    }
+
+    if let Some(ref mut k) = state.pending_key {
+        k.contents_ref = Some(name.clone());
+        k.contents = None;
+        info!("Set contents_ref = '{}'", name);
+        println!("  contents_ref → {}", name);
     }
 }

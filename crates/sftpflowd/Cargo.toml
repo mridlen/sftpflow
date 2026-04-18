@@ -32,3 +32,8 @@ log        = { workspace = true }
 env_logger = { workspace = true }
 tokio      = { workspace = true }
 ureq       = { workspace = true }
+rusqlite   = { workspace = true }
+age        = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

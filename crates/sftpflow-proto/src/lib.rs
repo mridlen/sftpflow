@@ -57,6 +57,19 @@ pub enum Request {
 
     /// Trigger a full reconciliation of feed schedules ↔ dkron jobs.
     SyncSchedules,
+
+    /// Retrieve run history for a feed (most recent first).
+    GetRunHistory { feed: String, limit: Option<u32> },
+
+    // ---- sealed credential store ----
+    /// Insert or replace a sealed secret by name. The value is sent
+    /// over the RPC channel and re-sealed on the daemon side.
+    PutSecret    { name: String, value: String },
+    /// Remove a sealed secret by name. Not-found is not an error.
+    DeleteSecret { name: String },
+    /// List the names of every sealed secret. Values are never returned
+    /// from the daemon — there is intentionally no `GetSecret`.
+    ListSecrets,
 }
 
 // ============================================================
@@ -94,6 +107,8 @@ pub enum Response {
     RunResult(RunResult),
     /// Reply to SyncSchedules.
     SyncReport(SyncReport),
+    /// Reply to GetRunHistory.
+    RunHistory(Vec<RunHistoryEntry>),
 }
 
 /// Server identity and version, returned by GetServerInfo.
@@ -151,6 +166,25 @@ pub struct SyncReport {
     pub deleted: usize,
     /// Non-fatal errors encountered during sync.
     pub errors: Vec<String>,
+}
+
+/// A single run history entry, returned by GetRunHistory.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RunHistoryEntry {
+    /// Auto-incremented row id.
+    pub id: i64,
+    /// Feed name at the time of execution.
+    pub feed: String,
+    /// ISO 8601 UTC timestamp when the run started.
+    pub started_at: String,
+    /// Wall-clock duration of the run in seconds.
+    pub duration_secs: f64,
+    /// Terminal status (success / noaction / failed).
+    pub status: RunStatus,
+    /// Number of files transferred.
+    pub files_transferred: usize,
+    /// Optional human-readable message (failure reason, etc).
+    pub message: Option<String>,
 }
 
 // ============================================================

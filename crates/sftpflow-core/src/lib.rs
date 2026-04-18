@@ -41,6 +41,12 @@ impl std::fmt::Display for Protocol {
 }
 
 /// An endpoint with connection credentials.
+///
+/// Secrets can be supplied two ways:
+///   - `password` / `ssh_key` — plaintext in the YAML (legacy / dev only).
+///   - `password_ref` / `ssh_key_ref` — the *name* of a secret in the
+///     daemon's sealed store; the daemon resolves the name to the real
+///     value at run time. Prefer refs so config.yaml is committable.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct Endpoint {
     #[serde(default)]
@@ -55,6 +61,12 @@ pub struct Endpoint {
     pub password: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ssh_key: Option<String>,
+    /// Name of a sealed-store secret holding the password.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password_ref: Option<String>,
+    /// Name of a sealed-store secret holding an SSH private key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_key_ref: Option<String>,
 }
 
 impl Endpoint {
@@ -69,9 +81,17 @@ impl Endpoint {
         println!("  host        {}", self.host.as_deref().unwrap_or("(not set)"));
         println!("  port        {}", self.port.map_or("(not set)".to_string(), |p| p.to_string()));
         println!("  username    {}", self.username.as_deref().unwrap_or("(not set)"));
-        // Mask password in display
-        println!("  password    {}", if self.password.is_some() { "********" } else { "(not set)" });
-        println!("  ssh_key     {}", self.ssh_key.as_deref().unwrap_or("(not set)"));
+        // Credentials: prefer refs over plaintext, show both if both are set.
+        match (&self.password_ref, &self.password) {
+            (Some(r), _)    => println!("  password    (ref: {})", r),
+            (None, Some(_)) => println!("  password    ********"),
+            (None, None)    => println!("  password    (not set)"),
+        }
+        match (&self.ssh_key_ref, &self.ssh_key) {
+            (Some(r), _)    => println!("  ssh_key     (ref: {})", r),
+            (None, Some(v)) => println!("  ssh_key     {}", v),
+            (None, None)    => println!("  ssh_key     (not set)"),
+        }
     }
 }
 
@@ -97,12 +117,20 @@ impl std::fmt::Display for KeyType {
 }
 
 /// A PGP key with its contents stored in the config.
+///
+/// Contents can be supplied two ways:
+///   - `contents` — the PGP armour block inline in YAML (legacy / dev).
+///   - `contents_ref` — the *name* of a secret in the daemon's sealed
+///     store; the daemon resolves the name to the real key at run time.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct PgpKey {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key_type: Option<KeyType>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub contents: Option<String>,
+    /// Name of a sealed-store secret holding the key material.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contents_ref: Option<String>,
 }
 
 impl PgpKey {
@@ -115,14 +143,17 @@ impl PgpKey {
         println!("Key: {}", name);
         println!("  type        {}",
             self.key_type.as_ref().map_or("(not set)".to_string(), |t| t.to_string()));
-        match &self.contents {
-            Some(c) => {
+        match (&self.contents_ref, &self.contents) {
+            (Some(r), _) => {
+                println!("  contents    (ref: {})", r);
+            }
+            (None, Some(c)) => {
                 // Show first line and length as a summary
                 let first_line = c.lines().next().unwrap_or("(empty)");
                 let line_count = c.lines().count();
                 println!("  contents    {} ({} lines)", first_line, line_count);
             }
-            None => println!("  contents    (not set)"),
+            (None, None) => println!("  contents    (not set)"),
         }
     }
 }

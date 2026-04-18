@@ -32,4 +32,6 @@ async-trait = { workspace = true }
 tokio       = { workspace = true }
 russh       = { workspace = true }
 russh-sftp  = { workspace = true }
-tempfile    = { workspace = true }
+tempfile        = { workspace = true }
+sequoia-openpgp = { workspace = true }
+anyhow          = { workspace = true }

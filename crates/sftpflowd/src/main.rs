@@ -6,8 +6,12 @@
 // YAML config, and hands off to the server loop.
 //
 // Usage:
-//   sftpflowd                        (use the platform default address)
-//   sftpflowd --socket <addr>        (override the listen address)
+//   sftpflowd                                    (platform defaults)
+//   sftpflowd --socket <addr>                    (override listen address)
+//   sftpflowd --db <path>                        (override runs.db path)
+//   sftpflowd --secrets <path>                   (override sealed store path)
+//   sftpflowd --passphrase-file <path>           (unlock sealed store)
+//   SFTPFLOW_PASSPHRASE=... sftpflowd            (passphrase via env)
 //
 // Address formats:
 //   unix:/path/to/sock   - Unix domain socket (Linux only)
@@ -22,6 +26,8 @@ use sftpflow_core::Config;
 
 pub mod dkron;    // dkron.rs - Dkron scheduler reconciliation
 mod handlers; // handlers.rs - RPC method implementations
+mod history;  // history.rs - SQLite run history persistence
+mod secrets;  // secrets.rs - sealed credential store (age-encrypted)
 mod server;   // server.rs - listener + connection handling + dispatch
 
 // ============================================================
@@ -39,9 +45,38 @@ fn main() {
 
     // Parse --socket <addr> if present; otherwise fall back to the
     // platform default (unix socket on Linux, TCP loopback on Windows).
-    let socket_addr = match parse_socket_arg(&args) {
+    let socket_addr = match parse_named_arg(&args, "--socket") {
         Ok(Some(addr)) => addr,
         Ok(None)       => default_socket_addr(),
+        Err(e) => {
+            eprintln!("% {}", e);
+            process::exit(2);
+        }
+    };
+
+    // Parse --db <path> for the run-history SQLite database.
+    let db_path = match parse_named_arg(&args, "--db") {
+        Ok(Some(p)) => std::path::PathBuf::from(p),
+        Ok(None)    => default_db_path(),
+        Err(e) => {
+            eprintln!("% {}", e);
+            process::exit(2);
+        }
+    };
+
+    // Parse --secrets <path> for the sealed-credential store.
+    let secrets_path = match parse_named_arg(&args, "--secrets") {
+        Ok(Some(p)) => std::path::PathBuf::from(p),
+        Ok(None)    => secrets::default_secrets_path(), // secrets.rs
+        Err(e) => {
+            eprintln!("% {}", e);
+            process::exit(2);
+        }
+    };
+
+    // Parse --passphrase-file <path> (or fall back to SFTPFLOW_PASSPHRASE).
+    let passphrase_file = match parse_named_arg(&args, "--passphrase-file") {
+        Ok(v) => v.map(std::path::PathBuf::from),
         Err(e) => {
             eprintln!("% {}", e);
             process::exit(2);
@@ -77,10 +112,51 @@ fn main() {
         info!("no dkron_url configured; scheduler sync disabled");
     }
 
+    // Open the run-history SQLite database. Best-effort — if it
+    // fails, the daemon still starts but runs won't be recorded.
+    let run_db = match history::RunDb::open(&db_path) {
+        Ok(db) => {
+            info!("run history database ready at '{}'", db_path.display());
+            Some(db)
+        }
+        Err(e) => {
+            warn!("could not open run history database: {} — runs will not be recorded", e);
+            None
+        }
+    };
+
+    // Load the master passphrase and unlock the sealed credential
+    // store. Missing passphrase is allowed (legacy configs with
+    // plaintext passwords keep working), but any feed that uses a
+    // `*_ref` field will then fail at run time with a clear message.
+    let secret_store = match secrets::load_passphrase(passphrase_file.as_deref()) {
+        Ok(Some(passphrase)) => match secrets::SecretStore::open(&secrets_path, passphrase) {
+            Ok(store) => {
+                info!("sealed credential store ready at '{}'", secrets_path.display());
+                Some(store)
+            }
+            Err(e) => {
+                error!("could not open sealed credential store: {}", e);
+                process::exit(1);
+            }
+        },
+        Ok(None) => {
+            warn!(
+                "no master passphrase provided — sealed credential store will not be \
+                 available; feeds using password_ref / ssh_key_ref / contents_ref will fail"
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!("% {}", e);
+            process::exit(2);
+        }
+    };
+
     info!("listening on {}", socket_addr);
 
     // server::run() - server.rs
-    if let Err(e) = server::run(&socket_addr, config) {
+    if let Err(e) = server::run(&socket_addr, config, run_db, secret_store) {
         error!("server error: {}", e);
         process::exit(1);
     }
@@ -90,16 +166,17 @@ fn main() {
 // Argument helpers
 // ============================================================
 
-/// Scan `args` for `--socket <addr>`. Returns:
-///   Ok(Some(addr)) - flag provided with a value
-///   Ok(None)       - flag not present
-///   Err(msg)       - flag present but missing a value
-fn parse_socket_arg(args: &[String]) -> Result<Option<String>, String> {
+/// Scan `args` for a named flag (e.g. `--socket`, `--db`).
+/// Returns:
+///   Ok(Some(value)) - flag provided with a value
+///   Ok(None)        - flag not present
+///   Err(msg)        - flag present but missing a value
+fn parse_named_arg(args: &[String], flag: &str) -> Result<Option<String>, String> {
     let mut i = 1;
     while i < args.len() {
-        if args[i] == "--socket" {
+        if args[i] == flag {
             if i + 1 >= args.len() {
-                return Err("--socket requires an address argument".to_string());
+                return Err(format!("{} requires an argument", flag));
             }
             return Ok(Some(args[i + 1].clone()));
         }
@@ -121,5 +198,21 @@ fn default_socket_addr() -> String {
     #[cfg(not(unix))]
     {
         "tcp:127.0.0.1:7777".to_string()
+    }
+}
+
+/// Platform default path for the run-history SQLite database.
+/// - Linux: `/var/lib/sftpflow/runs.db`
+/// - Windows: `%APPDATA%/sftpflow/runs.db` (dev convenience)
+fn default_db_path() -> std::path::PathBuf {
+    #[cfg(unix)]
+    {
+        std::path::PathBuf::from("/var/lib/sftpflow/runs.db")
+    }
+    #[cfg(not(unix))]
+    {
+        let base = std::env::var("APPDATA")
+            .unwrap_or_else(|_| ".".to_string());
+        std::path::PathBuf::from(base).join("sftpflow").join("runs.db")
     }
 }

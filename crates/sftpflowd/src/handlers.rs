@@ -18,7 +18,8 @@
 // Handlers return `Result<Response, ProtoError>`. server.rs wraps
 // that into a ResponseEnvelope.
 
-use std::time::Instant;
+use std::collections::BTreeMap;
+use std::time::{Instant, SystemTime};
 
 use log::{error, info, warn};
 
@@ -33,6 +34,7 @@ use sftpflow_proto::{
 };
 
 use crate::dkron::DkronClient; // dkron.rs
+use crate::secrets::SecretStore; // secrets.rs
 use crate::server::DaemonState;
 
 // ============================================================
@@ -371,7 +373,8 @@ pub fn rename_feed(
 }
 
 /// Execute a feed: download from sources, upload to destinations,
-/// optionally delete source files afterward.
+/// optionally delete source files afterward. Records the run in
+/// the SQLite history database.
 ///
 /// Creates a short-lived tokio runtime to bridge into the async
 /// transport layer (russh/russh-sftp). The runtime is dropped
@@ -387,10 +390,27 @@ pub fn run_feed_now(
     info!("run_feed_now requested for '{}'", name);
 
     // Clone the data we need so we can release the DaemonState
-    // lock before blocking on async I/O.
+    // lock before blocking on async I/O. Resolve any `*_ref` fields
+    // against the sealed secret store so the transport layer only
+    // ever sees plaintext values.
     let feed = feed.clone();
-    let endpoints = state.config.endpoints.clone();
+    let mut endpoints = state.config.endpoints.clone();
+    let mut keys = state.config.keys.clone();
+
+    // resolve_refs() - below
+    if let Err(msg) = resolve_refs(&mut endpoints, &mut keys, state.secrets.as_ref()) {
+        warn!("run_feed_now '{}': secret resolution failed: {}", name, msg);
+        return Err(ProtoError {
+            code: error_code::CONFIG_ERROR,
+            message: msg,
+        });
+    }
+
     let feed_name = name.to_string();
+
+    // Capture the start time for history recording.
+    let started_at = iso8601_now();
+    let timer = Instant::now();
 
     // Build a single-threaded tokio runtime for the transfer.
     // The daemon is thread-per-connection, so each RunFeedNow
@@ -409,14 +429,210 @@ pub fn run_feed_now(
         &feed_name,
         &feed,
         &endpoints,
+        &keys,
     ));
 
+    let duration = timer.elapsed();
+
     info!(
-        "run_feed_now '{}': completed — status={:?}, files={}",
-        feed_name, result.status, result.files_transferred
+        "run_feed_now '{}': completed — status={:?}, files={}, duration={:.1}s",
+        feed_name, result.status, result.files_transferred, duration.as_secs_f64()
     );
 
+    // Record the run in SQLite (best-effort).
+    if let Some(ref db) = state.run_db {
+        db.record_run(&feed_name, &started_at, duration, &result);
+    }
+
     Ok(Response::RunResult(result))
+}
+
+/// Format the current wall-clock time as ISO 8601 UTC.
+fn iso8601_now() -> String {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs();
+
+    // Manual UTC formatting to avoid pulling in chrono.
+    // Good enough for logging — not for leap-second correctness.
+    let days_since_epoch = secs / 86400;
+    let time_of_day      = secs % 86400;
+    let hours   = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+    let seconds = time_of_day % 60;
+
+    // Convert days since 1970-01-01 to Y-M-D using a civil calendar algorithm.
+    let (y, m, d) = civil_from_days(days_since_epoch as i64);
+
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        y, m, d, hours, minutes, seconds
+    )
+}
+
+/// Convert days since 1970-01-01 to (year, month, day).
+/// Algorithm from Howard Hinnant's chrono-compatible date library.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y   = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp  = (5 * doy + 2) / 153;
+    let d   = doy - (153 * mp + 2) / 5 + 1;
+    let m   = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y   = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+// ============================================================
+// Scheduler
+// ============================================================
+
+// ============================================================
+// Sealed-secret ref resolution
+// ============================================================
+//
+// Called before every feed execution. Rewrites each endpoint's
+// `password` / `ssh_key` and each key's `contents` from the
+// corresponding `*_ref` field, looking up the real value in the
+// sealed store. If a ref is set and the secret is missing (or
+// the store isn't open), fail loudly — the operator has asked
+// for a secret we can't supply.
+//
+// Plaintext fields still work unchanged when no ref is present,
+// so configs that predate milestone 11 keep running.
+
+fn resolve_refs(
+    endpoints: &mut BTreeMap<String, Endpoint>,
+    keys: &mut BTreeMap<String, PgpKey>,
+    secrets: Option<&SecretStore>,
+) -> Result<(), String> {
+    // Endpoints: password_ref → password, ssh_key_ref → ssh_key.
+    for (ep_name, ep) in endpoints.iter_mut() {
+        if let Some(ref_name) = ep.password_ref.clone() {
+            let value = lookup_secret(secrets, &ref_name).map_err(|e| {
+                format!("endpoint '{}' password_ref: {}", ep_name, e)
+            })?;
+            ep.password = Some(value);
+        }
+        if let Some(ref_name) = ep.ssh_key_ref.clone() {
+            let value = lookup_secret(secrets, &ref_name).map_err(|e| {
+                format!("endpoint '{}' ssh_key_ref: {}", ep_name, e)
+            })?;
+            ep.ssh_key = Some(value);
+        }
+    }
+
+    // PGP keys: contents_ref → contents.
+    for (key_name, key) in keys.iter_mut() {
+        if let Some(ref_name) = key.contents_ref.clone() {
+            let value = lookup_secret(secrets, &ref_name).map_err(|e| {
+                format!("key '{}' contents_ref: {}", key_name, e)
+            })?;
+            key.contents = Some(value);
+        }
+    }
+
+    Ok(())
+}
+
+/// Look up a secret by name in the sealed store. Returns a fresh
+/// owned String so the caller can stash it back into config objects.
+fn lookup_secret(
+    secrets: Option<&SecretStore>,
+    name: &str,
+) -> Result<String, String> {
+    let store = secrets.ok_or_else(|| {
+        "sealed secrets store is not open — start sftpflowd with \
+         --passphrase-file or SFTPFLOW_PASSPHRASE".to_string()
+    })?;
+    store
+        .get(name)
+        .map(|s| s.to_string())
+        .ok_or_else(|| format!("secret '{}' not found in sealed store", name))
+}
+
+// ============================================================
+// Sealed-secret handlers
+// ============================================================
+
+/// Require an open secret store; otherwise return CONFIG_ERROR.
+fn require_secrets<'a>(state: &'a DaemonState) -> Result<&'a SecretStore, ProtoError> {
+    state.secrets.as_ref().ok_or_else(|| ProtoError {
+        code: error_code::CONFIG_ERROR,
+        message: "sealed secrets store is not open — start sftpflowd with \
+                  --passphrase-file or SFTPFLOW_PASSPHRASE"
+            .to_string(),
+    })
+}
+
+fn require_secrets_mut<'a>(state: &'a mut DaemonState) -> Result<&'a mut SecretStore, ProtoError> {
+    state.secrets.as_mut().ok_or_else(|| ProtoError {
+        code: error_code::CONFIG_ERROR,
+        message: "sealed secrets store is not open — start sftpflowd with \
+                  --passphrase-file or SFTPFLOW_PASSPHRASE"
+            .to_string(),
+    })
+}
+
+/// Upsert a sealed secret. `value` never touches disk in plaintext.
+pub fn put_secret(
+    state: &mut DaemonState,
+    name: String,
+    value: String,
+) -> Result<Response, ProtoError> {
+    let store = require_secrets_mut(state)?;
+    store.put(name.clone(), value).map_err(|e| ProtoError {
+        code: error_code::INTERNAL_ERROR,
+        message: format!("could not persist secret '{}': {}", name, e),
+    })?;
+    Ok(Response::Ok)
+}
+
+/// Delete a sealed secret. Idempotent — not-found is not an error.
+pub fn delete_secret(
+    state: &mut DaemonState,
+    name: &str,
+) -> Result<Response, ProtoError> {
+    let store = require_secrets_mut(state)?;
+    store.delete(name).map_err(|e| ProtoError {
+        code: error_code::INTERNAL_ERROR,
+        message: format!("could not persist secret deletion '{}': {}", name, e),
+    })?;
+    Ok(Response::Ok)
+}
+
+/// List the *names* of every sealed secret. Values are never sent
+/// back to the client.
+pub fn list_secrets(state: &DaemonState) -> Result<Response, ProtoError> {
+    let store = require_secrets(state)?;
+    Ok(Response::Names(store.names()))
+}
+
+// ============================================================
+// Run history
+// ============================================================
+
+/// Retrieve run history for a feed from SQLite.
+pub fn get_run_history(
+    state: &DaemonState,
+    feed: &str,
+    limit: Option<u32>,
+) -> Result<Response, ProtoError> {
+    let db = state.run_db.as_ref().ok_or_else(|| ProtoError {
+        code: error_code::INTERNAL_ERROR,
+        message: "run history database is not available".to_string(),
+    })?;
+
+    let entries = db.get_runs(feed, limit).map_err(|e| ProtoError {
+        code: error_code::INTERNAL_ERROR,
+        message: format!("failed to query run history: {}", e),
+    })?;
+
+    Ok(Response::RunHistory(entries))
 }
 
 // ============================================================

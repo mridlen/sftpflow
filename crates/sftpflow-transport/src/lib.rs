@@ -14,12 +14,15 @@ use async_trait::async_trait;
 use log::{error, info, warn};
 use tempfile::TempDir;
 
-use sftpflow_core::{Endpoint, Feed, FeedPath, Protocol};
+use sftpflow_core::{Endpoint, Feed, FeedPath, PgpKey, ProcessStep, Protocol};
 use sftpflow_proto::{RunResult, RunStatus};
 
 // sftp.rs — SftpTransport implementation
 mod sftp;
 pub use sftp::SftpTransport;
+
+// pgp.rs — PGP encrypt/decrypt for process steps
+mod pgp;
 
 // ============================================================
 // TransportError
@@ -210,6 +213,7 @@ pub async fn run_feed(
     feed_name: &str,
     feed: &Feed,
     endpoints: &BTreeMap<String, Endpoint>,
+    keys: &BTreeMap<String, PgpKey>,
 ) -> RunResult {
     info!("run_feed '{}': starting", feed_name);
 
@@ -224,15 +228,16 @@ pub async fn run_feed(
         };
     }
 
-    // Warn about process steps (PGP not implemented until milestone 10)
-    if !feed.process.is_empty() {
-        warn!(
-            "run_feed '{}': {} process step(s) configured but PGP \
-             is not yet implemented — files will be transferred \
-             without processing",
-            feed_name,
-            feed.process.len()
-        );
+    // Validate process-step key references up-front so we can fail
+    // fast before connecting to any endpoint.
+    if let Err(msg) = validate_process_keys(feed, keys) {
+        error!("run_feed '{}': process validation failed: {}", feed_name, msg);
+        return RunResult {
+            feed: feed_name.to_string(),
+            status: RunStatus::Failed,
+            files_transferred: 0,
+            message: Some(format!("process validation error: {}", msg)),
+        };
     }
 
     // ---- create staging temp dir ----
@@ -386,6 +391,40 @@ pub async fn run_feed(
         };
     }
 
+    // ---- phase 1.5: process pipeline (PGP encrypt/decrypt) ----
+    // Each ProcessStep rewrites the staged files in place. The step
+    // operates on whatever set of filenames phase 1 produced (or the
+    // previous step left behind), and returns the new filename list
+    // that the next step / upload phase should use.
+    if !feed.process.is_empty() {
+        match apply_process_pipeline(
+            feed_name,
+            &feed.process,
+            keys,
+            staging_dir.path(),
+            downloaded_files.clone(),
+        ) {
+            Ok(new_files) => {
+                downloaded_files = new_files;
+            }
+            Err(msg) => {
+                error!(
+                    "run_feed '{}': process pipeline failed: {}",
+                    feed_name, msg
+                );
+                return RunResult {
+                    feed: feed_name.to_string(),
+                    status: RunStatus::Failed,
+                    files_transferred: 0,
+                    message: Some(format!(
+                        "process pipeline failed: {}",
+                        msg
+                    )),
+                };
+            }
+        }
+    }
+
     // ---- phase 2: upload to destinations ----
     for dst in &feed.destinations {
         info!(
@@ -512,4 +551,74 @@ pub async fn run_feed(
         files_transferred: total_files,
         message: None,
     }
+}
+
+// ============================================================
+// Process pipeline helpers
+// ============================================================
+
+/// Confirm that every key name referenced by a process step exists
+/// in the keys map and has non-empty contents. Run before connecting
+/// to any endpoint so misconfigured feeds fail fast.
+fn validate_process_keys(
+    feed: &Feed,
+    keys: &BTreeMap<String, PgpKey>,
+) -> Result<(), String> {
+    for step in &feed.process {
+        let key_name = match step {
+            ProcessStep::Encrypt { key } | ProcessStep::Decrypt { key } => key,
+        };
+        let pgp_key = keys
+            .get(key_name)
+            .ok_or_else(|| format!("pgp key '{}' not found", key_name))?;
+        let contents = pgp_key.contents.as_deref().unwrap_or("");
+        if contents.trim().is_empty() {
+            return Err(format!("pgp key '{}' has no contents", key_name));
+        }
+    }
+    Ok(())
+}
+
+/// Run every `ProcessStep` against the staged files, threading the
+/// output filenames through so each step sees the names produced
+/// by the previous step. Returns the final filename list.
+fn apply_process_pipeline(
+    feed_name: &str,
+    steps: &[ProcessStep],
+    keys: &BTreeMap<String, PgpKey>,
+    staging_dir: &std::path::Path,
+    mut files: Vec<String>,
+) -> Result<Vec<String>, String> {
+    for (i, step) in steps.iter().enumerate() {
+        info!(
+            "run_feed '{}': process step {} of {}: {}",
+            feed_name,
+            i + 1,
+            steps.len(),
+            step
+        );
+
+        let result = match step {
+            ProcessStep::Encrypt { key } => {
+                let contents = keys
+                    .get(key)
+                    .and_then(|k| k.contents.as_deref())
+                    .unwrap_or("");
+                // pgp.rs — encrypt_files
+                pgp::encrypt_files(key, contents, staging_dir, &files)
+            }
+            ProcessStep::Decrypt { key } => {
+                let contents = keys
+                    .get(key)
+                    .and_then(|k| k.contents.as_deref())
+                    .unwrap_or("");
+                // pgp.rs — decrypt_files
+                pgp::decrypt_files(key, contents, staging_dir, &files)
+            }
+        };
+
+        files = result.map_err(|e| e.to_string())?;
+    }
+
+    Ok(files)
 }
