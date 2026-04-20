@@ -50,3 +50,7 @@ sequoia-openpgp = { version = "1", default-features = false, features = ["crypto
 anyhow          = "1"
 age             = { version = "0.10", default-features = false }
 rpassword       = "7"
+suppaftp        = { version = "6", default-features = false, features = ["rustls", "deprecated"] }
+rustls          = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
+webpki-roots    = "0.26"
+base64          = "0.22"

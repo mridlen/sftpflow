@@ -19,6 +19,7 @@ use log::info;
 pub enum Protocol {
     Sftp,
     Ftp,
+    Ftps,
     Http,
     Https,
 }
@@ -34,8 +35,36 @@ impl std::fmt::Display for Protocol {
         match self {
             Protocol::Sftp  => write!(f, "sftp"),
             Protocol::Ftp   => write!(f, "ftp"),
+            Protocol::Ftps  => write!(f, "ftps"),
             Protocol::Http  => write!(f, "http"),
             Protocol::Https => write!(f, "https"),
+        }
+    }
+}
+
+/// FTPS negotiation style.
+///
+/// - `Explicit` — AUTH TLS on the existing port 21 control channel
+///   (the modern, common pattern for B2B partners).
+/// - `Implicit` — TLS from the first byte on port 990 (legacy).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum FtpsMode {
+    Explicit,
+    Implicit,
+}
+
+impl Default for FtpsMode {
+    fn default() -> Self {
+        FtpsMode::Explicit
+    }
+}
+
+impl std::fmt::Display for FtpsMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FtpsMode::Explicit => write!(f, "explicit"),
+            FtpsMode::Implicit => write!(f, "implicit"),
         }
     }
 }
@@ -67,6 +96,22 @@ pub struct Endpoint {
     /// Name of a sealed-store secret holding an SSH private key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ssh_key_ref: Option<String>,
+
+    // ---- FTP/FTPS-specific options ----
+    /// TLS negotiation style (FTPS only). None = default Explicit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ftps_mode: Option<FtpsMode>,
+    /// PASV vs active mode (FTP/FTPS). None = default passive.
+    /// Active mode requires the FTP server to open a data
+    /// connection *back* to us — the firewall in front of the
+    /// client must permit that. Passive is the modern default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub passive: Option<bool>,
+    /// Whether to verify the server's TLS certificate (FTPS only).
+    /// None = default true. Set to `Some(false)` for vendor
+    /// endpoints that present self-signed certs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verify_tls: Option<bool>,
 }
 
 impl Endpoint {
@@ -91,6 +136,19 @@ impl Endpoint {
             (Some(r), _)    => println!("  ssh_key     (ref: {})", r),
             (None, Some(v)) => println!("  ssh_key     {}", v),
             (None, None)    => println!("  ssh_key     (not set)"),
+        }
+
+        // FTP/FTPS extras only printed when relevant, to avoid
+        // cluttering SFTP endpoint output.
+        if matches!(self.protocol, Protocol::Ftp | Protocol::Ftps) {
+            let pasv = self.passive.unwrap_or(true);
+            println!("  mode        {}", if pasv { "passive" } else { "active" });
+        }
+        if matches!(self.protocol, Protocol::Ftps) {
+            let mode = self.ftps_mode.clone().unwrap_or_default();
+            let verify = self.verify_tls.unwrap_or(true);
+            println!("  ftps_mode   {}", mode);
+            println!("  verify_tls  {}", verify);
         }
     }
 }

@@ -4,7 +4,7 @@
 //
 // Defines the Transport trait and the run_feed() orchestrator
 // that moves files from sources → staging → destinations.
-// v1 supports SFTP only; FTP/HTTP/HTTPS come in later milestones.
+// Supports SFTP, FTP/FTPS, and HTTP/HTTPS (source-only).
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -20,6 +20,14 @@ use sftpflow_proto::{RunResult, RunStatus};
 // sftp.rs — SftpTransport implementation
 mod sftp;
 pub use sftp::SftpTransport;
+
+// ftp.rs — FtpTransport (plain FTP and FTPS)
+mod ftp;
+pub use ftp::FtpTransport;
+
+// http.rs — HttpTransport (HTTP/HTTPS, source-only)
+mod http;
+pub use http::HttpTransport;
 
 // pgp.rs — PGP encrypt/decrypt for process steps
 mod pgp;
@@ -86,6 +94,15 @@ impl std::error::Error for TransportError {}
 /// talk to, then calls the trait methods to move files.
 #[async_trait]
 pub trait Transport: Send + Sync {
+    /// Build the remote path to hand back to download/upload/delete
+    /// given a source/destination base path and a filename from
+    /// list_files. Default is `{base}/{name}` (SFTP, FTP). HTTP
+    /// overrides this because a URL *is* a single file — the base
+    /// already names the whole resource and no join is possible.
+    fn remote_path(&self, base: &str, name: &str) -> String {
+        format!("{}/{}", base.trim_end_matches('/'), name)
+    }
+
     /// List regular files in a remote directory.
     /// Returns file names (not full paths).
     async fn list_files(
@@ -129,11 +146,16 @@ async fn connect_endpoint(
                 SftpTransport::connect(name, endpoint).await?;
             Ok(Box::new(transport))
         }
-        // FTP, HTTP, HTTPS — future milestones
-        ref proto => Err(TransportError::UnsupportedProtocol(
-            name.to_string(),
-            proto.to_string(),
-        )),
+        Protocol::Ftp | Protocol::Ftps => {
+            let transport =
+                FtpTransport::connect(name, endpoint).await?;
+            Ok(Box::new(transport))
+        }
+        Protocol::Http | Protocol::Https => {
+            let transport =
+                HttpTransport::connect(name, endpoint).await?;
+            Ok(Box::new(transport))
+        }
     }
 }
 
@@ -160,6 +182,17 @@ fn validate_feed(
             TransportError::EndpointNotFound(dst.endpoint.clone())
         })?;
         validate_endpoint(&dst.endpoint, ep)?;
+        // HTTP/HTTPS are read-only — a plain GET endpoint has no
+        // upload semantics. Reject at validate time so the feed
+        // fails fast instead of hitting an unsupported-op error
+        // mid-transfer.
+        if matches!(ep.protocol, Protocol::Http | Protocol::Https) {
+            return Err(TransportError::UnsupportedProtocol(
+                dst.endpoint.clone(),
+                format!("{} (destinations are not supported for http/https)",
+                    ep.protocol),
+            ));
+        }
     }
     Ok(())
 }
@@ -192,10 +225,55 @@ fn validate_endpoint(
             }
             Ok(())
         }
-        ref proto => Err(TransportError::UnsupportedProtocol(
-            name.to_string(),
-            proto.to_string(),
-        )),
+        Protocol::Ftp | Protocol::Ftps => {
+            // FTP has no key-based auth — password is mandatory.
+            if ep.host.is_none() {
+                return Err(TransportError::MissingField(
+                    name.to_string(),
+                    "host".to_string(),
+                ));
+            }
+            if ep.username.is_none() {
+                return Err(TransportError::MissingField(
+                    name.to_string(),
+                    "username".to_string(),
+                ));
+            }
+            if ep.password.is_none() {
+                return Err(TransportError::MissingField(
+                    name.to_string(),
+                    "password".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        Protocol::Http | Protocol::Https => {
+            // Only the host is mandatory. Credentials are optional —
+            // anonymous GET is the common case for public download
+            // URLs. Reject half-set credentials so the misconfig
+            // fails fast instead of silently skipping auth.
+            if ep.host.is_none() {
+                return Err(TransportError::MissingField(
+                    name.to_string(),
+                    "host".to_string(),
+                ));
+            }
+            if ep.username.is_some() && ep.password.is_none() {
+                return Err(TransportError::MissingField(
+                    name.to_string(),
+                    "password (username is set, password must be set too \
+                     for basic auth)".to_string(),
+                ));
+            }
+            if ep.password.is_some() && ep.username.is_none() {
+                return Err(TransportError::MissingField(
+                    name.to_string(),
+                    "username (password is set, username must be set too \
+                     for basic auth)".to_string(),
+                ));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -340,11 +418,9 @@ pub async fn run_feed(
 
         let mut src_files = Vec::new();
         for file_name in &files {
-            let remote_path = format!(
-                "{}/{}",
-                src.path.trim_end_matches('/'),
-                file_name
-            );
+            // Transport decides how to join base+name — HTTP returns
+            // the base verbatim because a URL is already a full file.
+            let remote_path = transport.remote_path(&src.path, file_name);
             let local_path = staging_dir.path().join(file_name);
 
             if let Err(e) =
@@ -456,11 +532,7 @@ pub async fn run_feed(
 
         for file_name in &downloaded_files {
             let local_path = staging_dir.path().join(file_name);
-            let remote_path = format!(
-                "{}/{}",
-                dst.path.trim_end_matches('/'),
-                file_name
-            );
+            let remote_path = transport.remote_path(&dst.path, file_name);
 
             if let Err(e) =
                 transport.upload(&local_path, &remote_path).await
@@ -519,11 +591,7 @@ pub async fn run_feed(
                 };
 
             for file_name in files {
-                let remote_path = format!(
-                    "{}/{}",
-                    src.path.trim_end_matches('/'),
-                    file_name
-                );
+                let remote_path = transport.remote_path(&src.path, file_name);
                 if let Err(e) =
                     transport.delete(&remote_path).await
                 {

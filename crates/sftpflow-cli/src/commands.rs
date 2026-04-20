@@ -12,7 +12,7 @@ use log::info;
 use sftpflow_proto::{Request, Response}; // lib.rs (sftpflow-proto)
 
 use crate::cli::{Mode, ShellState};
-use crate::feed::{Endpoint, Feed, FeedPath, KeyType, NextStep, NextStepAction, PgpKey, ProcessStep, Protocol, TriggerCondition}; // feed.rs
+use crate::feed::{Endpoint, Feed, FeedPath, FtpsMode, KeyType, NextStep, NextStepAction, PgpKey, ProcessStep, Protocol, TriggerCondition}; // feed.rs
 use crate::rpc::RpcError; // rpc.rs
 
 // ============================================================
@@ -613,7 +613,7 @@ pub fn exit_config_edit(state: &mut ShellState) {
 /// Print help for endpoint-edit mode.
 pub fn help_endpoint_edit() {
     println!("Endpoint configuration commands:");
-    println!("  protocol <proto>         Set protocol: sftp (default), ftp, http, https");
+    println!("  protocol <proto>         Set protocol: sftp (default), ftp, ftps, http, https");
     println!("  host <address>           Set the hostname or IP address");
     println!("  port <number>            Set the port");
     println!("  username <user>          Set the username");
@@ -621,6 +621,9 @@ pub fn help_endpoint_edit() {
     println!("  password_ref <name>      Set a sealed-store secret name for the password");
     println!("  ssh_key <path>           Set an inline SSH private key (plaintext in YAML)");
     println!("  ssh_key_ref <name>       Set a sealed-store secret name for the SSH key");
+    println!("  ftps_mode <mode>         FTPS only: explicit (default) or implicit");
+    println!("  passive <yes|no>         FTP/FTPS: PASV (default) or active mode");
+    println!("  verify_tls <yes|no>      FTPS only: validate server cert (default yes)");
     println!("  no <property>            Clear a property");
     println!("  show                     Show pending configuration");
     println!("  commit                   Save changes to config file");
@@ -639,10 +642,11 @@ pub fn set_protocol(args: &[&str], state: &mut ShellState) {
     let proto = match args[0].to_lowercase().as_str() {
         "sftp"  => Protocol::Sftp,
         "ftp"   => Protocol::Ftp,
+        "ftps"  => Protocol::Ftps,
         "http"  => Protocol::Http,
         "https" => Protocol::Https,
         _ => {
-            println!("% Unknown protocol '{}'. Available: sftp, ftp, http, https", args[0]);
+            println!("% Unknown protocol '{}'. Available: sftp, ftp, ftps, http, https", args[0]);
             return;
         }
     };
@@ -736,10 +740,81 @@ pub fn set_ssh_key(args: &[&str], state: &mut ShellState) {
     }
 }
 
+// ---- FTP/FTPS-specific setters ----
+
+/// Set FTPS negotiation mode (explicit | implicit). Only meaningful
+/// when the endpoint protocol is `ftps` — but we don't enforce that
+/// here; the field is harmless on other protocols.
+pub fn set_ftps_mode(args: &[&str], state: &mut ShellState) {
+    if args.is_empty() {
+        println!("% Usage: ftps_mode <explicit|implicit>");
+        return;
+    }
+    let mode = match args[0].to_lowercase().as_str() {
+        "explicit" => FtpsMode::Explicit,
+        "implicit" => FtpsMode::Implicit,
+        _ => {
+            println!("% Unknown ftps_mode '{}'. Available: explicit, implicit", args[0]);
+            return;
+        }
+    };
+    if let Some(ref mut ep) = state.pending_endpoint {
+        info!("Set ftps_mode = {}", mode);
+        println!("  ftps_mode → {}", mode);
+        ep.ftps_mode = Some(mode);
+    }
+}
+
+/// Set passive (true) or active (false) FTP mode.
+pub fn set_passive(args: &[&str], state: &mut ShellState) {
+    if args.is_empty() {
+        println!("% Usage: passive <yes|no>  (yes=PASV, no=active mode)");
+        return;
+    }
+    let value = match args[0].to_lowercase().as_str() {
+        "yes" | "true"  | "on"  => true,
+        "no"  | "false" | "off" => false,
+        _ => {
+            println!("% Expected yes/no, got '{}'", args[0]);
+            return;
+        }
+    };
+    if let Some(ref mut ep) = state.pending_endpoint {
+        ep.passive = Some(value);
+        info!("Set passive = {}", value);
+        println!("  passive → {} ({} mode)", value, if value { "passive" } else { "active" });
+    }
+}
+
+/// Set whether FTPS server certificates are validated.
+pub fn set_verify_tls(args: &[&str], state: &mut ShellState) {
+    if args.is_empty() {
+        println!("% Usage: verify_tls <yes|no>");
+        return;
+    }
+    let value = match args[0].to_lowercase().as_str() {
+        "yes" | "true"  | "on"  => true,
+        "no"  | "false" | "off" => false,
+        _ => {
+            println!("% Expected yes/no, got '{}'", args[0]);
+            return;
+        }
+    };
+    if let Some(ref mut ep) = state.pending_endpoint {
+        ep.verify_tls = Some(value);
+        info!("Set verify_tls = {}", value);
+        if !value {
+            println!("  verify_tls → no  (WARNING: server cert will not be validated)");
+        } else {
+            println!("  verify_tls → yes");
+        }
+    }
+}
+
 /// Handle 'no <property>' in endpoint-edit mode.
 pub fn no_endpoint_command(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
-        println!("% Usage: no <protocol|host|port|username|password|password_ref|ssh_key|ssh_key_ref>");
+        println!("% Usage: no <protocol|host|port|username|password|password_ref|ssh_key|ssh_key_ref|ftps_mode|passive|verify_tls>");
         return;
     }
 
@@ -753,6 +828,9 @@ pub fn no_endpoint_command(args: &[&str], state: &mut ShellState) {
             "password_ref" => { ep.password_ref = None; println!("  password_ref cleared."); }
             "ssh_key"      => { ep.ssh_key = None;      println!("  ssh_key cleared."); }
             "ssh_key_ref"  => { ep.ssh_key_ref = None;  println!("  ssh_key_ref cleared."); }
+            "ftps_mode"    => { ep.ftps_mode = None;    println!("  ftps_mode reset to default (explicit)."); }
+            "passive"      => { ep.passive = None;      println!("  passive reset to default (yes)."); }
+            "verify_tls"   => { ep.verify_tls = None;   println!("  verify_tls reset to default (yes)."); }
             _ => println!("% Unknown property: '{}'", args[0]),
         }
     }
