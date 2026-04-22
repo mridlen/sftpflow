@@ -19,6 +19,7 @@ members = [
     "crates/sftpflowd",
     "crates/sftpflow-shell",
     "crates/sftpflow-transport",
+    "crates/sftpflow-cluster",
 ]
 
 [workspace.package]
@@ -41,7 +42,7 @@ env_logger = "0.11"
 rustyline  = "15"
 ureq       = { version = "2", features = ["json"] }
 async-trait = "0.1"
-tokio      = { version = "1", features = ["rt", "macros", "io-util", "fs"] }
+tokio      = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-util", "fs", "sync", "net", "time"] }
 russh      = "0.50"
 russh-sftp = "2.1"
 tempfile   = "3"
@@ -54,3 +55,23 @@ suppaftp        = { version = "6", default-features = false, features = ["rustls
 rustls          = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 webpki-roots    = "0.26"
 base64          = "0.22"
+
+# ------------------------------------------------------------
+# Cluster / Raft dependencies (M12+)
+# Used by sftpflow-cluster and sftpflowd. Pure-Rust where possible
+# to keep the Windows MSVC build story unchanged from M11.
+# ------------------------------------------------------------
+openraft        = { version = "0.9", features = ["serde"] }
+tonic           = "0.12"
+tonic-build     = "0.12"
+prost           = "0.13"
+rcgen           = "0.13"
+rustls-pemfile  = "2"
+tokio-rustls    = "0.26"
+uuid            = { version = "1", features = ["v4", "serde"] }
+clap            = { version = "4", features = ["derive"] }
+sled            = "0.34"
+chrono          = { version = "0.4", features = ["serde"] }
+hmac            = "0.12"
+sha2            = "0.10"
+rand            = "0.8"

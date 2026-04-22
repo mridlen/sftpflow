@@ -1,0 +1,66 @@
+# ============================================================
+# sftpflow-cluster
+# ============================================================
+#
+# Raft-based cluster runtime for sftpflowd. Provides:
+#   - openraft state machine + sled-backed log/snapshot storage
+#   - tonic-based mTLS transport for Raft RPCs between nodes
+#   - cluster CA + leaf cert minting (rcgen, pure-Rust)
+#   - join token mint/validate (HMAC-SHA256, single-use nonces)
+#   - public ClusterHandle API consumed by sftpflowd
+#
+# This crate is intentionally separable: it knows nothing about
+# config.yaml, the sealed secrets store, or the NDJSON RPC layer.
+# Those integrations live in sftpflowd and arrive in milestones
+# 13 / 14. M12 lands cluster *membership* only; the state machine
+# applies NoOp entries and stubs the data-replication variants.
+#
+# Design doc: docs/m12-raft-scaffolding.md
+
+[package]
+name = "sftpflow-cluster"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# ---- Raft runtime + RPC transport ----
+openraft       = { workspace = true }
+tonic          = { workspace = true }
+prost          = { workspace = true }
+tokio          = { workspace = true }
+tokio-rustls   = { workspace = true }
+rustls         = { workspace = true }
+rustls-pemfile = { workspace = true }
+async-trait    = { workspace = true }
+
+# ---- Storage ----
+sled           = { workspace = true }
+
+# ---- TLS cert + token crypto ----
+rcgen          = { workspace = true }
+hmac           = { workspace = true }
+sha2           = { workspace = true }
+rand           = { workspace = true }
+base64         = { workspace = true }
+
+# ---- Serialization + identity ----
+serde          = { workspace = true }
+serde_json     = { workspace = true }
+uuid           = { workspace = true }
+chrono         = { workspace = true }
+
+# ---- Logging + errors ----
+log            = { workspace = true }
+anyhow         = { workspace = true }
+
+[build-dependencies]
+# Code-generates from src/proto/cluster.proto. Empty until the
+# proto file lands in the next M12 task; build.rs is a no-op
+# guarded by file existence so the crate builds cleanly today.
+tonic-build    = { workspace = true }
+
+[dev-dependencies]
+tempfile       = { workspace = true }
