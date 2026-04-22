@@ -23,11 +23,23 @@
 //
 // Design doc: docs/m12-raft-scaffolding.md
 
+// ---- Generated protobuf / tonic stubs ----
+// src/proto/cluster.proto -> tonic_build (in build.rs) ->
+// OUT_DIR/sftpflow.cluster.v1.rs, included here.
+pub mod proto {
+    //! Generated tonic client + server stubs for the three
+    //! cluster services (RaftService, AdminService,
+    //! BootstrapService). See src/proto/cluster.proto for the
+    //! authoritative schema.
+    tonic::include_proto!("sftpflow.cluster.v1");
+}
+
 // ---- Internal modules (added incrementally during M12) ----
-// pub mod state;       // openraft TypeConfig + StateMachine
+pub mod state;       // openraft TypeConfig + Command/Result enums
 // pub mod store;       // sled-backed RaftStorage impl
 // pub mod transport;   // tonic mTLS RaftService client/server
 // pub mod bootstrap;   // anonymous TLS BootstrapService
+// pub mod admin;       // mTLS AdminService (mint tokens etc.)
 // pub mod tls;         // CA + leaf cert generation
 // pub mod token;       // join token mint/validate
 // pub mod membership;  // membership change helpers

@@ -64,6 +64,9 @@ base64          = "0.22"
 openraft        = { version = "0.9", features = ["serde"] }
 tonic           = "0.12"
 tonic-build     = "0.12"
+# Vendored protoc binary so contributors don't need a system protoc install.
+# Pulled in by sftpflow-cluster's build.rs and re-exported via PROTOC env var.
+protoc-bin-vendored = "3"
 prost           = "0.13"
 rcgen           = "0.13"
 rustls-pemfile  = "2"

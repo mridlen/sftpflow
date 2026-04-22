@@ -1,0 +1,153 @@
+// ============================================================
+// sftpflow.cluster.v1 - node-to-node RPC schema
+// ============================================================
+//
+// Three services share a single TLS server port. tonic dispatches
+// by gRPC service name; the trust boundary is enforced by the
+// per-service handler:
+//
+//   RaftService       - mTLS required (validated against cluster CA)
+//   AdminService      - mTLS required (validated against cluster CA)
+//   BootstrapService  - anonymous TLS allowed; authenticated via
+//                       HMAC'd join token in the request body
+//
+// Raft message payloads are JSON-serialized openraft types wrapped
+// in `bytes`. This keeps the proto schema stable across openraft
+// upgrades — only the JSON shape (which we own) needs migration.
+//
+// Versioning: the package is suffixed with v1. Breaking changes to
+// the wire shape introduce v2 services; v1 stays serving until all
+// nodes are upgraded.
+
+syntax = "proto3";
+
+package sftpflow.cluster.v1;
+
+// ============================================================
+// RaftService - openraft consensus messages
+// ============================================================
+//
+// Every method requires a valid mTLS client cert chained to the
+// cluster CA. The handler extracts the calling node's ID from the
+// cert CN (format: "node-<id>") for log/audit purposes.
+
+service RaftService {
+  // AppendEntries: leader -> follower log replication + heartbeat.
+  rpc AppendEntries(RaftRpcRequest) returns (RaftRpcResponse);
+
+  // Vote: candidate -> peer leader election.
+  rpc Vote(RaftRpcRequest) returns (RaftRpcResponse);
+
+  // InstallSnapshot: leader -> lagging follower full state transfer.
+  // Single-request shape in M12 (snapshots are tiny - no replicated
+  // data yet). M13/M14 may switch to a streaming variant once real
+  // config + run history pushes snapshot sizes up.
+  rpc InstallSnapshot(RaftRpcRequest) returns (RaftRpcResponse);
+}
+
+// JSON-wrapped openraft request payload. The exact type encoded
+// inside `payload_json` is determined by the RPC method that
+// carries it (AppendEntriesRequest, VoteRequest, etc.). Versioned
+// by the gRPC service version and the openraft version pinned in
+// Cargo.toml.
+message RaftRpcRequest {
+  bytes payload_json = 1;
+}
+
+// JSON-wrapped openraft response payload. Mirrors RaftRpcRequest;
+// the response type is determined by the calling method.
+message RaftRpcResponse {
+  bytes payload_json = 1;
+}
+
+// ============================================================
+// AdminService - cluster administrative operations
+// ============================================================
+//
+// mTLS required. Used by sftpflowd internally for operator-driven
+// cluster management. Forwarded to the leader by openraft when
+// called on a follower.
+
+service AdminService {
+  // MintToken: create a single-use join token. In M12 only the
+  // bootstrap node holds the HMAC key, so this method either
+  // executes locally or returns NOT_BOOTSTRAP_NODE with the
+  // bootstrap node's advertise address for the caller to retry.
+  rpc MintToken(MintTokenRequest) returns (MintTokenResponse);
+}
+
+message MintTokenRequest {
+  // Optional human-readable label for audit (e.g. "added by alice
+  // on 2026-04-22 for west-coast replica"). Stored alongside the
+  // nonce in the used-tokens log when the token is later redeemed.
+  string label = 1;
+
+  // Token TTL in seconds. Capped server-side to MAX_JOIN_TOKEN_TTL
+  // (1 hour by default). Zero means "use the server default".
+  uint32 ttl_seconds = 2;
+}
+
+message MintTokenResponse {
+  // Opaque token string in the wire format documented in token.rs.
+  // The CLI prints this verbatim for the operator to paste on the
+  // joining node.
+  string token = 1;
+
+  // Unix seconds when the token expires. Informational; servers
+  // re-validate against the embedded expiry, not this field.
+  int64 expires_at_unix = 2;
+}
+
+// ============================================================
+// BootstrapService - join the cluster (anonymous-TLS allowed)
+// ============================================================
+//
+// Anonymous TLS connections are allowed for this service. The
+// joining node has no cert yet — it presents a minted token, the
+// bootstrap node validates the HMAC + nonce, signs the joining
+// node's CSR with the cluster CA, and returns the issued cert
+// plus the current cluster membership.
+
+service BootstrapService {
+  rpc Join(JoinRequest) returns (JoinResponse);
+}
+
+message JoinRequest {
+  // Single-use token minted via AdminService.MintToken. Wire format
+  // documented in token.rs. Includes embedded HMAC, expiry, and
+  // nonce for replay protection.
+  string token = 1;
+
+  // Node ID the joining node would like to be assigned. M12 requires
+  // operator-supplied IDs; the bootstrap node rejects collisions
+  // with existing members.
+  uint64 desired_node_id = 2;
+
+  // host:port the joining node is listening on for Raft RPCs. Other
+  // members will dial this address when replicating log entries.
+  string advertise_addr = 3;
+
+  // PKCS#10 CSR (DER-encoded) for the joining node's leaf cert.
+  // The bootstrap node signs it with the cluster CA and returns the
+  // signed cert in JoinResponse.signed_leaf_cert_pem.
+  bytes csr_der = 4;
+}
+
+message JoinResponse {
+  // Cluster CA public cert (PEM). The joining node uses this to
+  // validate other members' certs on subsequent mTLS connections.
+  bytes ca_cert_pem = 1;
+
+  // The joining node's signed leaf cert (PEM). Paired with the
+  // private key the joining node generated locally.
+  bytes signed_leaf_cert_pem = 2;
+
+  // JSON-serialized openraft Membership snapshot. The joining node
+  // uses this to seed its peer table before its first AppendEntries.
+  bytes membership_json = 3;
+
+  // Cluster identity (UUID generated at the bootstrap node's `init`).
+  // The joining node persists this in node.json and refuses to talk
+  // to peers from a different cluster_id thereafter.
+  string cluster_id = 4;
+}

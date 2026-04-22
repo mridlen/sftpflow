@@ -57,10 +57,12 @@ log            = { workspace = true }
 anyhow         = { workspace = true }
 
 [build-dependencies]
-# Code-generates from src/proto/cluster.proto. Empty until the
-# proto file lands in the next M12 task; build.rs is a no-op
-# guarded by file existence so the crate builds cleanly today.
-tonic-build    = { workspace = true }
+# Code-generates Rust + tonic stubs from src/proto/cluster.proto.
+tonic-build         = { workspace = true }
+# Vendored protoc binary so contributors don't need a system
+# protoc install — keeps the "newcomer can clone and build"
+# promise intact across Linux / macOS / Windows.
+protoc-bin-vendored = { workspace = true }
 
 [dev-dependencies]
 tempfile       = { workspace = true }
