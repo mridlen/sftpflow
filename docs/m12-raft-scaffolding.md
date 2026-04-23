@@ -18,6 +18,12 @@ Plus three scope calls:
 - **No write forwarding from follower → leader in M12.** Mutating RPCs on a follower return `NOT_LEADER` with the leader's advertise address so the CLI can retry. M13 adds automatic forwarding. ✔
 - **`cluster status` prints a red warning when `voters == 2`.** Two-node is not HA. ✔
 
+## Implementation deviations (recorded as encountered)
+
+- **2026-04-22 — protoc-bin-vendored.** tonic-build requires `protoc` on PATH. Newcomers shouldn't have to install protobuf-compiler. Added `protoc-bin-vendored` as a build-dep so `cargo build` ships a per-target binary. See `crates/sftpflow-cluster/build.rs`.
+- **2026-04-22 — three services instead of two.** Design doc had `BootstrapService` holding both `Join` (anonymous) and `MintToken` (mTLS). Split into `BootstrapService` (anonymous, Join only) and `AdminService` (mTLS, MintToken). Cleaner trust boundary; same single-port story via gRPC service-name routing.
+- **2026-04-22 — v1 RaftStorage via Adaptor.** openraft 0.9 sealed the v2 `RaftLogStorage` / `RaftStateMachine` traits — external crates can't implement them. Implemented v1 `RaftStorage` on `SledStore` and used `openraft::storage::Adaptor` to produce the v2 (LogStore, StateMachine) pair the runtime consumes. `crates/sftpflow-cluster/src/store.rs::open_for_raft()` is the public entry point.
+
 ## 1. Goal and non-goals
 
 ### Goal

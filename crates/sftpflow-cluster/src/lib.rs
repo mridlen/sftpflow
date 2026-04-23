@@ -36,12 +36,12 @@ pub mod proto {
 
 // ---- Internal modules (added incrementally during M12) ----
 pub mod state;       // openraft TypeConfig + Command/Result enums
-// pub mod store;       // sled-backed RaftStorage impl
+pub mod store;       // sled-backed RaftLogStorage + RaftStateMachine
+pub mod tls;         // cluster CA + leaf cert generation (rcgen)
+pub mod token;       // join token mint/validate (HMAC-SHA256)
 // pub mod transport;   // tonic mTLS RaftService client/server
 // pub mod bootstrap;   // anonymous TLS BootstrapService
 // pub mod admin;       // mTLS AdminService (mint tokens etc.)
-// pub mod tls;         // CA + leaf cert generation
-// pub mod token;       // join token mint/validate
 // pub mod membership;  // membership change helpers
 
 // ============================================================

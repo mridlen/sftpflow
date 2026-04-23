@@ -41,6 +41,7 @@ sled           = { workspace = true }
 
 # ---- TLS cert + token crypto ----
 rcgen          = { workspace = true }
+time           = { workspace = true }
 hmac           = { workspace = true }
 sha2           = { workspace = true }
 rand           = { workspace = true }
