@@ -3985,17 +3985,21 @@ name = "sftpflowd"
 version = "0.1.1"
 dependencies = [
  "age",
+ "clap",
  "env_logger",
  "log",
  "rusqlite",
+ "rustls",
  "serde",
  "serde_json",
+ "sftpflow-cluster",
  "sftpflow-core",
  "sftpflow-proto",
  "sftpflow-transport",
  "tempfile",
  "tokio",
  "ureq",
+ "uuid",
 ]
 
 [[package]]

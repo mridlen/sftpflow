@@ -25,6 +25,8 @@ path = "src/main.rs"
 sftpflow-core      = { path = "../sftpflow-core" }
 sftpflow-proto     = { path = "../sftpflow-proto" }
 sftpflow-transport = { path = "../sftpflow-transport" }
+# Cluster runtime (M12+). Pulls in openraft, tonic, sled, rcgen.
+sftpflow-cluster   = { path = "../sftpflow-cluster" }
 
 serde      = { workspace = true }
 serde_json = { workspace = true }
@@ -34,6 +36,13 @@ tokio      = { workspace = true }
 ureq       = { workspace = true }
 rusqlite   = { workspace = true }
 age        = { workspace = true }
+
+# CLI subcommand dispatch (M12 PR-B: init / join / run).
+clap       = { workspace = true }
+# Cluster ID generation during `sftpflowd init`.
+uuid       = { workspace = true }
+# TLS crypto provider install at startup (tonic builds on rustls).
+rustls     = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
