@@ -257,6 +257,66 @@ impl LeafKeyPair {
 }
 
 // ============================================================
+// Tonic TLS config helpers
+// ============================================================
+//
+// Built on top of tonic's tls feature (which itself sits on
+// tokio-rustls). One config per node serves both directions:
+//
+//   - server_tls_config:  presents this node's leaf cert; verifies
+//                         peer client certs against the cluster CA;
+//                         allows anonymous clients (they're routed
+//                         to BootstrapService.Join only).
+//
+//   - client_tls_config:  presents this node's leaf cert; verifies
+//                         peer server certs against the cluster CA.
+//
+// Anonymous clients (joining nodes that don't have a cert yet) get
+// `client_tls_config_anonymous` which only verifies the server.
+
+use tonic::transport::{Certificate as TonicCert, ClientTlsConfig, Identity, ServerTlsConfig};
+
+/// Server-side TLS config for a node already in the cluster.
+/// Accepts mTLS connections (preferred) and also allows anonymous
+/// clients — those are gated to BootstrapService at the per-method
+/// layer in transport.rs.
+pub fn server_tls_config(
+    leaf_cert_pem: &str,
+    leaf_key_pem:  &str,
+    ca_cert_pem:   &str,
+) -> ServerTlsConfig {
+    ServerTlsConfig::new()
+        .identity(Identity::from_pem(leaf_cert_pem, leaf_key_pem))
+        .client_ca_root(TonicCert::from_pem(ca_cert_pem))
+        .client_auth_optional(true)
+}
+
+/// Client-side mTLS config for talking to other cluster members.
+pub fn client_tls_config(
+    leaf_cert_pem: &str,
+    leaf_key_pem:  &str,
+    ca_cert_pem:   &str,
+    expected_dns:  &str,
+) -> ClientTlsConfig {
+    ClientTlsConfig::new()
+        .identity(Identity::from_pem(leaf_cert_pem, leaf_key_pem))
+        .ca_certificate(TonicCert::from_pem(ca_cert_pem))
+        .domain_name(expected_dns.to_string())
+}
+
+/// Anonymous client TLS config — used by a joining node that hasn't
+/// been issued a cert yet. The server is still authenticated against
+/// the supplied CA, but the client presents nothing.
+pub fn client_tls_config_anonymous(
+    ca_cert_pem:  &str,
+    expected_dns: &str,
+) -> ClientTlsConfig {
+    ClientTlsConfig::new()
+        .ca_certificate(TonicCert::from_pem(ca_cert_pem))
+        .domain_name(expected_dns.to_string())
+}
+
+// ============================================================
 // Tests
 // ============================================================
 

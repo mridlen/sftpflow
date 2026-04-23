@@ -62,7 +62,7 @@ base64          = "0.22"
 # to keep the Windows MSVC build story unchanged from M11.
 # ------------------------------------------------------------
 openraft        = { version = "0.9", features = ["serde"] }
-tonic           = "0.12"
+tonic           = { version = "0.12", features = ["tls", "transport"] }
 tonic-build     = "0.12"
 # Vendored protoc binary so contributors don't need a system protoc install.
 # Pulled in by sftpflow-cluster's build.rs and re-exported via PROTOC env var.

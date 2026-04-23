@@ -39,10 +39,8 @@ pub mod state;       // openraft TypeConfig + Command/Result enums
 pub mod store;       // sled-backed RaftLogStorage + RaftStateMachine
 pub mod tls;         // cluster CA + leaf cert generation (rcgen)
 pub mod token;       // join token mint/validate (HMAC-SHA256)
-// pub mod transport;   // tonic mTLS RaftService client/server
-// pub mod bootstrap;   // anonymous TLS BootstrapService
-// pub mod admin;       // mTLS AdminService (mint tokens etc.)
-// pub mod membership;  // membership change helpers
+pub mod transport;   // tonic mTLS RaftService + Admin + Bootstrap
+pub mod node;        // public ClusterNode / ClusterHandle API
 
 // ============================================================
 // Crate version (used in startup logs and protocol negotiation)
