@@ -43,6 +43,9 @@ clap       = { workspace = true }
 uuid       = { workspace = true }
 # TLS crypto provider install at startup (tonic builds on rustls).
 rustls     = { workspace = true }
+# Encode the raw 32-byte token secret for storage in the string-valued
+# sealed-secrets store (key name: __cluster_token_key__).
+base64     = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -3985,6 +3985,7 @@ name = "sftpflowd"
 version = "0.1.1"
 dependencies = [
  "age",
+ "base64 0.22.1",
  "clap",
  "env_logger",
  "log",
