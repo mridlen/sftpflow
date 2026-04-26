@@ -31,6 +31,7 @@
 
 use std::path::PathBuf;
 use std::process;
+use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand};
 use log::{error, info, warn};
@@ -318,8 +319,10 @@ fn cmd_init(daemon: DaemonArgs, args: InitArgs) -> Result<(), String> {
 
     // ---- 4. Generate cluster identity + crypto ----
     let cluster_id = uuid::Uuid::new_v4().to_string();
-    let ca = sftpflow_cluster::tls::ClusterCa::generate(&cluster_id)
-        .map_err(|e| format!("generating cluster CA: {}", e))?;
+    let ca = Arc::new(
+        sftpflow_cluster::tls::ClusterCa::generate(&cluster_id)
+            .map_err(|e| format!("generating cluster CA: {}", e))?,
+    );
     let leaf = sftpflow_cluster::tls::LeafKeyPair::generate(args.node_id, &advertise_addr)
         .map_err(|e| format!("generating leaf key pair: {}", e))?;
     let csr_der = leaf.csr_der()
@@ -397,7 +400,7 @@ fn cmd_init(daemon: DaemonArgs, args: InitArgs) -> Result<(), String> {
         state_dir:     state_dir.clone(),
         node:          node.clone(),
         bind_addr,
-        ca_cert_pem:   ca.cert_pem(),
+        ca:            ca.clone(),
         leaf_cert_pem,
         leaf_key_pem:  leaf.key_pem(),
         token_secret,
@@ -423,19 +426,217 @@ fn cmd_init(daemon: DaemonArgs, args: InitArgs) -> Result<(), String> {
 }
 
 // ============================================================
-// cmd_join - stubbed; real implementation lands in next commit
+// cmd_join - join an existing cluster via a seed node
+// ============================================================
+//
+// Mirrors docs/m12-raft-scaffolding.md §5.2:
+//
+//   1. Refuse if node.json already exists.
+//   2. Read the operator-supplied CA cert (out-of-band trust anchor).
+//   3. Resolve bind + advertise.
+//   4. Generate this node's leaf key + CSR locally.
+//   5. Dial the seed's BootstrapService.Join with the token + CSR.
+//   6. Cross-check the seed's CA matches what the operator handed us.
+//   7. Persist node.json + ca.crt + node.crt + node.key (NO ca.key
+//      — joiners don't get the CA private key in M12).
+//   8. Open the optional sealed-secrets store + run-history DB.
+//   9. Bring up the Raft runtime as a follower; the seed has already
+//      added us as a learner and promoted us to voter, so we just
+//      have to wait for the first AppendEntries to reach us.
+//   10. Enter the NDJSON serve loop.
+
+fn cmd_join(daemon: DaemonArgs, args: JoinArgs) -> Result<(), String> {
+    let state_dir = daemon.state_dir.clone().unwrap_or_else(default_state_dir);
+
+    // ---- 1. Refuse to clobber an existing node state ----
+    let node_json_path = node_state::node_json_path(&state_dir);
+    if node_json_path.exists() {
+        return Err(format!(
+            "{} already exists — refusing to re-join. Run \
+             `sftpflowd run` to start this node, or remove the \
+             state directory if you really want to re-join from \
+             scratch",
+            node_json_path.display(),
+        ));
+    }
+
+    // ---- 2. Read CA cert from operator-supplied path ----
+    let operator_ca_pem = std::fs::read_to_string(&args.ca_cert_file)
+        .map_err(|e| format!("reading {}: {}", args.ca_cert_file.display(), e))?;
+    if !operator_ca_pem.contains("BEGIN CERTIFICATE") {
+        return Err(format!(
+            "{} does not look like a PEM-encoded certificate",
+            args.ca_cert_file.display(),
+        ));
+    }
+
+    // ---- 3. Resolve bind + advertise ----
+    let bind_addr: std::net::SocketAddr = args.bind.parse().map_err(|e| {
+        format!("--bind '{}' must be IP:PORT (e.g. 0.0.0.0:7900): {}", args.bind, e)
+    })?;
+    let advertise_addr = args.advertise.clone().unwrap_or_else(|| args.bind.clone());
+
+    // ---- 4. Generate leaf key + CSR ----
+    let leaf = sftpflow_cluster::tls::LeafKeyPair::generate(args.node_id, &advertise_addr)
+        .map_err(|e| format!("generating leaf key pair: {}", e))?;
+    let csr_der = leaf.csr_der()
+        .map_err(|e| format!("serializing leaf CSR: {}", e))?;
+
+    info!(
+        "join: dialing seed {} as node_id={} (advertise={})",
+        args.seed, args.node_id, advertise_addr,
+    );
+
+    // ---- 5. Tokio runtime + dial seed ----
+    cluster_runtime::install_crypto_provider_once();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("sftpflowd-cluster")
+        .build()
+        .map_err(|e| format!("building tokio runtime: {}", e))?;
+
+    let join_result = rt.block_on(sftpflow_cluster::node::dial_seed_join(
+        sftpflow_cluster::node::SeedJoinArgs {
+            seed_addr:        args.seed.clone(),
+            ca_cert_pem:      operator_ca_pem.clone(),
+            token:            args.token.clone(),
+            desired_node_id:  args.node_id,
+            advertise_addr:   advertise_addr.clone(),
+            csr_der,
+        },
+    )).map_err(|e| format!("seed join handshake failed: {}", e))?;
+
+    // ---- 6. Cross-check the seed's CA matches what we trusted ----
+    // The operator handed us --ca-cert-file out of band. The seed
+    // also returned a CA in the JoinResponse. They MUST match — if
+    // they don't, either the operator pointed us at the wrong file
+    // or something in the middle is rewriting bytes. Refuse rather
+    // than silently trust the seed's copy.
+    if normalize_pem(&operator_ca_pem) != normalize_pem(&join_result.ca_cert_pem) {
+        return Err(format!(
+            "seed returned a CA cert that does not match {} — refusing to join \
+             (this can mean: wrong --ca-cert-file, wrong --seed, or a MITM)",
+            args.ca_cert_file.display(),
+        ));
+    }
+
+    info!(
+        "join: handshake ok; cluster_id={}, signed leaf cert received",
+        join_result.cluster_id,
+    );
+
+    // ---- 7. Persist node.json + cluster/*.{crt,key} ----
+    let node = node_state::NodeJson {
+        version:         node_state::NODE_JSON_VERSION,
+        node_id:         args.node_id,
+        cluster_id:      join_result.cluster_id.clone(),
+        advertise_addr:  advertise_addr.clone(),
+        label:           args.label.clone(),
+        created_at_unix: node_state::now_unix(),
+    };
+    node_state::write_node_json(&state_dir, &node)?;
+    node_state::write_pem(
+        &node_state::ca_cert_path(&state_dir),
+        &join_result.ca_cert_pem,
+        false,
+    )?;
+    node_state::write_pem(
+        &node_state::leaf_cert_path(&state_dir),
+        &join_result.signed_leaf_cert_pem,
+        false,
+    )?;
+    node_state::write_pem(
+        &node_state::leaf_key_path(&state_dir),
+        &leaf.key_pem(),
+        true,
+    )?;
+    info!("join: wrote cluster state under {}", state_dir.display());
+
+    // ---- 8. Daemon prelude (config, run history, optional secrets) ----
+    let config = Config::load();
+    info!(
+        "join: loaded config (endpoints={}, keys={}, feeds={})",
+        config.endpoints.len(), config.keys.len(), config.feeds.len(),
+    );
+
+    let db_path = daemon.db.clone().unwrap_or_else(default_db_path);
+    let run_db = match history::RunDb::open(&db_path) {
+        Ok(db) => {
+            info!("run history database ready at '{}'", db_path.display());
+            Some(db)
+        }
+        Err(e) => {
+            warn!(
+                "could not open run history database: {} — runs will not be recorded",
+                e
+            );
+            None
+        }
+    };
+
+    // The sealed-secrets store is OPTIONAL on joiners. Joiners
+    // don't seal a token-HMAC secret (only the bootstrap node does
+    // in M12). The operator only needs to provide a passphrase if
+    // they intend to use *_ref features in feeds on this node.
+    let secrets_path = daemon.secrets.clone().unwrap_or_else(secrets::default_secrets_path);
+    let secret_store = match secrets::load_passphrase(daemon.passphrase_file.as_deref()) {
+        Ok(Some(passphrase)) => match secrets::SecretStore::open(&secrets_path, passphrase) {
+            Ok(store) => {
+                info!("sealed credential store ready at '{}'", secrets_path.display());
+                Some(store)
+            }
+            Err(e) => {
+                return Err(format!("could not open sealed credential store: {}", e));
+            }
+        },
+        Ok(None) => {
+            info!(
+                "no master passphrase provided — sealed credential store is unavailable on \
+                 this joiner; feeds using *_ref fields will fail until one is set"
+            );
+            None
+        }
+        Err(e) => return Err(e),
+    };
+
+    // ---- 9. Bring up Raft as a joiner ----
+    let cluster_node = rt.block_on(cluster_runtime::join_existing(
+        cluster_runtime::JoinExistingParams {
+            state_dir:     state_dir.clone(),
+            node:          node.clone(),
+            bind_addr,
+            ca_cert_pem:   join_result.ca_cert_pem.clone(),
+            leaf_cert_pem: join_result.signed_leaf_cert_pem.clone(),
+            leaf_key_pem:  leaf.key_pem(),
+        },
+    ))?;
+
+    info!(
+        "join: cluster joined (node_id={}, cluster_id={})",
+        node.node_id, node.cluster_id,
+    );
+
+    // ---- 10. NDJSON serve loop ----
+    let ndjson_addr = daemon.socket.clone().unwrap_or_else(default_socket_addr);
+    info!("NDJSON server listening on {}", ndjson_addr);
+    let serve_result = server::run(&ndjson_addr, config, run_db, secret_store)
+        .map_err(|e| format!("NDJSON server: {}", e));
+
+    drop(cluster_node);
+    drop(rt);
+    serve_result
+}
+
+// ============================================================
+// normalize_pem
 // ============================================================
 
-fn cmd_join(_daemon: DaemonArgs, args: JoinArgs) -> Result<(), String> {
-    warn!(
-        "join {} --token <redacted> --ca-cert-file {} --node-id {} \
-         --bind {} --advertise {:?} --label {:?} parsed successfully \
-         but cluster join is not yet implemented (lands in the next \
-         PR-B commit)",
-        args.seed, args.ca_cert_file.display(), args.node_id,
-        args.bind, args.advertise, args.label,
-    );
-    Err("sftpflowd join is not yet implemented".to_string())
+/// Strip ASCII whitespace and CR before comparing two PEM blobs.
+/// Lets us tolerate trivial differences (CRLF vs LF, trailing
+/// newline, leading BOM) without losing the security check that
+/// the seed-supplied CA matches the operator-supplied one.
+fn normalize_pem(pem: &str) -> String {
+    pem.chars().filter(|c| !c.is_ascii_whitespace()).collect()
 }
 
 // ============================================================
