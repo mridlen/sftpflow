@@ -16,12 +16,15 @@
 //                         M13 removes this fallback).
 //
 // M12 PR-B status:
-//   - `run` is fully wired (legacy single-node path).
-//   - `init` and `join` print a descriptive stub message and exit
-//     with a non-zero code. Subsequent PR-B commits flesh them
-//     out one at a time. Rationale: lands the subcommand shape
-//     first so reviewers can see the UX before the crypto /
-//     bootstrap code follows.
+//   - `init` and `join` are fully wired (CA + leaf cert generation,
+//     sealed token secret, Raft startup, NDJSON serve loop).
+//   - `run` branches on whether <state_dir>/node.json exists:
+//     present → cluster-mode restart (bootstrap-node sub-path
+//     re-installs the seed-side join handler; joiner sub-path
+//     just brings Raft back up). Absent → legacy single-node
+//     mode. The legacy fallback is removed in M13.
+//   - Remaining for PR-B: leader gating on mutating RPCs +
+//     `cluster status`/`token`/`remove` CLI commands.
 //
 // Legacy flag compatibility:
 //   --socket / --db / --secrets / --passphrase-file continue to
@@ -144,7 +147,23 @@ enum Command {
     /// Run the daemon. Default behavior when no subcommand is
     /// given. Comes up as a cluster member if node.json exists;
     /// otherwise falls back to legacy single-node mode.
-    Run,
+    Run(RunArgs),
+}
+
+// ============================================================
+// RunArgs
+// ============================================================
+
+#[derive(Args, Clone, Debug, Default)]
+struct RunArgs {
+    /// host:port the Raft gRPC server binds to on this machine.
+    /// Only consulted in cluster mode (i.e. when node.json exists).
+    /// Defaults to the advertise address recorded in node.json,
+    /// which is correct on hosts where bind == advertise. Override
+    /// when binding to a wildcard or a different interface than
+    /// what peers use to dial in (e.g. NAT, multi-homed hosts).
+    #[arg(long, value_name = "ADDR")]
+    bind: Option<String>,
 }
 
 // ============================================================
@@ -250,9 +269,16 @@ fn main() {
             }
         }
 
-        // ---- Default: run the daemon (legacy single-node path)
-        Some(Command::Run) | None => {
-            if let Err(e) = cmd_run(cli.daemon) {
+        // ---- Default: run the daemon. Cluster restart if node.json
+        //               is present, otherwise legacy single-node mode.
+        Some(Command::Run(args)) => {
+            if let Err(e) = cmd_run(cli.daemon, args) {
+                error!("{}", e);
+                process::exit(1);
+            }
+        }
+        None => {
+            if let Err(e) = cmd_run(cli.daemon, RunArgs::default()) {
                 error!("{}", e);
                 process::exit(1);
             }
@@ -640,36 +666,233 @@ fn normalize_pem(pem: &str) -> String {
 }
 
 // ============================================================
-// cmd_run - the existing daemon path, preserved byte-for-byte
+// cmd_run - run the daemon
+// ============================================================
+//
+// Two paths, picked by whether `<state_dir>/node.json` exists:
+//
+//   - Cluster mode (node.json present): re-open the on-disk
+//     cluster state (CA cert, leaf cert + key, optional CA key
+//     and sealed token secret), bring openraft back up against
+//     the existing sled log, and serve NDJSON RPCs concurrently.
+//     openraft replays log + membership and either rejoins quorum
+//     or sits as a follower waiting for one. Implemented in
+//     cmd_run_cluster.
+//
+//   - Legacy single-node mode (no node.json): the pre-M12 daemon
+//     path — load config, reconcile dkron, open run history,
+//     unlock sealed store, serve NDJSON. Removed entirely in M13;
+//     kept for now so the existing test env keeps working through
+//     the rest of M12 PR-B.
+
+fn cmd_run(daemon: DaemonArgs, args: RunArgs) -> Result<(), String> {
+    let state_dir = daemon.state_dir.clone().unwrap_or_else(default_state_dir);
+
+    if let Some(node) = node_state::read_node_json(&state_dir)? {
+        return cmd_run_cluster(daemon, args, state_dir, node);
+    }
+
+    if args.bind.is_some() {
+        warn!(
+            "--bind is only consulted in cluster mode; ignoring it because \
+             {} does not exist (legacy single-node startup)",
+            node_state::node_json_path(&state_dir).display(),
+        );
+    }
+    cmd_run_legacy(daemon)
+}
+
+// ============================================================
+// cmd_run_cluster - cluster-mode restart
+// ============================================================
+//
+// Two sub-paths, distinguished by whether cluster/ca.key is on
+// disk (only the original `sftpflowd init` node has it in M12):
+//
+//   - Bootstrap-node restart: re-load CA cert + key, re-load the
+//     token-HMAC secret from the sealed store (passphrase
+//     required), re-install the seed-side join handler so future
+//     `sftpflowd join` flows still succeed, then resume Raft.
+//
+//   - Joiner restart: re-load CA cert + leaf only, no token
+//     secret, no join handler. Same as the post-handshake path
+//     in `cmd_join` minus the handshake itself.
+//
+// In both sub-paths the existing sled log under raft/ is re-used
+// — there is no "re-bootstrap" or "re-join" — and the NDJSON
+// server runs alongside the Raft runtime as before.
+fn cmd_run_cluster(
+    daemon:    DaemonArgs,
+    args:      RunArgs,
+    state_dir: PathBuf,
+    node:      node_state::NodeJson,
+) -> Result<(), String> {
+    info!(
+        "cluster restart: node_id={} cluster_id={} state_dir={}",
+        node.node_id, node.cluster_id, state_dir.display(),
+    );
+
+    // ---- 1. Resolve bind ----
+    // Default to advertise so single-arg restarts work for the
+    // common "bind == advertise" case; --bind overrides for
+    // multi-homed / NAT'd setups.
+    let bind_str = args.bind.clone().unwrap_or_else(|| node.advertise_addr.clone());
+    let bind_addr: std::net::SocketAddr = bind_str.parse().map_err(|e| {
+        format!("--bind '{}' must be IP:PORT (e.g. 0.0.0.0:7900): {}", bind_str, e)
+    })?;
+
+    // ---- 2. Re-read on-disk certs ----
+    let leaf_cert_pem = node_state::read_pem(&node_state::leaf_cert_path(&state_dir))?;
+    let leaf_key_pem  = node_state::read_pem(&node_state::leaf_key_path(&state_dir))?;
+    let ca_cert_pem   = node_state::read_pem(&node_state::ca_cert_path(&state_dir))?;
+
+    // ---- 3. Detect bootstrap-vs-joiner role ----
+    // Presence of cluster/ca.key is the marker: only the original
+    // bootstrap node persists the CA private key. M13 may
+    // distribute it to all voters for HA token minting; until then
+    // this asymmetry is intentional.
+    let ca_key_path = node_state::ca_key_path(&state_dir);
+    let is_bootstrap = ca_key_path.exists();
+
+    // ---- 4. Sealed credential store ----
+    // Bootstrap-node restart REQUIRES the passphrase: the
+    // token-HMAC secret was sealed there at init time and we
+    // need it to re-install the join handler.
+    // Joiner restart treats it as optional, exactly like cmd_join.
+    let secrets_path = daemon.secrets.clone().unwrap_or_else(secrets::default_secrets_path);
+    let mut secret_store = match secrets::load_passphrase(daemon.passphrase_file.as_deref())? {
+        Some(passphrase) => Some(
+            secrets::SecretStore::open(&secrets_path, passphrase)
+                .map_err(|e| format!("opening sealed store at '{}': {}", secrets_path.display(), e))?,
+        ),
+        None => {
+            if is_bootstrap {
+                return Err(
+                    "cluster restart on the bootstrap node requires a master \
+                     passphrase (--passphrase-file PATH or SFTPFLOW_PASSPHRASE \
+                     env var) to re-load the sealed token-HMAC secret"
+                        .to_string(),
+                );
+            }
+            warn!(
+                "no master passphrase provided — sealed credential store will not be \
+                 available; feeds using password_ref / ssh_key_ref / contents_ref will fail"
+            );
+            None
+        }
+    };
+
+    // ---- 5. Daemon prelude (config + run history) ----
+    let config = Config::load();
+    info!(
+        "sftpflowd v{} starting (cluster mode; endpoints={}, keys={}, feeds={})",
+        env!("CARGO_PKG_VERSION"),
+        config.endpoints.len(),
+        config.keys.len(),
+        config.feeds.len(),
+    );
+
+    let db_path = daemon.db.clone().unwrap_or_else(default_db_path);
+    let run_db = match history::RunDb::open(&db_path) {
+        Ok(db) => {
+            info!("run history database ready at '{}'", db_path.display());
+            Some(db)
+        }
+        Err(e) => {
+            warn!(
+                "could not open run history database: {} — runs will not be recorded",
+                e
+            );
+            None
+        }
+    };
+
+    // ---- 6. Tokio runtime + Raft startup ----
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("sftpflowd-cluster")
+        .build()
+        .map_err(|e| format!("building tokio runtime: {}", e))?;
+
+    let cluster_node = if is_bootstrap {
+        // ---- 6a. Bootstrap-node restart ----
+        let ca_key_pem = node_state::read_pem(&ca_key_path)?;
+        let ca = Arc::new(
+            sftpflow_cluster::tls::ClusterCa::from_pem(&ca_cert_pem, &ca_key_pem)
+                .map_err(|e| format!("loading cluster CA from '{}': {}",
+                    node_state::cluster_dir(&state_dir).display(), e))?,
+        );
+
+        // Pull the sealed token secret. Always present on a healthy
+        // bootstrap node (cmd_init wrote it), but a manual
+        // intervention could have removed it; surface a clear
+        // error in that case rather than silently breaking joins.
+        let store = secret_store.as_mut()
+            .expect("checked above that bootstrap has Some(store)");
+        let token_b64 = store.get(node_state::CLUSTER_TOKEN_SECRET_KEY)
+            .ok_or_else(|| format!(
+                "sealed store has no '{}' entry — was this node initialized \
+                 with `sftpflowd init`? (manual recovery: rewrite via `sftpflow \
+                 secret add` is not enough; the secret must be the original \
+                 32 raw bytes minted at init time)",
+                node_state::CLUSTER_TOKEN_SECRET_KEY,
+            ))?
+            .to_string();
+        use base64::Engine as _;
+        let token_bytes = base64::engine::general_purpose::STANDARD.decode(&token_b64)
+            .map_err(|e| format!("decoding sealed token secret: {}", e))?;
+        let token_secret = sftpflow_cluster::token::TokenSecret::from_bytes(&token_bytes)
+            .map_err(|e| format!("rebuilding token secret from sealed bytes: {}", e))?;
+
+        info!("cluster restart: bootstrap-node path (CA key + token secret loaded)");
+
+        rt.block_on(cluster_runtime::resume_bootstrap(cluster_runtime::BootstrapParams {
+            state_dir:     state_dir.clone(),
+            node:          node.clone(),
+            bind_addr,
+            ca,
+            leaf_cert_pem,
+            leaf_key_pem,
+            token_secret,
+        }))?
+    } else {
+        // ---- 6b. Joiner restart ----
+        info!("cluster restart: joiner path (CA cert only — no CA key, no token secret)");
+
+        rt.block_on(cluster_runtime::join_existing(cluster_runtime::JoinExistingParams {
+            state_dir:     state_dir.clone(),
+            node:          node.clone(),
+            bind_addr,
+            ca_cert_pem,
+            leaf_cert_pem,
+            leaf_key_pem,
+        }))?
+    };
+
+    // ---- 7. NDJSON serve loop ----
+    let socket_addr = daemon.socket.clone().unwrap_or_else(default_socket_addr);
+    info!("NDJSON server listening on {}", socket_addr);
+    let serve_result = server::run(&socket_addr, config, run_db, secret_store)
+        .map_err(|e| format!("NDJSON server: {}", e));
+
+    // Same teardown order as cmd_init/cmd_join: drop the cluster
+    // node first (aborts gRPC task while runtime is still alive),
+    // then drop the runtime (shuts down tokio workers).
+    drop(cluster_node);
+    drop(rt);
+    serve_result
+}
+
+// ============================================================
+// cmd_run_legacy - pre-M12 single-node path
 // ============================================================
 //
 // Identical in behavior to the pre-M12 main(): load config,
 // reconcile dkron, open run history, unlock sealed store, start
-// the NDJSON server. PR-B extends this to also bring up the
-// cluster runtime when node.json exists, but that's a later
-// commit — this one only renames the entry point.
+// the NDJSON server. M13 deletes this; cmd_run is then just
+// cmd_run_cluster.
 
-fn cmd_run(daemon: DaemonArgs) -> Result<(), String> {
-    // Refuse to start in legacy single-node mode if the state
-    // directory already contains a node.json written by a prior
-    // `sftpflowd init` or `join`. Otherwise we'd silently ignore
-    // the cluster state and come up as a single-node daemon,
-    // which is confusing and unsafe (mutations wouldn't replicate).
-    // Cluster-mode restart lands with the next PR-B commit;
-    // surfacing the guard now prevents accidents.
-    let state_dir = daemon.state_dir.clone().unwrap_or_else(default_state_dir);
-    if let Some(n) = node_state::read_node_json(&state_dir)? {
-        return Err(format!(
-            "{} identifies this host as cluster member node_id={} of \
-             cluster_id={}. Cluster-mode restart is not yet wired; it \
-             lands with the next PR-B commit. Until then, to run the \
-             daemon in legacy single-node mode, point --state-dir at a \
-             directory that does not contain node.json.",
-            node_state::node_json_path(&state_dir).display(),
-            n.node_id, n.cluster_id,
-        ));
-    }
-
+fn cmd_run_legacy(daemon: DaemonArgs) -> Result<(), String> {
     let socket_addr = daemon.socket.unwrap_or_else(default_socket_addr);
     let db_path     = daemon.db.unwrap_or_else(default_db_path);
     let secrets_path = daemon.secrets.unwrap_or_else(secrets::default_secrets_path);

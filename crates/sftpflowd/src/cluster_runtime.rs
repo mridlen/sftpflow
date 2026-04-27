@@ -119,6 +119,63 @@ pub struct JoinExistingParams {
 /// it alive for the life of the daemon. Dropping it tears down
 /// the cluster.
 pub async fn bootstrap(params: BootstrapParams) -> Result<ClusterNode, String> {
+    let advertise_addr = params.node.advertise_addr.clone();
+    let added_at_unix  = params.node.created_at_unix;
+    let label          = params.node.label.clone();
+    let node_id        = params.node.node_id;
+
+    let node = start_with_join_handler(params).await?;
+    let handle = node.handle();
+
+    let member = ClusterMember {
+        advertise_addr,
+        added_at_unix,
+        label,
+    };
+    handle.initialize_solo(node_id, member).await
+        .map_err(|e| format!("initialize_solo: {}", e))?;
+
+    wait_for_leader(&handle).await?;
+    info!("cluster: this node is the leader");
+
+    Ok(node)
+}
+
+// ============================================================
+// resume_bootstrap - restart of a node that originally bootstrapped
+// ============================================================
+
+/// Restart path for a node that holds the cluster CA private key
+/// and the token-HMAC secret — i.e. the node originally created by
+/// `sftpflowd init`. Brings the Raft runtime back up with the
+/// seed-side join handler installed, but does NOT call
+/// `initialize_solo` (the cluster already exists; openraft replays
+/// log + membership from sled).
+///
+/// Waits for a current leader to be observed before returning so
+/// the NDJSON serve loop only starts once the node is participating.
+/// This may briefly be the local node (if it wins the post-restart
+/// election) or a peer (if quorum already converged elsewhere).
+pub async fn resume_bootstrap(params: BootstrapParams) -> Result<ClusterNode, String> {
+    let node = start_with_join_handler(params).await?;
+    wait_for_leader(&node.handle()).await?;
+    info!(
+        "cluster: resumed; current leader is node_id={:?}",
+        node.handle().current_leader(),
+    );
+    Ok(node)
+}
+
+// ============================================================
+// start_with_join_handler - shared bootstrap/resume_bootstrap prelude
+// ============================================================
+
+/// Bring up `ClusterNode` with the seed-side BootstrapService.Join
+/// handler wired in. Used by both `bootstrap` (fresh cluster) and
+/// `resume_bootstrap` (restart of the bootstrap node) — the
+/// difference between the two is whether `initialize_solo` is
+/// called afterward.
+async fn start_with_join_handler(params: BootstrapParams) -> Result<ClusterNode, String> {
     install_crypto_provider_once();
 
     // The seed-side join handler needs a `ClusterHandle` to add
@@ -163,29 +220,17 @@ pub async fn bootstrap(params: BootstrapParams) -> Result<ClusterNode, String> {
     );
     let node = ClusterNode::start(cfg).await
         .map_err(|e| format!("ClusterNode::start: {}", e))?;
-    let handle = node.handle();
 
     // Hand the live handle to the join handler. set() returns
     // Err if the cell is already populated, which can't happen
     // here (we only call this once); ignore the result.
-    let _ = handle_cell.set(handle.clone());
+    let _ = handle_cell.set(node.handle());
 
     // Give tonic a beat to actually bind. Without this, the
     // initialize_solo → leader-election path sometimes loses a
     // heartbeat against its own listener. Mirrors the 500ms pause
     // in the three_node_cluster integration test.
     tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let member = ClusterMember {
-        advertise_addr: params.node.advertise_addr.clone(),
-        added_at_unix:  params.node.created_at_unix,
-        label:          params.node.label.clone(),
-    };
-    handle.initialize_solo(params.node.node_id, member).await
-        .map_err(|e| format!("initialize_solo: {}", e))?;
-
-    wait_for_leader(&handle).await?;
-    info!("cluster: this node is the leader");
 
     Ok(node)
 }
@@ -194,14 +239,23 @@ pub async fn bootstrap(params: BootstrapParams) -> Result<ClusterNode, String> {
 // join_existing - join-time cluster startup
 // ============================================================
 
-/// Bring up the Raft + gRPC machinery on a node that has just
-/// completed the BootstrapService.Join handshake against a seed.
-/// Returns once this node sees a current leader (which means the
-/// seed's add_learner / change_membership round trip has reached
-/// us via AppendEntries).
+/// Bring up the Raft + gRPC machinery on a non-bootstrap node.
+/// Used by both:
+///   - `sftpflowd join`: first-time join, immediately after the
+///     BootstrapService.Join handshake against a seed.
+///   - `sftpflowd run`: restart of a node that joined previously
+///     (no second handshake — openraft replays log + membership
+///     from sled, and the seed's heartbeats reach us as soon as
+///     the gRPC server is bound).
 ///
-/// Joiners hold no token secret and install no join handler — only
-/// the bootstrap node can mint or accept further joins in M12.
+/// Returns once this node sees a current leader. For a fresh join
+/// the leader is the seed; for a restart it can be any current
+/// voter (or briefly `None` if the cluster is mid-election, which
+/// `wait_for_leader` polls through).
+///
+/// Non-bootstrap nodes hold no token secret and install no join
+/// handler — only the bootstrap node can mint or accept further
+/// joins in M12.
 pub async fn join_existing(params: JoinExistingParams) -> Result<ClusterNode, String> {
     install_crypto_provider_once();
 

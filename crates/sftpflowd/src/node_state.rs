@@ -222,10 +222,7 @@ pub fn write_pem(path: &Path, pem: &str, sensitive: bool) -> Result<(), String> 
 }
 
 /// Read a PEM file into a String. Thin wrapper so call sites stay
-/// single-line and errors carry the path. Consumed by `cmd_run`'s
-/// cluster-mode restart branch (next PR-B commit) — marked
-/// allow(dead_code) until that lands so the tree stays warning-free.
-#[allow(dead_code)]
+/// single-line and errors carry the path.
 pub fn read_pem(path: &Path) -> Result<String, String> {
     fs::read_to_string(path)
         .map_err(|e| format!("reading {}: {}", path.display(), e))
