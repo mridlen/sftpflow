@@ -70,6 +70,20 @@ pub enum Request {
     /// List the names of every sealed secret. Values are never returned
     /// from the daemon — there is intentionally no `GetSecret`.
     ListSecrets,
+
+    // ---- cluster (M12+) ----
+    /// Snapshot of cluster membership, leader, and self ID. Read-only;
+    /// any node can answer.
+    ClusterStatus,
+    /// Mint a new join token. Only the bootstrap node holds the
+    /// token-HMAC secret in M12; other nodes return CONFIG_ERROR.
+    /// `ttl_seconds` is the requested validity window; the daemon
+    /// caps it at its configured max (1 hour by default). `None`
+    /// uses the daemon default.
+    ClusterMintToken { ttl_seconds: Option<u32> },
+    /// Remove a node from the cluster's voter set. Leader-only.
+    /// The CLI must double-confirm before sending.
+    ClusterRemoveNode { node_id: u64 },
 }
 
 // ============================================================
@@ -109,6 +123,12 @@ pub enum Response {
     SyncReport(SyncReport),
     /// Reply to GetRunHistory.
     RunHistory(Vec<RunHistoryEntry>),
+    /// Reply to ClusterStatus. Read-only snapshot used by the
+    /// CLI's `cluster status` command.
+    ClusterStatus(ClusterStatus),
+    /// Reply to ClusterMintToken. Wraps the opaque token string
+    /// so the CLI can surface its expiry alongside it.
+    ClusterToken(ClusterToken),
 }
 
 /// Server identity and version, returned by GetServerInfo.
@@ -166,6 +186,45 @@ pub struct SyncReport {
     pub deleted: usize,
     /// Non-fatal errors encountered during sync.
     pub errors: Vec<String>,
+}
+
+/// Snapshot of a Raft cluster's membership and current leader.
+/// Returned by ClusterStatus. The CLI uses this to render a colored
+/// table; daemon-side it's a thin projection of openraft metrics.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ClusterStatus {
+    /// UUID minted at `sftpflowd init`. Identifies the cluster.
+    pub cluster_id: String,
+    /// Node ID of the daemon answering the request — lets the CLI
+    /// mark the responding node distinctly in the output.
+    pub self_id: u64,
+    /// Node ID of the current leader, from the responder's view.
+    /// `None` during an in-progress election.
+    pub leader_id: Option<u64>,
+    /// All members openraft knows about (voters + learners). Order
+    /// is by node_id ascending so output is deterministic.
+    pub members: Vec<ClusterMemberInfo>,
+}
+
+/// One row of cluster status output.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ClusterMemberInfo {
+    pub node_id: u64,
+    pub advertise_addr: String,
+    /// Operator-supplied label from `--label` at init/join time.
+    pub label: Option<String>,
+    /// True if this node was a voter at the last applied membership
+    /// change. False means this is a learner (non-voting replica).
+    pub is_voter: bool,
+}
+
+/// Outcome of a ClusterMintToken request. The token string itself
+/// is opaque to the CLI; `expires_at_unix` is informational so the
+/// operator knows how long they have to redeem it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ClusterToken {
+    pub token: String,
+    pub expires_at_unix: i64,
 }
 
 /// A single run history entry, returned by GetRunHistory.

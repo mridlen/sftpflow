@@ -23,8 +23,14 @@
 //     re-installs the seed-side join handler; joiner sub-path
 //     just brings Raft back up). Absent → legacy single-node
 //     mode. The legacy fallback is removed in M13.
-//   - Remaining for PR-B: leader gating on mutating RPCs +
-//     `cluster status`/`token`/`remove` CLI commands.
+//   - Mutating RPCs are leader-gated: followers reply NOT_LEADER
+//     instead of writing local state. M13 turns this into auto-
+//     forwarding.
+//   - `cluster status` / `cluster token` / `cluster remove` CLI
+//     commands wired through new ClusterStatus / ClusterMintToken
+//     / ClusterRemoveNode RPCs.
+//   - Remaining for PR-B: multi-process docker-compose integration
+//     test exercising init + join + cluster status + leader failover.
 //
 // Legacy flag compatibility:
 //   --socket / --db / --secrets / --passphrase-file continue to
@@ -429,7 +435,7 @@ fn cmd_init(daemon: DaemonArgs, args: InitArgs) -> Result<(), String> {
         ca:            ca.clone(),
         leaf_cert_pem,
         leaf_key_pem:  leaf.key_pem(),
-        token_secret,
+        token_secret:  token_secret.clone(),
     }))?;
 
     info!(
@@ -439,8 +445,14 @@ fn cmd_init(daemon: DaemonArgs, args: InitArgs) -> Result<(), String> {
 
     // ---- 9. Enter NDJSON serve loop ----
     info!("NDJSON server listening on {}", ndjson_addr);
-    let cluster_handle = cluster_node.handle();
-    let serve_result = server::run(&ndjson_addr, config, run_db, Some(secrets_store), Some(cluster_handle))
+    let cluster_ctx = cluster_runtime::ClusterContext {
+        handle:       cluster_node.handle(),
+        cluster_id:   node.cluster_id.clone(),
+        self_id:      node.node_id,
+        token_secret: Some(token_secret),
+        runtime:      rt.handle().clone(),
+    };
+    let serve_result = server::run(&ndjson_addr, config, run_db, Some(secrets_store), Some(cluster_ctx))
         .map_err(|e| format!("NDJSON server: {}", e));
 
     // Explicit teardown order: drop cluster node first (aborts
@@ -646,8 +658,17 @@ fn cmd_join(daemon: DaemonArgs, args: JoinArgs) -> Result<(), String> {
     // ---- 10. NDJSON serve loop ----
     let ndjson_addr = daemon.socket.clone().unwrap_or_else(default_socket_addr);
     info!("NDJSON server listening on {}", ndjson_addr);
-    let cluster_handle = cluster_node.handle();
-    let serve_result = server::run(&ndjson_addr, config, run_db, secret_store, Some(cluster_handle))
+    // Joiners hold no token secret in M12 — only the bootstrap
+    // node mints. `cluster token` against this node will surface
+    // the asymmetry as a clear CONFIG_ERROR.
+    let cluster_ctx = cluster_runtime::ClusterContext {
+        handle:       cluster_node.handle(),
+        cluster_id:   node.cluster_id.clone(),
+        self_id:      node.node_id,
+        token_secret: None,
+        runtime:      rt.handle().clone(),
+    };
+    let serve_result = server::run(&ndjson_addr, config, run_db, secret_store, Some(cluster_ctx))
         .map_err(|e| format!("NDJSON server: {}", e));
 
     drop(cluster_node);
@@ -816,7 +837,10 @@ fn cmd_run_cluster(
         .build()
         .map_err(|e| format!("building tokio runtime: {}", e))?;
 
-    let cluster_node = if is_bootstrap {
+    // The if/else returns the ClusterNode plus an Option<TokenSecret>
+    // so the bootstrap branch can hand the secret on to ClusterContext
+    // (joiners always pass None — they can't mint tokens in M12).
+    let (cluster_node, token_secret_for_ctx) = if is_bootstrap {
         // ---- 6a. Bootstrap-node restart ----
         let ca_key_pem = node_state::read_pem(&ca_key_path)?;
         let ca = Arc::new(
@@ -848,34 +872,42 @@ fn cmd_run_cluster(
 
         info!("cluster restart: bootstrap-node path (CA key + token secret loaded)");
 
-        rt.block_on(cluster_runtime::resume_bootstrap(cluster_runtime::BootstrapParams {
+        let node_handle = rt.block_on(cluster_runtime::resume_bootstrap(cluster_runtime::BootstrapParams {
             state_dir:     state_dir.clone(),
             node:          node.clone(),
             bind_addr,
             ca,
             leaf_cert_pem,
             leaf_key_pem,
-            token_secret,
-        }))?
+            token_secret:  token_secret.clone(),
+        }))?;
+        (node_handle, Some(token_secret))
     } else {
         // ---- 6b. Joiner restart ----
         info!("cluster restart: joiner path (CA cert only — no CA key, no token secret)");
 
-        rt.block_on(cluster_runtime::join_existing(cluster_runtime::JoinExistingParams {
+        let node_handle = rt.block_on(cluster_runtime::join_existing(cluster_runtime::JoinExistingParams {
             state_dir:     state_dir.clone(),
             node:          node.clone(),
             bind_addr,
             ca_cert_pem,
             leaf_cert_pem,
             leaf_key_pem,
-        }))?
+        }))?;
+        (node_handle, None)
     };
 
     // ---- 7. NDJSON serve loop ----
     let socket_addr = daemon.socket.clone().unwrap_or_else(default_socket_addr);
     info!("NDJSON server listening on {}", socket_addr);
-    let cluster_handle = cluster_node.handle();
-    let serve_result = server::run(&socket_addr, config, run_db, secret_store, Some(cluster_handle))
+    let cluster_ctx = cluster_runtime::ClusterContext {
+        handle:       cluster_node.handle(),
+        cluster_id:   node.cluster_id.clone(),
+        self_id:      node.node_id,
+        token_secret: token_secret_for_ctx,
+        runtime:      rt.handle().clone(),
+    };
+    let serve_result = server::run(&socket_addr, config, run_db, secret_store, Some(cluster_ctx))
         .map_err(|e| format!("NDJSON server: {}", e));
 
     // Same teardown order as cmd_init/cmd_join: drop the cluster

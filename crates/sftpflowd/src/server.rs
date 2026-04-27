@@ -21,7 +21,6 @@ use std::os::unix::net::{UnixListener, UnixStream};
 
 use log::{debug, info, warn};
 
-use sftpflow_cluster::node::ClusterHandle;
 use sftpflow_core::Config;
 use sftpflow_proto::{
     error_code,
@@ -31,6 +30,7 @@ use sftpflow_proto::{
     ResponseEnvelope,
 };
 
+use crate::cluster_runtime::ClusterContext; // cluster_runtime.rs - runtime cluster bundle
 use crate::handlers; // handlers.rs - RPC method implementations
 use crate::history::RunDb; // history.rs - SQLite run history
 use crate::secrets::SecretStore; // secrets.rs - sealed credential store
@@ -54,11 +54,13 @@ pub struct DaemonState {
     /// at startup — secret RPCs then fail with CONFIG_ERROR and feeds
     /// that use `*_ref` fields will fail to resolve at run time.
     pub secrets: Option<SecretStore>,
-    /// Live Raft handle for cluster mode. None in legacy single-node
-    /// mode (which M13 removes). When `Some`, mutating RPCs are
-    /// gated on `is_leader()` — followers reply with NOT_LEADER
-    /// instead of mutating local state.
-    pub cluster: Option<ClusterHandle>,
+    /// Live Raft handle + cluster identity bundle. `None` in
+    /// legacy single-node mode (which M13 removes). When `Some`,
+    /// mutating RPCs are gated on `is_leader()` — followers reply
+    /// with NOT_LEADER instead of mutating local state — and the
+    /// new `cluster_*` RPCs use the bundled `cluster_id`,
+    /// `self_id`, and (on the bootstrap node) `token_secret`.
+    pub cluster: Option<ClusterContext>,
 }
 
 // ============================================================
@@ -76,7 +78,7 @@ pub fn run(
     config: Config,
     run_db: Option<RunDb>,
     secrets: Option<SecretStore>,
-    cluster: Option<ClusterHandle>,
+    cluster: Option<ClusterContext>,
 ) -> std::io::Result<()> {
     let dkron_url = config.server.dkron_url.clone();
     let state = Arc::new(Mutex::new(DaemonState {
@@ -380,6 +382,37 @@ fn dispatch(env: RequestEnvelope, state: &Arc<Mutex<DaemonState>>) -> ResponseEn
         Request::ListSecrets => {
             let guard = state.lock().unwrap();
             result_to_envelope(id, handlers::list_secrets(&guard))
+        }
+
+        // ---- cluster (read) ----
+        // Read-only: any node answers. The CLI uses this from
+        // followers to figure out who the leader is and where to
+        // redirect mutating RPCs.
+        Request::ClusterStatus => {
+            let guard = state.lock().unwrap();
+            result_to_envelope(id, handlers::cluster_status(&guard))
+        }
+
+        // ---- cluster (mint token) ----
+        // Token minting is bootstrap-node-only in M12, not
+        // leader-only. The handler itself returns CONFIG_ERROR if
+        // this node doesn't hold the secret; we don't gate here
+        // because a follower bootstrap node should still be able
+        // to mint (the seed-side BootstrapServiceImpl validates
+        // and adds learners regardless of leader status).
+        Request::ClusterMintToken { ttl_seconds } => {
+            let guard = state.lock().unwrap();
+            result_to_envelope(id, handlers::cluster_mint_token(&guard, ttl_seconds))
+        }
+
+        // ---- cluster (mutate membership) ----
+        // Leader-gated. change_membership goes through the Raft
+        // log; followers can't apply it. Fail fast with NOT_LEADER
+        // so the CLI's error tells the operator where to retry.
+        Request::ClusterRemoveNode { node_id } => {
+            let guard = state.lock().unwrap();
+            if let Some(rsp) = enforce_leader(id, &guard) { return rsp; }
+            result_to_envelope(id, handlers::cluster_remove_node(&guard, node_id))
         }
     }
 }

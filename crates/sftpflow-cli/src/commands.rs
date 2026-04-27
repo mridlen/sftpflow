@@ -54,6 +54,10 @@ pub fn help_exec() {
     println!("  secret delete <name>         Remove a sealed secret");
     println!("  secret list                  List sealed secret names");
     println!();
+    println!("  cluster status               Show cluster leader / members");
+    println!("  cluster token [ttl]          Mint a join token (bootstrap node only)");
+    println!("  cluster remove <node-id>     Remove a node from the voter set");
+    println!();
     println!("  run feed <name>              Manually run a feed (outside of schedule)");
     println!("  sync schedules               Reconcile feed schedules with dkron");
     println!("  connect                      Connect (or reconnect) to the daemon");
@@ -2277,4 +2281,166 @@ pub fn set_key_contents_ref(args: &[&str], state: &mut ShellState) {
         info!("Set contents_ref = '{}'", name);
         println!("  contents_ref → {}", name);
     }
+}
+
+// ============================================================
+// Cluster (top-level `cluster` command, M12+)
+// ============================================================
+//
+// Three subcommands:
+//   - status            Pretty-print leader, voters, learners.
+//   - token [ttl]       Mint a join token (bootstrap node only).
+//   - remove <node-id>  Drop a node from the voter set; the CLI
+//                       double-confirms before sending.
+
+/// Route 'cluster status|token|remove ...' in exec mode.
+pub fn cluster(args: &[&str], state: &mut ShellState) {
+    if args.is_empty() {
+        println!("% Usage: cluster <status|token|remove> [args]");
+        return;
+    }
+
+    match args[0] {
+        "status" => cluster_status(state),
+        "token"  => {
+            // Optional TTL in seconds. Daemon caps it at its max
+            // (1 hour today); we just forward whatever was typed.
+            let ttl = if args.len() >= 2 {
+                match args[1].parse::<u32>() {
+                    Ok(n) => Some(n),
+                    Err(_) => {
+                        println!("% Usage: cluster token [ttl-seconds]");
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            cluster_token(state, ttl);
+        }
+        "remove" => {
+            if args.len() < 2 {
+                println!("% Usage: cluster remove <node-id>");
+                return;
+            }
+            let node_id = match args[1].parse::<u64>() {
+                Ok(n) => n,
+                Err(_) => {
+                    println!("% node-id must be a non-negative integer");
+                    return;
+                }
+            };
+            cluster_remove(state, node_id);
+        }
+        _ => println!("% Unknown cluster subcommand '{}'. Use status, token, or remove.", args[0]),
+    }
+}
+
+/// Send ClusterStatus and pretty-print the result.
+fn cluster_status(state: &mut ShellState) {
+    if !has_rpc(state) { return; }
+    let rpc = state.rpc.as_mut().unwrap();
+
+    match rpc.call(Request::ClusterStatus) {
+        Ok(Response::ClusterStatus(status)) => {
+            println!("Cluster:  {}", status.cluster_id);
+            match status.leader_id {
+                Some(id) => println!("Leader:   node_id={}", id),
+                None     => println!("Leader:   <election in progress>"),
+            }
+            println!("This node: {}", status.self_id);
+            println!();
+            // Header + separator. Width chosen to fit a typical
+            // 8-byte node_id, an IP:port advertise addr, and a
+            // short label without wrapping at 80 columns.
+            println!("  {:<8} {:<8} {:<24} {}", "NODE", "ROLE", "ADVERTISE", "LABEL");
+            println!("  {:-<8} {:-<8} {:-<24} {:-<20}", "", "", "", "");
+            for m in &status.members {
+                let role = if Some(m.node_id) == status.leader_id {
+                    "leader"
+                } else if m.is_voter {
+                    "voter"
+                } else {
+                    "learner"
+                };
+                let self_marker = if m.node_id == status.self_id { " *" } else { "" };
+                let label_str = m.label.as_deref().unwrap_or("-");
+                println!(
+                    "  {:<8} {:<8} {:<24} {}{}",
+                    m.node_id, role, m.advertise_addr, label_str, self_marker,
+                );
+            }
+            println!();
+            println!("(* = this node)");
+        }
+        Err(RpcError::Proto(e)) => println!("% {}", e.message),
+        Err(e) => println!("% Error: {}", e),
+        _ => {}
+    }
+}
+
+/// Send ClusterMintToken and print the resulting token + expiry.
+fn cluster_token(state: &mut ShellState, ttl_seconds: Option<u32>) {
+    if !has_rpc(state) { return; }
+    let rpc = state.rpc.as_mut().unwrap();
+
+    match rpc.call(Request::ClusterMintToken { ttl_seconds }) {
+        Ok(Response::ClusterToken(t)) => {
+            info!("Minted cluster join token (expires_at_unix={})", t.expires_at_unix);
+            println!("Token:");
+            println!("  {}", t.token);
+            println!();
+            println!("Expires at unix={} ({} seconds from now)",
+                t.expires_at_unix,
+                t.expires_at_unix.saturating_sub(unix_now()),
+            );
+            println!();
+            println!("Hand this token to the joiner along with the cluster CA cert,");
+            println!("then run on the new node:");
+            println!("  sftpflowd join <seed-addr> --token <token> \\");
+            println!("    --ca-cert-file <path-to-ca.crt> --node-id <id> --bind <addr>");
+        }
+        Err(RpcError::Proto(e)) => println!("% {}", e.message),
+        Err(e) => println!("% Error: {}", e),
+        _ => {}
+    }
+}
+
+/// Send ClusterRemoveNode after a double-confirm on stdin.
+fn cluster_remove(state: &mut ShellState, node_id: u64) {
+    if !has_rpc(state) { return; }
+
+    println!("Remove node_id={} from the cluster voter set?", node_id);
+    println!("This is irreversible. Type the node id again to confirm:");
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() {
+        println!("% Could not read confirmation — aborting.");
+        return;
+    }
+    let typed = input.trim();
+    if typed != node_id.to_string() {
+        println!("% Confirmation did not match — aborting.");
+        return;
+    }
+
+    let rpc = state.rpc.as_mut().unwrap();
+    match rpc.call(Request::ClusterRemoveNode { node_id }) {
+        Ok(Response::Ok) => {
+            info!("Removed node_id={} from the cluster", node_id);
+            println!("Node {} removed.", node_id);
+        }
+        Err(RpcError::Proto(e)) => println!("% {}", e.message),
+        Err(e) => println!("% Error: {}", e),
+        _ => {}
+    }
+}
+
+/// Seconds since the Unix epoch, saturating to 0 on clock errors.
+/// Local helper so the CLI can compute "expires in N seconds" for
+/// `cluster token` output without taking a chrono dependency.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }

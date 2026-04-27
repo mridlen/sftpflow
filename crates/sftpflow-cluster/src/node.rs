@@ -266,6 +266,17 @@ impl ClusterHandle {
             .collect()
     }
 
+    /// Members alongside their voter/learner status. Used by
+    /// `cluster status` to render voters and learners distinctly.
+    pub fn members_with_voter_flag(&self) -> BTreeMap<u64, (ClusterMember, bool)> {
+        let m = self.raft.metrics().borrow().clone();
+        let voters: std::collections::BTreeSet<u64> = m.membership_config.voter_ids().collect();
+        m.membership_config
+            .nodes()
+            .map(|(id, node)| (*id, (node.clone(), voters.contains(id))))
+            .collect()
+    }
+
     /// Append an empty log entry — useful as a smoke test that the
     /// leader is alive and replication works end-to-end.
     pub async fn append_noop(&self) -> Result<(), ClusterError> {

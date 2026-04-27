@@ -192,6 +192,7 @@ fn dispatch_exec(cmd: &str, args: &[&str], state: &mut ShellState) {
         "connect"          => commands::connect(state),
         "sync"             => commands::sync(args, state),
         "secret"           => commands::secret(args, state),
+        "cluster"          => commands::cluster(args, state),
         "config"           => commands::enter_config(state),
         "exit" | "quit"    => commands::exit_shell(state),
         "version"          => commands::version(),

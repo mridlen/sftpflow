@@ -14,7 +14,7 @@
 // here that isn't directly tied to bringing the Raft machinery
 // up on this node.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -27,10 +27,110 @@ use sftpflow_cluster::node::{ClusterHandle, ClusterNode, StartConfig};
 use sftpflow_cluster::proto::{JoinRequest as PJoinRequest, JoinResponse as PJoinResponse};
 use sftpflow_cluster::state::ClusterMember;
 use sftpflow_cluster::tls::ClusterCa;
-use sftpflow_cluster::token::TokenSecret;
+use sftpflow_cluster::token::{self, TokenSecret};
 use sftpflow_cluster::transport::JoinHandler;
 
 use crate::node_state::{self, NodeJson};
+
+// ============================================================
+// ClusterContext - runtime cluster handle + identity bundle
+// ============================================================
+//
+// Lives behind `DaemonState::cluster` (Option<ClusterContext>).
+// Bundles every piece of cluster-side state the NDJSON RPC layer
+// needs: the live Raft handle, this cluster's UUID, this node's
+// stable u64 ID, and (on the bootstrap node only) the token-HMAC
+// secret used to mint join tokens. M13 will likely add an
+// `Arc<Mutex<UsedNonces>>` here once tokens get persisted across
+// restarts; for M12 the seed-side BootstrapServiceImpl owns its
+// own replay-protection set.
+
+pub struct ClusterContext {
+    pub handle:       ClusterHandle,
+    pub cluster_id:   String,
+    pub self_id:      u64,
+    /// Bootstrap-node only. Populated by `cmd_init` and the
+    /// bootstrap branch of `cmd_run_cluster`; joiners hold `None`
+    /// and `cluster mint_token` returns an error to make the
+    /// asymmetry obvious.
+    pub token_secret: Option<TokenSecret>,
+    /// Handle to the tokio runtime that drives the cluster's gRPC
+    /// server. Stored here so the synchronous NDJSON dispatch can
+    /// block on async Raft calls (e.g. `change_membership` for
+    /// `cluster remove`). Safe: the NDJSON server runs on its own
+    /// OS thread spawned by `std::thread::spawn`, not on a tokio
+    /// worker, so `block_on` does not deadlock.
+    pub runtime:      tokio::runtime::Handle,
+}
+
+impl ClusterContext {
+    /// True if this node is the cluster leader. Forwards to
+    /// `ClusterHandle::is_leader`.
+    pub fn is_leader(&self) -> bool { self.handle.is_leader() }
+
+    /// Node ID of the current leader from this node's view.
+    pub fn current_leader(&self) -> Option<u64> { self.handle.current_leader() }
+
+    /// All known members. Used by `enforce_leader` to look up the
+    /// leader's advertise address for the NOT_LEADER error message.
+    pub fn members(&self) -> BTreeMap<u64, ClusterMember> {
+        self.handle.members()
+    }
+
+    /// All known members alongside their voter/learner flag.
+    /// Used by the `cluster_status` handler.
+    pub fn members_with_voter_flag(&self) -> BTreeMap<u64, (ClusterMember, bool)> {
+        self.handle.members_with_voter_flag()
+    }
+
+    /// Mint a join token using this node's TokenSecret. Returns
+    /// `(token, expires_at_unix)`. Errors if this node doesn't
+    /// hold the secret (i.e. it's not the bootstrap node in M12).
+    pub fn mint_token(&self, ttl_seconds: u32) -> Result<(String, i64), String> {
+        let secret = self.token_secret.as_ref().ok_or_else(|| {
+            "this node does not hold the token-HMAC secret; in M12 only \
+             the bootstrap node can mint join tokens. Run `cluster token` \
+             against the bootstrap node instead."
+                .to_string()
+        })?;
+        let token = token::mint(secret, &self.cluster_id, ttl_seconds)
+            .map_err(|e| format!("mint: {}", e))?;
+        let expires_at = node_state::now_unix() + ttl_seconds as i64;
+        Ok((token, expires_at))
+    }
+
+    /// Remove a node from the voter set. Leader-only.
+    ///
+    /// Computes the new voter set as `current_voters - {node_id}`
+    /// and pushes a `change_membership` through Raft, blocking the
+    /// caller (NDJSON dispatch is sync). Refuses if the target
+    /// doesn't exist or removing it would leave zero voters.
+    pub fn remove_node_blocking(&self, node_id: u64) -> Result<(), String> {
+        let current = self.handle.members_with_voter_flag();
+        if !current.contains_key(&node_id) {
+            return Err(format!("no member with node_id={} exists", node_id));
+        }
+        let new_voters: BTreeSet<u64> = current
+            .iter()
+            .filter(|(id, (_, is_voter))| **id != node_id && *is_voter)
+            .map(|(id, _)| *id)
+            .collect();
+        if new_voters.is_empty() {
+            return Err(format!(
+                "removing node_id={} would leave the cluster with no voters",
+                node_id,
+            ));
+        }
+
+        let handle = self.handle.clone();
+        self.runtime.block_on(async move {
+            handle
+                .change_membership(new_voters)
+                .await
+                .map_err(|e| format!("change_membership: {}", e))
+        })
+    }
+}
 
 // ============================================================
 // rustls crypto provider bootstrap

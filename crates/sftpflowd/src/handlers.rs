@@ -26,6 +26,9 @@ use log::{error, info, warn};
 use sftpflow_core::{Config, Endpoint, NextStepAction, PgpKey, ProcessStep};
 use sftpflow_proto::{
     error_code,
+    ClusterMemberInfo,
+    ClusterStatus,
+    ClusterToken,
     FeedSummary,
     ProtoError,
     Response,
@@ -660,4 +663,110 @@ pub fn sync_schedules(state: &DaemonState) -> Response {
             })
         }
     }
+}
+
+// ============================================================
+// Cluster RPCs (M12+)
+// ============================================================
+
+/// Helper: extract the ClusterContext from DaemonState or return a
+/// CONFIG_ERROR. Used by every `cluster_*` handler — they only make
+/// sense when this daemon is running as a Raft member.
+fn require_cluster<'a>(
+    state: &'a DaemonState,
+) -> Result<&'a crate::cluster_runtime::ClusterContext, ProtoError> {
+    state.cluster.as_ref().ok_or_else(|| ProtoError {
+        code: error_code::CONFIG_ERROR,
+        message: "this daemon is running in legacy single-node mode (no node.json) — \
+                  cluster RPCs are only available on Raft members"
+            .to_string(),
+    })
+}
+
+/// `cluster status`: snapshot of leader, voters, learners.
+/// Read-only, any node can answer.
+pub fn cluster_status(state: &DaemonState) -> Result<Response, ProtoError> {
+    let ctx = require_cluster(state)?;
+
+    let mut members: Vec<ClusterMemberInfo> = ctx
+        .members_with_voter_flag()
+        .into_iter()
+        .map(|(node_id, (member, is_voter))| ClusterMemberInfo {
+            node_id,
+            advertise_addr: member.advertise_addr,
+            label:          member.label,
+            is_voter,
+        })
+        .collect();
+    // BTreeMap iteration is already sorted by key, but be explicit:
+    // the wire contract promises ascending node_id so the CLI can
+    // render deterministically.
+    members.sort_by_key(|m| m.node_id);
+
+    Ok(Response::ClusterStatus(ClusterStatus {
+        cluster_id: ctx.cluster_id.clone(),
+        self_id:    ctx.self_id,
+        leader_id:  ctx.current_leader(),
+        members,
+    }))
+}
+
+/// `cluster token`: mint a new join token. Bootstrap-node only in M12;
+/// joiners return CONFIG_ERROR with a clear redirect message.
+pub fn cluster_mint_token(
+    state:       &DaemonState,
+    ttl_seconds: Option<u32>,
+) -> Result<Response, ProtoError> {
+    // Cap requested TTL at 1 hour to match the gRPC AdminService
+    // default. Operators rarely need longer; if they do, they'll
+    // mint a second one rather than us issuing long-lived tokens.
+    const MAX_TTL: u32 = 3600;
+    const DEFAULT_TTL: u32 = 3600;
+    let ttl = ttl_seconds.unwrap_or(DEFAULT_TTL).min(MAX_TTL);
+
+    let ctx = require_cluster(state)?;
+    let (token, expires_at_unix) = ctx.mint_token(ttl).map_err(|msg| ProtoError {
+        code: error_code::CONFIG_ERROR,
+        message: msg,
+    })?;
+    info!(
+        "cluster_mint_token: minted token (ttl={}s, expires_at_unix={})",
+        ttl, expires_at_unix,
+    );
+    Ok(Response::ClusterToken(ClusterToken { token, expires_at_unix }))
+}
+
+/// `cluster remove <node_id>`: drop a node from the voter set.
+/// Leader-only — the gate in dispatch ensures we only get here on
+/// the leader, and the underlying `change_membership` would itself
+/// reject on followers.
+pub fn cluster_remove_node(
+    state:   &DaemonState,
+    node_id: u64,
+) -> Result<Response, ProtoError> {
+    let ctx = require_cluster(state)?;
+
+    // Refuse to remove the responding node — there's no point in a
+    // node voting itself out, and the operator almost certainly
+    // meant a different ID. M13 will allow it once `cluster leave`
+    // is wired (which gracefully steps down first).
+    if node_id == ctx.self_id {
+        return Err(ProtoError {
+            code: error_code::CONFIG_ERROR,
+            message: format!(
+                "refusing to remove the responding node (node_id={}) from the voter set; \
+                 use `cluster leave` (M13+) to drain this node, or run `cluster remove` \
+                 against a different node",
+                node_id,
+            ),
+        });
+    }
+
+    info!("cluster_remove_node: removing node_id={}", node_id);
+    ctx.remove_node_blocking(node_id).map_err(|msg| ProtoError {
+        code: error_code::CONFIG_ERROR,
+        message: msg,
+    })?;
+    info!("cluster_remove_node: node_id={} removed", node_id);
+    Ok(Response::Ok)
 }
