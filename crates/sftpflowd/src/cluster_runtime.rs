@@ -244,20 +244,23 @@ pub async fn join_existing(params: JoinExistingParams) -> Result<ClusterNode, St
 // make_seed_join_handler - the seed-side BootstrapService.Join callback
 // ============================================================
 //
-// Returned closure is invoked on the bootstrap node every time a
-// joining node POSTs a valid token + CSR. Steps:
+// Chicken-and-egg note: the joiner can't bring up its gRPC server
+// until it has a CA-signed cert, and openraft's add_learner +
+// change_membership both require the new node to be reachable to
+// commit. So the handler MUST return the signed cert *before* the
+// joiner is ready to receive AppendEntries — otherwise the seed
+// blocks forever.
 //
-//   1. Sign the joiner's CSR with the cluster CA.
-//   2. Build a ClusterMember for the joiner from the request.
-//   3. add_learner → wait briefly for catch-up → change_membership
-//      to promote learner → voter.
-//   4. Return JoinResponse with the signed cert + CA cert.
+// Solution: the handler signs the CSR (fast, sync) and **spawns**
+// the membership work onto a background task. The joiner gets its
+// cert immediately, brings up its server, becomes reachable, and
+// the spawned task's add_learner / change_membership succeed once
+// AppendEntries can flow.
 //
-// Errors propagate verbatim back through tonic to the joiner so
-// `sftpflowd join` surfaces the underlying cause (e.g. "node_id 2
-// is already a member"). All work is serialized through a Mutex so
-// two concurrent joins don't try to overlap openraft config
-// changes (which openraft rejects).
+// The background tasks are serialized through `join_serializer` —
+// openraft rejects overlapping membership changes, and this is
+// where the queue forms when multiple nodes join in quick
+// succession.
 fn make_seed_join_handler(
     ca:               Arc<ClusterCa>,
     cluster_id:       String,
@@ -270,59 +273,60 @@ fn make_seed_join_handler(
         let handle_cell      = handle_cell.clone();
         let join_serializer  = join_serializer.clone();
         Box::pin(async move {
-            // Serialize the whole join (CSR sign is fast; the
-            // openraft membership ops are the part we have to
-            // serialize, but holding the lock across signing
-            // keeps the handler simple).
-            let _guard = join_serializer.lock().await;
-
+            // ---- Synchronous prelude (runs while joiner waits) ----
             let handle = handle_cell.get().ok_or_else(|| {
                 "cluster handle not yet initialized (initialize_solo \
                  hasn't run on this node yet)".to_string()
-            })?;
+            })?.clone();
 
-            // ---- 1. Sign CSR ------------------------------------
-            let leaf_pem = ca.sign_csr(&req.csr_der)
-                .map_err(|e| format!("signing joiner CSR: {}", e))?;
-
-            // ---- 2. Refuse duplicate node_id --------------------
-            let existing = handle.members();
-            if existing.contains_key(&req.desired_node_id) {
+            // Refuse duplicate node_id up front so the joiner sees
+            // a clean error instead of a successful cert + a silent
+            // failure in the background task.
+            if handle.members().contains_key(&req.desired_node_id) {
                 return Err(format!(
                     "node_id {} already exists in this cluster",
                     req.desired_node_id,
                 ));
             }
 
-            // ---- 3. Add learner --------------------------------
+            let leaf_pem = ca.sign_csr(&req.csr_der)
+                .map_err(|e| format!("signing joiner CSR: {}", e))?;
+
+            // ---- Background membership work --------------------
+            // We need this to run after the handler returns so the
+            // joiner has time to bring up its server. Spawn onto
+            // the runtime that's already executing this future.
             let member = ClusterMember {
                 advertise_addr: req.advertise_addr.clone(),
                 added_at_unix:  node_state::now_unix(),
                 label:          None, // M13: pull label from token claims
             };
-            info!(
-                "join: adding node_id={} advertise={} as learner",
-                req.desired_node_id, req.advertise_addr,
-            );
-            handle.add_learner(req.desired_node_id, member.clone()).await
-                .map_err(|e| format!("add_learner: {}", e))?;
+            let desired_node_id = req.desired_node_id;
+            let advertise_addr  = req.advertise_addr.clone();
+            tokio::spawn(async move {
+                let _guard = join_serializer.lock().await;
+                info!(
+                    "join: adding node_id={} advertise={} as learner",
+                    desired_node_id, advertise_addr,
+                );
+                if let Err(e) = handle.add_learner(desired_node_id, member).await {
+                    warn!("join: add_learner({}) failed: {}", desired_node_id, e);
+                    return;
+                }
+                let mut voters: BTreeSet<u64> =
+                    handle.members().keys().copied().collect();
+                voters.insert(desired_node_id);
+                info!("join: promoting voter set to {:?}", voters);
+                if let Err(e) = handle.change_membership(voters).await {
+                    warn!(
+                        "join: change_membership for node_id={} failed: {}",
+                        desired_node_id, e,
+                    );
+                }
+            });
 
-            // ---- 4. Promote to voter ---------------------------
-            // Compose the new voter set from the (now-updated) member
-            // map. add_learner appended the new node, but we still
-            // want to be explicit about which nodes are voters vs
-            // learners — collect every member id.
-            let mut voters: BTreeSet<u64> = handle.members().keys().copied().collect();
-            voters.insert(req.desired_node_id);
-            info!("join: promoting voter set to {:?}", voters);
-            handle.change_membership(voters).await
-                .map_err(|e| format!("change_membership: {}", e))?;
-
-            // ---- 5. Build response -----------------------------
             // membership_json is reserved for M13/M14 (the joiner
-            // currently learns membership from the first AppendEntries
-            // anyway — populating this field is forward compatibility
-            // for snapshot-only joins).
+            // learns membership from the first AppendEntries anyway).
             Ok(PJoinResponse {
                 ca_cert_pem:          ca.cert_pem().into_bytes(),
                 signed_leaf_cert_pem: leaf_pem.into_bytes(),

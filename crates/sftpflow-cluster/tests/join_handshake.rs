@@ -64,7 +64,8 @@ async fn wait_for<F: Fn() -> bool>(name: &str, timeout: Duration, cond: F) {
 }
 
 /// Build the same JoinHandler shape the daemon installs. Kept in
-/// sync with `sftpflowd::cluster_runtime::make_seed_join_handler`.
+/// sync with `sftpflowd::cluster_runtime::make_seed_join_handler` —
+/// see that function for why the membership work is spawned.
 fn make_test_join_handler(
     ca:               Arc<ClusterCa>,
     cluster_id:       String,
@@ -77,23 +78,44 @@ fn make_test_join_handler(
         let handle_cell      = handle_cell.clone();
         let join_serializer  = join_serializer.clone();
         Box::pin(async move {
-            let _guard = join_serializer.lock().await;
             let handle = handle_cell.get().ok_or_else(|| {
                 "cluster handle not initialized".to_string()
-            })?;
+            })?.clone();
+
+            if handle.members().contains_key(&req.desired_node_id) {
+                return Err(format!(
+                    "node_id {} already in cluster",
+                    req.desired_node_id,
+                ));
+            }
+
             let leaf_pem = ca.sign_csr(&req.csr_der)
                 .map_err(|e| format!("sign csr: {}", e))?;
+
+            let desired_node_id = req.desired_node_id;
+            let advertise_addr  = req.advertise_addr.clone();
             let member = ClusterMember {
-                advertise_addr: req.advertise_addr.clone(),
+                advertise_addr: advertise_addr.clone(),
                 added_at_unix:  0,
                 label:          None,
             };
-            handle.add_learner(req.desired_node_id, member).await
-                .map_err(|e| format!("add_learner: {}", e))?;
-            let mut voters: BTreeSet<u64> = handle.members().keys().copied().collect();
-            voters.insert(req.desired_node_id);
-            handle.change_membership(voters).await
-                .map_err(|e| format!("change_membership: {}", e))?;
+            tokio::spawn(async move {
+                let _guard = join_serializer.lock().await;
+                if let Err(e) = handle.add_learner(desired_node_id, member).await {
+                    eprintln!("[bg] add_learner({}) failed: {}", desired_node_id, e);
+                    return;
+                }
+                let mut voters: BTreeSet<u64> =
+                    handle.members().keys().copied().collect();
+                voters.insert(desired_node_id);
+                if let Err(e) = handle.change_membership(voters).await {
+                    eprintln!(
+                        "[bg] change_membership for {} failed: {}",
+                        desired_node_id, e,
+                    );
+                }
+            });
+
             Ok(PJoinResponse {
                 ca_cert_pem:          ca.cert_pem().into_bytes(),
                 signed_leaf_cert_pem: leaf_pem.into_bytes(),
