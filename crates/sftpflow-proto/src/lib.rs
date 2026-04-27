@@ -213,6 +213,12 @@ pub mod error_code {
     pub const ALREADY_EXISTS:   i32 = 1001;
     pub const CONFIG_ERROR:     i32 = 1002;
     pub const REFERENCE_IN_USE: i32 = 1003;
+    /// This node is not the Raft leader; the requested mutating
+    /// RPC must be sent to whoever is. The error message includes
+    /// the leader's advertise address when available so the CLI
+    /// (or a human) can retry against the right node. M12 is
+    /// fail-loud; M13 will turn this into automatic forwarding.
+    pub const NOT_LEADER:       i32 = 1004;
 }
 
 // ============================================================

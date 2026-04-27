@@ -21,6 +21,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 
 use log::{debug, info, warn};
 
+use sftpflow_cluster::node::ClusterHandle;
 use sftpflow_core::Config;
 use sftpflow_proto::{
     error_code,
@@ -53,6 +54,11 @@ pub struct DaemonState {
     /// at startup — secret RPCs then fail with CONFIG_ERROR and feeds
     /// that use `*_ref` fields will fail to resolve at run time.
     pub secrets: Option<SecretStore>,
+    /// Live Raft handle for cluster mode. None in legacy single-node
+    /// mode (which M13 removes). When `Some`, mutating RPCs are
+    /// gated on `is_leader()` — followers reply with NOT_LEADER
+    /// instead of mutating local state.
+    pub cluster: Option<ClusterHandle>,
 }
 
 // ============================================================
@@ -61,11 +67,16 @@ pub struct DaemonState {
 
 /// Parse `addr` ("unix:/path", "tcp:host:port", or "host:port") and
 /// run the appropriate accept loop until the listener errors out.
+///
+/// `cluster` is `Some` whenever the daemon is running as a Raft
+/// member (init / join / cluster-mode restart). Pass `None` for
+/// the legacy single-node path; mutating RPCs then run unguarded.
 pub fn run(
     addr: &str,
     config: Config,
     run_db: Option<RunDb>,
     secrets: Option<SecretStore>,
+    cluster: Option<ClusterHandle>,
 ) -> std::io::Result<()> {
     let dkron_url = config.server.dkron_url.clone();
     let state = Arc::new(Mutex::new(DaemonState {
@@ -74,6 +85,7 @@ pub fn run(
         dkron_url,
         run_db,
         secrets,
+        cluster,
     }));
 
     // Split into (scheme, rest). Anything without a known scheme
@@ -227,6 +239,11 @@ where
 // Thin routing layer: reads from state, calls into handlers.rs for
 // actual business logic. Read-only RPCs lock briefly and release;
 // mutating RPCs hold the lock through the full mutation + save.
+//
+// Mutating RPCs additionally pass through `enforce_leader` first
+// (cluster mode only) — followers fail loud with NOT_LEADER. Reads
+// run unguarded so `cluster status`, `show feeds`, etc. work from
+// any node. M13 turns the gate into automatic forwarding.
 
 fn dispatch(env: RequestEnvelope, state: &Arc<Mutex<DaemonState>>) -> ResponseEnvelope {
     let id = env.id;
@@ -254,14 +271,17 @@ fn dispatch(env: RequestEnvelope, state: &Arc<Mutex<DaemonState>>) -> ResponseEn
         // ---- endpoints (mutate) ----
         Request::PutEndpoint { name, endpoint } => {
             let mut guard = state.lock().unwrap();
+            if let Some(rsp) = enforce_leader(id, &guard) { return rsp; }
             result_to_envelope(id, handlers::put_endpoint(&mut guard, name, endpoint))
         }
         Request::DeleteEndpoint { name } => {
             let mut guard = state.lock().unwrap();
+            if let Some(rsp) = enforce_leader(id, &guard) { return rsp; }
             result_to_envelope(id, handlers::delete_endpoint(&mut guard, &name))
         }
         Request::RenameEndpoint { from, to } => {
             let mut guard = state.lock().unwrap();
+            if let Some(rsp) = enforce_leader(id, &guard) { return rsp; }
             result_to_envelope(id, handlers::rename_endpoint(&mut guard, from, to))
         }
 
@@ -278,14 +298,17 @@ fn dispatch(env: RequestEnvelope, state: &Arc<Mutex<DaemonState>>) -> ResponseEn
         // ---- keys (mutate) ----
         Request::PutKey { name, key } => {
             let mut guard = state.lock().unwrap();
+            if let Some(rsp) = enforce_leader(id, &guard) { return rsp; }
             result_to_envelope(id, handlers::put_key(&mut guard, name, key))
         }
         Request::DeleteKey { name } => {
             let mut guard = state.lock().unwrap();
+            if let Some(rsp) = enforce_leader(id, &guard) { return rsp; }
             result_to_envelope(id, handlers::delete_key(&mut guard, &name))
         }
         Request::RenameKey { from, to } => {
             let mut guard = state.lock().unwrap();
+            if let Some(rsp) = enforce_leader(id, &guard) { return rsp; }
             result_to_envelope(id, handlers::rename_key(&mut guard, from, to))
         }
 
@@ -302,26 +325,38 @@ fn dispatch(env: RequestEnvelope, state: &Arc<Mutex<DaemonState>>) -> ResponseEn
         // ---- feeds (mutate) ----
         Request::PutFeed { name, feed } => {
             let mut guard = state.lock().unwrap();
+            if let Some(rsp) = enforce_leader(id, &guard) { return rsp; }
             result_to_envelope(id, handlers::put_feed(&mut guard, name, feed))
         }
         Request::DeleteFeed { name } => {
             let mut guard = state.lock().unwrap();
+            if let Some(rsp) = enforce_leader(id, &guard) { return rsp; }
             result_to_envelope(id, handlers::delete_feed(&mut guard, &name))
         }
         Request::RenameFeed { from, to } => {
             let mut guard = state.lock().unwrap();
+            if let Some(rsp) = enforce_leader(id, &guard) { return rsp; }
             result_to_envelope(id, handlers::rename_feed(&mut guard, from, to))
         }
 
         // ---- execution ----
+        // Leader-gated: we don't want N replicas of the same feed
+        // running on N nodes. M14 routes RunFeedNow through the
+        // Raft leader (which then dispatches to a chosen member);
+        // M12 just refuses on followers.
         Request::RunFeedNow { name } => {
             let guard = state.lock().unwrap();
+            if let Some(rsp) = enforce_leader(id, &guard) { return rsp; }
             result_to_envelope(id, handlers::run_feed_now(&guard, &name))
         }
 
         // ---- scheduler ----
+        // Leader-gated: dkron is a shared external system; only the
+        // leader should reconcile schedules. M14 retires dkron and
+        // makes the leader the scheduler natively.
         Request::SyncSchedules => {
             let guard = state.lock().unwrap();
+            if let Some(rsp) = enforce_leader(id, &guard) { return rsp; }
             ResponseEnvelope::success(id, handlers::sync_schedules(&guard))
         }
 
@@ -334,10 +369,12 @@ fn dispatch(env: RequestEnvelope, state: &Arc<Mutex<DaemonState>>) -> ResponseEn
         // ---- sealed secrets ----
         Request::PutSecret { name, value } => {
             let mut guard = state.lock().unwrap();
+            if let Some(rsp) = enforce_leader(id, &guard) { return rsp; }
             result_to_envelope(id, handlers::put_secret(&mut guard, name, value))
         }
         Request::DeleteSecret { name } => {
             let mut guard = state.lock().unwrap();
+            if let Some(rsp) = enforce_leader(id, &guard) { return rsp; }
             result_to_envelope(id, handlers::delete_secret(&mut guard, &name))
         }
         Request::ListSecrets => {
@@ -345,6 +382,42 @@ fn dispatch(env: RequestEnvelope, state: &Arc<Mutex<DaemonState>>) -> ResponseEn
             result_to_envelope(id, handlers::list_secrets(&guard))
         }
     }
+}
+
+// ============================================================
+// enforce_leader - cluster-mode mutating-RPC guard
+// ============================================================
+
+/// Returns `Some(error_envelope)` if this node should refuse a
+/// mutating RPC because it isn't the cluster leader. Returns
+/// `None` to proceed.
+///
+/// In single-node (legacy) mode `state.cluster` is `None` and this
+/// always returns `None` — mutations run as before. In cluster
+/// mode we read `is_leader()` off the live Raft handle; if false,
+/// we synthesize a NOT_LEADER reply and include the leader's
+/// advertise address (when known) so the operator knows where to
+/// retry. The leader-id-to-address lookup goes through the
+/// membership map openraft already has cached.
+fn enforce_leader(id: u64, state: &DaemonState) -> Option<ResponseEnvelope> {
+    let handle = state.cluster.as_ref()?;
+    if handle.is_leader() {
+        return None;
+    }
+
+    let leader_advertise = handle
+        .current_leader()
+        .and_then(|leader_id| handle.members().get(&leader_id).map(|m| m.advertise_addr.clone()));
+
+    let msg = match leader_advertise {
+        Some(addr) => format!(
+            "this node is not the cluster leader; current leader is reachable at {}",
+            addr,
+        ),
+        None => "this node is not the cluster leader; election in progress or quorum unavailable"
+            .to_string(),
+    };
+    Some(ResponseEnvelope::failure(id, error_code::NOT_LEADER, msg))
 }
 
 /// Convert a handler `Result<Response, ProtoError>` into the wire

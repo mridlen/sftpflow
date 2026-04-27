@@ -439,7 +439,8 @@ fn cmd_init(daemon: DaemonArgs, args: InitArgs) -> Result<(), String> {
 
     // ---- 9. Enter NDJSON serve loop ----
     info!("NDJSON server listening on {}", ndjson_addr);
-    let serve_result = server::run(&ndjson_addr, config, run_db, Some(secrets_store))
+    let cluster_handle = cluster_node.handle();
+    let serve_result = server::run(&ndjson_addr, config, run_db, Some(secrets_store), Some(cluster_handle))
         .map_err(|e| format!("NDJSON server: {}", e));
 
     // Explicit teardown order: drop cluster node first (aborts
@@ -645,7 +646,8 @@ fn cmd_join(daemon: DaemonArgs, args: JoinArgs) -> Result<(), String> {
     // ---- 10. NDJSON serve loop ----
     let ndjson_addr = daemon.socket.clone().unwrap_or_else(default_socket_addr);
     info!("NDJSON server listening on {}", ndjson_addr);
-    let serve_result = server::run(&ndjson_addr, config, run_db, secret_store)
+    let cluster_handle = cluster_node.handle();
+    let serve_result = server::run(&ndjson_addr, config, run_db, secret_store, Some(cluster_handle))
         .map_err(|e| format!("NDJSON server: {}", e));
 
     drop(cluster_node);
@@ -872,7 +874,8 @@ fn cmd_run_cluster(
     // ---- 7. NDJSON serve loop ----
     let socket_addr = daemon.socket.clone().unwrap_or_else(default_socket_addr);
     info!("NDJSON server listening on {}", socket_addr);
-    let serve_result = server::run(&socket_addr, config, run_db, secret_store)
+    let cluster_handle = cluster_node.handle();
+    let serve_result = server::run(&socket_addr, config, run_db, secret_store, Some(cluster_handle))
         .map_err(|e| format!("NDJSON server: {}", e));
 
     // Same teardown order as cmd_init/cmd_join: drop the cluster
@@ -973,7 +976,9 @@ fn cmd_run_legacy(daemon: DaemonArgs) -> Result<(), String> {
     info!("listening on {}", socket_addr);
 
     // server::run() - server.rs
-    server::run(&socket_addr, config, run_db, secret_store)
+    // No cluster handle: legacy single-node mode runs every RPC
+    // unguarded, like pre-M12. M13 deletes this fallback.
+    server::run(&socket_addr, config, run_db, secret_store, None)
         .map_err(|e| format!("server error: {}", e))
 }
 
