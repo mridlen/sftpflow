@@ -19,6 +19,8 @@
 # ------------------------------------------------------------
 # Compose file path relative to repo root.
 COMPOSE_FILE := docker/compose.test.yml
+# Cluster integration test compose file (M12 multi-process env).
+CLUSTER_COMPOSE_FILE := docker/compose.cluster.yml
 
 # `docker compose` (v2 plugin) is the canonical form; fall back to the
 # older `docker-compose` only if v2 isn't present.
@@ -49,7 +51,9 @@ SFTPFLOW_SSH_PORT := 2222
 # ------------------------------------------------------------
 .PHONY: help \
         test-keygen test-build test-up test-down test-restart \
-        test-logs test-status test-shell test-ping test-clean
+        test-logs test-status test-shell test-ping test-clean \
+        cluster-build cluster-up cluster-down cluster-clean \
+        cluster-logs cluster-status cluster-test
 
 # Default target: print the list of available test- commands.
 help:
@@ -65,6 +69,16 @@ help:
 	@echo "  make test-shell    Open an sftpflow CLI session via the bridge"
 	@echo "  make test-ping     Send a single Ping RPC through the bridge"
 	@echo "  make test-clean    test-down + delete named volumes (destructive)"
+	@echo ""
+	@echo "Cluster integration test (M12, 3-node multi-process env):"
+	@echo ""
+	@echo "  make cluster-build   Build the sftpflow-server image (re-uses test image)"
+	@echo "  make cluster-up      Start the 3-node cluster compose env"
+	@echo "  make cluster-test    Run scripts/test-cluster.sh end-to-end (init/join/failover)"
+	@echo "  make cluster-status  Show container status for cluster env"
+	@echo "  make cluster-logs    Tail logs from all cluster nodes"
+	@echo "  make cluster-down    Stop cluster env (volumes preserved)"
+	@echo "  make cluster-clean   cluster-down + delete cluster volumes (destructive)"
 
 # ------------------------------------------------------------
 # test-keygen: one-time client keypair generation
@@ -173,3 +187,55 @@ test-ping: $(PUB_KEY)
 test-clean:
 	@echo "==> tearing down + deleting named volumes"
 	$(COMPOSE) -f $(COMPOSE_FILE) down -v
+
+# ============================================================
+# Cluster integration test (M12 — 3-node multi-process env)
+# ============================================================
+#
+# The cluster env is independent of the single-node test env: own
+# compose file, own network, own volumes, but reuses the same
+# Dockerfile and the same client SSH keypair. Run `make test-keygen`
+# once before `make cluster-up`.
+#
+# Typical workflow for M12 PR-B verification:
+#   make test-keygen
+#   make cluster-test     # builds, brings up, runs full scenario
+#   make cluster-down     # tear down when satisfied
+
+cluster-build:
+	@echo "==> building sftpflow-server image for cluster env"
+	$(COMPOSE) -f $(CLUSTER_COMPOSE_FILE) build
+
+cluster-up: $(PUB_KEY)
+	@echo "==> starting sftpflow cluster test environment (3 nodes)"
+	$(COMPOSE) -f $(CLUSTER_COMPOSE_FILE) up -d
+	@echo ""
+	@echo "Cluster is up but unbootstrapped — node.json is absent on every node."
+	@echo "Bootstrap with: make cluster-test"
+	@echo "Or manually:    docker exec -d sftpflow-cluster-1 sftpflowd init ..."
+	@echo ""
+	@echo "SSH ports: 2231 (node 1), 2232 (node 2), 2233 (node 3)"
+
+cluster-down:
+	@echo "==> stopping sftpflow cluster test environment"
+	$(COMPOSE) -f $(CLUSTER_COMPOSE_FILE) down
+
+cluster-clean:
+	@echo "==> tearing down cluster + deleting volumes (destructive)"
+	$(COMPOSE) -f $(CLUSTER_COMPOSE_FILE) down -v
+
+cluster-logs:
+	$(COMPOSE) -f $(CLUSTER_COMPOSE_FILE) logs -f --tail=100
+
+cluster-status:
+	$(COMPOSE) -f $(CLUSTER_COMPOSE_FILE) ps
+
+# ------------------------------------------------------------
+# cluster-test: run the full M12 acceptance scenario
+# ------------------------------------------------------------
+# Drives scripts/test-cluster.sh: init node 1, mint token, join 2/3,
+# verify membership, kill the leader, verify re-election, restart
+# the killed node, verify rejoin. Exits 0 on success, 1 on any
+# verification failure (with a diagnostic dump).
+cluster-test: $(PUB_KEY)
+	@bash scripts/test-cluster.sh

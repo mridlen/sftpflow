@@ -15,7 +15,7 @@
 //                         legacy single-node mode (deprecated;
 //                         M13 removes this fallback).
 //
-// M12 PR-B status:
+// M12 PR-B status (complete):
 //   - `init` and `join` are fully wired (CA + leaf cert generation,
 //     sealed token secret, Raft startup, NDJSON serve loop).
 //   - `run` branches on whether <state_dir>/node.json exists:
@@ -29,8 +29,9 @@
 //   - `cluster status` / `cluster token` / `cluster remove` CLI
 //     commands wired through new ClusterStatus / ClusterMintToken
 //     / ClusterRemoveNode RPCs.
-//   - Remaining for PR-B: multi-process docker-compose integration
-//     test exercising init + join + cluster status + leader failover.
+//   - Multi-process integration test at scripts/test-cluster.sh
+//     drives docker/compose.cluster.yml through init / join /
+//     status / leader-failover end-to-end (`make cluster-test`).
 //
 // Legacy flag compatibility:
 //   --socket / --db / --secrets / --passphrase-file continue to

@@ -1,0 +1,116 @@
+# ============================================================
+# docker/compose.cluster.yml — M12 multi-process integration env
+# ============================================================
+#
+# Three sftpflow-server replicas wired up as a Raft cluster.
+# Stood up by `make cluster-up`; the orchestration script
+# scripts/test-cluster.sh exercises init / join / status / leader
+# failover end-to-end.
+#
+# Topology (intra-network — service names resolve as hostnames):
+#   sftpflow-1  raft :7900   ssh :22 (host :2231)
+#   sftpflow-2  raft :7900   ssh :22 (host :2232)
+#   sftpflow-3  raft :7900   ssh :22 (host :2233)
+#
+# Each service binds the Raft gRPC port on 0.0.0.0:7900 inside the
+# container; the advertise address is the docker DNS name (e.g.
+# "sftpflow-1:7900") so peers can reach it via the cluster network.
+# Raft ports are NOT exposed to the host — there is nothing to talk
+# to them outside the cluster network.
+#
+# The CLI on the developer's host connects via SSH on the mapped
+# port. Same client SSH key (docker/test-keys/id_ed25519.pub) used
+# for all three nodes — `make test-keygen` from the existing test
+# env produces it.
+#
+# Image: reuses docker/Dockerfile.sftpflow-server. The cluster-aware
+# entrypoint is bind-mounted on top of the baked-in single-node
+# entrypoint, so we don't need a separate image build.
+
+name: sftpflow-cluster-test
+
+x-sftpflow-base: &sftpflow-base
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile.sftpflow-server
+  # Override the image's entrypoint with the cluster-aware one.
+  # Bind-mount + entrypoint override beats building a second image
+  # for a one-line script change.
+  entrypoint: ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint-cluster.sh"]
+  environment:
+    # Cluster passphrase. Fixed test value so all three nodes seal
+    # their stores with the same key — only node 1 actually stores
+    # the cluster token-HMAC secret in M12, but every node needs a
+    # passphrase to open `*_ref` secrets at run time.
+    - SFTPFLOW_PASSPHRASE=cluster-test-passphrase
+    - RUST_LOG=info
+  networks:
+    - sftpflow-cluster
+  restart: unless-stopped
+
+services:
+
+  # ------------------------------------------------------------
+  # sftpflow-1 — initial bootstrap node (run `init` here first)
+  # ------------------------------------------------------------
+  sftpflow-1:
+    <<: *sftpflow-base
+    container_name: sftpflow-cluster-1
+    hostname: sftpflow-1
+    ports:
+      - "2231:22"
+    volumes:
+      - ./test-keys/id_ed25519.pub:/etc/sftpflow/authorized_keys:ro
+      - ./entrypoint-cluster.sh:/usr/local/bin/entrypoint-cluster.sh:ro
+      - sftpflow-cluster-1-state:/var/lib/sftpflow
+      - sftpflow-cluster-1-hostkeys:/etc/ssh/keys
+
+  # ------------------------------------------------------------
+  # sftpflow-2 / sftpflow-3 — joiners
+  # ------------------------------------------------------------
+  sftpflow-2:
+    <<: *sftpflow-base
+    container_name: sftpflow-cluster-2
+    hostname: sftpflow-2
+    ports:
+      - "2232:22"
+    volumes:
+      - ./test-keys/id_ed25519.pub:/etc/sftpflow/authorized_keys:ro
+      - ./entrypoint-cluster.sh:/usr/local/bin/entrypoint-cluster.sh:ro
+      - sftpflow-cluster-2-state:/var/lib/sftpflow
+      - sftpflow-cluster-2-hostkeys:/etc/ssh/keys
+
+  sftpflow-3:
+    <<: *sftpflow-base
+    container_name: sftpflow-cluster-3
+    hostname: sftpflow-3
+    ports:
+      - "2233:22"
+    volumes:
+      - ./test-keys/id_ed25519.pub:/etc/sftpflow/authorized_keys:ro
+      - ./entrypoint-cluster.sh:/usr/local/bin/entrypoint-cluster.sh:ro
+      - sftpflow-cluster-3-state:/var/lib/sftpflow
+      - sftpflow-cluster-3-hostkeys:/etc/ssh/keys
+
+# ------------------------------------------------------------
+# Named volumes — one per node, persisted across `down`/`up`
+# ------------------------------------------------------------
+# Each node's state_dir contains node.json + cluster/*.crt,key +
+# raft/ (sled) + secrets.age + runs.db. Persisting them lets the
+# failover test stop a container and bring it back without losing
+# its identity, which is exactly the M12 restart path.
+volumes:
+  sftpflow-cluster-1-state:
+  sftpflow-cluster-1-hostkeys:
+  sftpflow-cluster-2-state:
+  sftpflow-cluster-2-hostkeys:
+  sftpflow-cluster-3-state:
+  sftpflow-cluster-3-hostkeys:
+
+# ------------------------------------------------------------
+# Cluster network — distinct from sftpflow-test so the two envs
+# can coexist if anyone leaves both running.
+# ------------------------------------------------------------
+networks:
+  sftpflow-cluster:
+    driver: bridge
