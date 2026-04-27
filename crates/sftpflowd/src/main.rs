@@ -163,12 +163,13 @@ enum Command {
 
 #[derive(Args, Clone, Debug, Default)]
 struct RunArgs {
-    /// host:port the Raft gRPC server binds to on this machine.
+    /// IP:port the Raft gRPC server binds to on this machine.
     /// Only consulted in cluster mode (i.e. when node.json exists).
-    /// Defaults to the advertise address recorded in node.json,
-    /// which is correct on hosts where bind == advertise. Override
-    /// when binding to a wildcard or a different interface than
-    /// what peers use to dial in (e.g. NAT, multi-homed hosts).
+    /// Defaults to `0.0.0.0:<port-from-advertise>` so a no-args
+    /// restart works in the common case (bind on all interfaces,
+    /// port from the advertise address recorded at init/join).
+    /// Override when binding to a specific interface for NAT or
+    /// multi-homed hosts.
     #[arg(long, value_name = "ADDR")]
     bind: Option<String>,
 }
@@ -757,10 +758,26 @@ fn cmd_run_cluster(
     );
 
     // ---- 1. Resolve bind ----
-    // Default to advertise so single-arg restarts work for the
-    // common "bind == advertise" case; --bind overrides for
-    // multi-homed / NAT'd setups.
-    let bind_str = args.bind.clone().unwrap_or_else(|| node.advertise_addr.clone());
+    // The bind address isn't persisted in node.json (only advertise
+    // is — that's the operator-stable identity). On restart we need
+    // a sensible default: extract the port from advertise_addr and
+    // bind on 0.0.0.0:<that-port>. That covers the common case
+    // (init/join were typically run with --bind 0.0.0.0:N --advertise
+    // hostname:N) and works whether advertise is an IP or a DNS name.
+    // Operators with a multi-homed / NAT'd setup pass --bind
+    // explicitly to override.
+    let bind_str = match args.bind.clone() {
+        Some(b) => b,
+        None => {
+            let port = node.advertise_addr.rsplit_once(':').map(|(_, p)| p)
+                .ok_or_else(|| format!(
+                    "advertise_addr '{}' in node.json has no ':PORT' suffix; \
+                     pass --bind explicitly",
+                    node.advertise_addr,
+                ))?;
+            format!("0.0.0.0:{}", port)
+        }
+    };
     let bind_addr: std::net::SocketAddr = bind_str.parse().map_err(|e| {
         format!("--bind '{}' must be IP:PORT (e.g. 0.0.0.0:7900): {}", bind_str, e)
     })?;

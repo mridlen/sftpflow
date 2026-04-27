@@ -50,11 +50,15 @@ NODE_IDS=(1 2 3)
 # uniform). Not exposed to the host.
 RAFT_PORT=7900
 
-# Wait budgets. Cluster bootstrap is normally <2s; election timeout
-# is ~500ms-1s. These are loose to absorb CI noise.
-JOIN_WAIT_SECS=20
-ELECTION_WAIT_SECS=15
-RESTART_WAIT_SECS=20
+# Wait budgets, in seconds. Loose because the scrypt-based sealed
+# store unlock is intentionally slow (KDF) and runs on every init/
+# join/restart, easily eating ~5s by itself. Election + replication
+# are sub-second under normal conditions.
+INIT_SOCKET_WAIT_SECS=60
+JOIN_WAIT_SECS=60
+CONVERGE_WAIT_SECS=30
+ELECTION_WAIT_SECS=30
+RESTART_WAIT_SECS=60
 
 # ============================================================
 # Logging
@@ -178,12 +182,20 @@ cluster_status_json() {
 
 phase1_init_node1() {
     banner "Phase 1.1 — Bootstrap node 1"
-    step "running 'sftpflowd init' on ${CONTAINERS[0]} (detached)"
-    docker exec -d \
+    local logf="/tmp/sftpflowd-init-node1.log"
+    step "running 'sftpflowd init' on ${CONTAINERS[0]} (host-side bg, log -> ${logf})"
+    # We avoid `docker exec -d` here — it has subtle stdio detach
+    # bugs that have caused the daemon to die mid-init in earlier
+    # runs. Instead we use a foreground `docker exec` backgrounded
+    # at the host shell level. The docker client stays alive for
+    # the life of this test script, holding the daemon's stdio
+    # pipe open, and we get logs straight to the host filesystem.
+    : > "${logf}"
+    docker exec \
         -e SFTPFLOW_PASSPHRASE=cluster-test-passphrase \
         "${CONTAINERS[0]}" \
         su -s /bin/sh sftpflow -c "
-            export SFTPFLOW_PASSPHRASE='cluster-test-passphrase'
+            export SFTPFLOW_PASSPHRASE=cluster-test-passphrase
             export RUST_LOG=info
             cd /var/lib/sftpflow
             exec sftpflowd init \
@@ -192,25 +204,30 @@ phase1_init_node1() {
                 --advertise ${HOSTNAMES[0]}:${RAFT_PORT} \
                 --label bootstrap \
                 --socket unix:/run/sftpflow/sftpflow.sock
-        "
+        " >"${logf}" 2>&1 </dev/null &
+    INIT_PID=$!
 
     step "waiting for node.json on node 1"
     local tries=0
     until docker exec "${CONTAINERS[0]}" test -f /var/lib/sftpflow/node.json 2>/dev/null; do
         tries=$((tries + 1))
-        if [[ "${tries}" -gt 30 ]]; then
-            fail "node 1 did not write node.json within 30s"
+        if [[ "${tries}" -gt INIT_SOCKET_WAIT_SECS ]]; then
+            fail "node 1 did not write node.json within ${INIT_SOCKET_WAIT_SECS}s"
         fi
         sleep 1
     done
     ok "node 1 wrote node.json"
 
-    step "waiting for unix socket on node 1"
+    step "waiting for unix socket on node 1 (budget ${INIT_SOCKET_WAIT_SECS}s)"
     tries=0
     until docker exec "${CONTAINERS[0]}" test -S /run/sftpflow/sftpflow.sock 2>/dev/null; do
         tries=$((tries + 1))
-        if [[ "${tries}" -gt 30 ]]; then
-            fail "node 1 daemon socket never appeared"
+        if [[ "${tries}" -gt INIT_SOCKET_WAIT_SECS ]]; then
+            fail "node 1 daemon socket never appeared within ${INIT_SOCKET_WAIT_SECS}s"
+        fi
+        # Progress hint every 10s so a long wait doesn't look hung.
+        if (( tries % 10 == 0 )); then
+            step "still waiting for socket (${tries}/${INIT_SOCKET_WAIT_SECS}s)"
         fi
         sleep 1
     done
@@ -234,8 +251,16 @@ phase1_mint_token() {
 # Copy /var/lib/sftpflow/cluster/ca.crt out of node 1 and into the
 # joiner's filesystem under /etc/sftpflow/ca.crt — the path matches
 # the container layout the join command will reference.
+#
+# `docker cp` preserves the host file's perms/uid, so the copied file
+# lands as 0600 owned by the host user's uid (e.g. 1000 in WSL). The
+# sftpflow daemon runs as uid 2000 inside the container and cannot
+# read 0600-other-uid files. Force 0644 + chown root:root afterward
+# — the CA cert is public material; readability is the only thing
+# that matters.
 copy_ca_to_joiner() {
     local joiner_idx="${1}"
+    local container="${CONTAINERS[${joiner_idx}]}"
     local tmp
     tmp="$(mktemp)"
     docker exec "${CONTAINERS[0]}" cat /var/lib/sftpflow/cluster/ca.crt > "${tmp}"
@@ -243,7 +268,9 @@ copy_ca_to_joiner() {
         rm -f "${tmp}"
         fail "node 1's ca.crt does not look like a PEM certificate"
     fi
-    docker cp "${tmp}" "${CONTAINERS[${joiner_idx}]}:/etc/sftpflow/ca.crt"
+    docker cp "${tmp}" "${container}:/etc/sftpflow/ca.crt"
+    docker exec "${container}" chmod 0644 /etc/sftpflow/ca.crt
+    docker exec "${container}" chown root:root /etc/sftpflow/ca.crt
     rm -f "${tmp}"
 }
 
@@ -257,23 +284,26 @@ phase1_join_node() {
     step "copying CA cert from node 1 onto ${container}"
     copy_ca_to_joiner "${idx}"
 
-    step "running 'sftpflowd join' on ${container} (detached)"
-    docker exec -d \
+    local logf="/tmp/sftpflowd-join-node${node_id}.log"
+    step "running 'sftpflowd join' on ${container} (host-side bg, log -> ${logf})"
+    # Same host-side-background pattern as phase1_init_node1.
+    : > "${logf}"
+    docker exec \
         -e SFTPFLOW_PASSPHRASE=cluster-test-passphrase \
         "${container}" \
         su -s /bin/sh sftpflow -c "
-            export SFTPFLOW_PASSPHRASE='cluster-test-passphrase'
+            export SFTPFLOW_PASSPHRASE=cluster-test-passphrase
             export RUST_LOG=info
             cd /var/lib/sftpflow
             exec sftpflowd join ${HOSTNAMES[0]}:${RAFT_PORT} \
-                --token '${token}' \
+                --token ${token} \
                 --ca-cert-file /etc/sftpflow/ca.crt \
                 --node-id ${node_id} \
                 --bind 0.0.0.0:${RAFT_PORT} \
                 --advertise ${hostname}:${RAFT_PORT} \
                 --label joiner-${node_id} \
                 --socket unix:/run/sftpflow/sftpflow.sock
-        "
+        " >"${logf}" 2>&1 </dev/null &
 
     step "waiting for node ${node_id} to write node.json + open socket"
     local tries=0
@@ -293,7 +323,7 @@ phase1_join_node() {
 wait_for_three_node_convergence() {
     banner "Phase 1.3 — Wait for cluster to converge to 3 members"
     local tries=0
-    while [[ "${tries}" -lt JOIN_WAIT_SECS ]]; do
+    while [[ "${tries}" -lt CONVERGE_WAIT_SECS ]]; do
         local all_ok=1
         local leader_id=""
         for i in 0 1 2; do
@@ -326,7 +356,7 @@ wait_for_three_node_convergence() {
         sleep 1
     done
     print_status_dump
-    fail "cluster did not converge to 3 members within ${JOIN_WAIT_SECS}s"
+    fail "cluster did not converge to 3 members within ${CONVERGE_WAIT_SECS}s"
 }
 
 # ============================================================
@@ -466,10 +496,17 @@ main() {
     compose_up
 
     phase1_init_node1
-    local token
-    token="$(phase1_mint_token | tail -1)"
-    phase1_join_node 1 "${token}"
-    phase1_join_node 2 "${token}"
+
+    # Tokens are single-use (nonce-protected): the seed-side
+    # BootstrapServiceImpl marks the nonce as redeemed on a
+    # successful join, so a second join handshake with the same
+    # token fails with "token nonce already used (replay)". Mint
+    # one per joiner instead of reusing.
+    local token2 token3
+    token2="$(phase1_mint_token | tail -1)"
+    phase1_join_node 1 "${token2}"
+    token3="$(phase1_mint_token | tail -1)"
+    phase1_join_node 2 "${token3}"
     wait_for_three_node_convergence
 
     phase2_kill_leader
