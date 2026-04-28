@@ -433,6 +433,35 @@ fn make_seed_join_handler(
                  hasn't run on this node yet)".to_string()
             })?.clone();
 
+            // ---- Leader pre-flight ----
+            // openraft's add_learner / change_membership are
+            // leader-only. If we're not the leader, the spawned
+            // background task below will fail with "has to forward
+            // request to: <leader>" — but by then we've already
+            // signed the joiner's CSR and replied OK, so the joiner
+            // brings up a Raft replica that no peer ever reaches
+            // and dies in `wait_for_leader`. Refuse loudly here so
+            // the operator can re-issue the join against the leader.
+            // (Token minting is also bootstrap-only in M12; once a
+            // joiner has a token it knows the bootstrap is alive,
+            // but the leader can be any node after re-election.)
+            if !handle.is_leader() {
+                let leader_hint = handle.current_leader()
+                    .and_then(|lid| handle.members().get(&lid)
+                        .map(|m| (lid, m.advertise_addr.clone())));
+                return match leader_hint {
+                    Some((lid, addr)) => Err(format!(
+                        "this node is not the Raft leader; \
+                         reissue the join against node_id={} at {}",
+                        lid, addr,
+                    )),
+                    None => Err(
+                        "no Raft leader currently elected; \
+                         try the join again in a few seconds".to_string()
+                    ),
+                };
+            }
+
             // ---- Resolve assigned node_id ----
             // `desired_node_id == 0` is the wire signal for "seed,
             // please pick". We allocate `max(existing) + 1`. Any

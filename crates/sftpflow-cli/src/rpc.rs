@@ -3,15 +3,26 @@
 // ============================================================
 //
 // Two transport modes:
-//   1. Direct socket (dev): connects to tcp:host:port or unix:/path
-//   2. SSH subprocess (prod): spawns `ssh user@host sftpflow-shell`
+//   1. Direct socket (dev): persistent connection to tcp:host:port
+//      or unix:/path. Persistent is fine here — both sides flush
+//      per line, no shell in the middle.
+//   2. SSH bridge (prod): one-shot `ssh user@host sftpflow-shell`
+//      per RPC call. We *don't* keep a persistent ssh subprocess:
+//      under WSL2 / OpenSSH 9.x with no remote pty, the bridge's
+//      stdout doesn't flush back to the client until ssh's stdin
+//      EOFs, so a long-lived subprocess deadlocks on the second
+//      and subsequent calls. Closing stdin per call (which is what
+//      one-shot achieves) sidesteps the issue. The downside is one
+//      ssh handshake (~100-300ms) per call; acceptable for an
+//      operator CLI, much better than the alternative of silently
+//      hanging in cluster_join_remote's status-poll loop.
 //
-// Both provide a BufRead reader and Write writer over which we
-// send/receive NDJSON RequestEnvelope / ResponseEnvelope pairs.
+// Both modes provide a BufRead reader and Write writer over which
+// we send/receive NDJSON RequestEnvelope / ResponseEnvelope pairs.
 
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(unix)]
@@ -68,9 +79,27 @@ impl From<io::Error> for RpcError {
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct RpcClient {
-    reader: Box<dyn BufRead + Send>,
-    writer: Box<dyn Write + Send>,
-    ssh_child: Option<Child>,
+    inner: RpcInner,
+}
+
+enum RpcInner {
+    /// TCP/Unix socket — persistent, byte-streaming connection.
+    /// `reader` and `writer` are halves of the same socket and
+    /// stay open across calls.
+    Persistent {
+        reader: Box<dyn BufRead + Send>,
+        writer: Box<dyn Write + Send>,
+    },
+    /// SSH bridge — config only. Each `call()` spawns a fresh
+    /// `ssh user@host sftpflow-shell` subprocess, sends the
+    /// request, reads one response line, then drops the
+    /// subprocess (which EOFs the bridge's stdin and lets the
+    /// daemon flush its output buffer through sshd's pipe).
+    Ssh {
+        username: String,
+        host:     String,
+        port:     Option<u16>,
+    },
 }
 
 impl RpcClient {
@@ -111,9 +140,10 @@ impl RpcClient {
         debug!("rpc: connected via tcp to {}", addr);
         let reader = stream.try_clone()?;
         Ok(RpcClient {
-            reader: Box::new(BufReader::new(reader)),
-            writer: Box::new(stream),
-            ssh_child: None,
+            inner: RpcInner::Persistent {
+                reader: Box::new(BufReader::new(reader)),
+                writer: Box::new(stream),
+            },
         })
     }
 
@@ -123,18 +153,21 @@ impl RpcClient {
         debug!("rpc: connected via unix socket {}", path);
         let reader = stream.try_clone()?;
         Ok(RpcClient {
-            reader: Box::new(BufReader::new(reader)),
-            writer: Box::new(stream),
-            ssh_child: None,
+            inner: RpcInner::Persistent {
+                reader: Box::new(BufReader::new(reader)),
+                writer: Box::new(stream),
+            },
         })
     }
 
     // --------------------------------------------------------
-    // SSH subprocess connection (production)
+    // SSH "connection" (production)
     // --------------------------------------------------------
 
-    /// Spawn `ssh user@host sftpflow-shell` and wire its stdin/stdout
-    /// as the RPC transport. Uses settings from ServerConnection.
+    /// Stash the SSH transport config. Doesn't actually spawn ssh
+    /// here — that happens lazily in `call()`. We still validate
+    /// the required fields up-front so the operator gets an
+    /// immediate error instead of one per RPC.
     pub fn connect_ssh(server: &ServerConnection) -> Result<Self, RpcError> {
         let host = server.host.as_deref().ok_or_else(|| {
             RpcError::ConnectionNotConfigured(
@@ -148,38 +181,13 @@ impl RpcClient {
             )
         })?;
 
-        let mut cmd = Command::new("ssh");
-
-        if let Some(port) = server.port {
-            cmd.arg("-p").arg(port.to_string());
-        }
-
-        // -o BatchMode=yes prevents interactive password prompts that
-        // would hang the CLI; key-based auth is expected.
-        cmd.arg("-o").arg("BatchMode=yes");
-
-        cmd.arg(format!("{}@{}", username, host));
-        cmd.arg("sftpflow-shell");
-
-        cmd.stdin(Stdio::piped());
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::inherit());
-
-        debug!("rpc: spawning ssh subprocess to {}@{}", username, host);
-        let mut child = cmd.spawn().map_err(|e| {
-            RpcError::Io(io::Error::new(
-                e.kind(),
-                format!("failed to spawn ssh: {}", e),
-            ))
-        })?;
-
-        let stdin = child.stdin.take().expect("stdin was piped");
-        let stdout = child.stdout.take().expect("stdout was piped");
-
+        debug!("rpc: ssh transport ready for {}@{}", username, host);
         Ok(RpcClient {
-            reader: Box::new(BufReader::new(stdout)),
-            writer: Box::new(stdin),
-            ssh_child: Some(child),
+            inner: RpcInner::Ssh {
+                username: username.to_string(),
+                host:     host.to_string(),
+                port:     server.port,
+            },
         })
     }
 
@@ -192,12 +200,18 @@ impl RpcClient {
     pub fn call(&mut self, request: Request) -> Result<Response, RpcError> {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let envelope = RequestEnvelope { id, request };
-
         debug!("rpc: sending id={} {:?}", id, envelope);
-        framing::write_line(&mut self.writer, &envelope)?;
 
-        let response: Option<ResponseEnvelope> = framing::read_line(&mut self.reader)?;
-        let response = response.ok_or(RpcError::UnexpectedEof)?;
+        let response = match &mut self.inner {
+            RpcInner::Persistent { reader, writer } => {
+                framing::write_line(writer, &envelope)?;
+                let resp: Option<ResponseEnvelope> = framing::read_line(reader)?;
+                resp.ok_or(RpcError::UnexpectedEof)?
+            }
+            RpcInner::Ssh { username, host, port } => {
+                one_shot_ssh_call(username, host, *port, &envelope)?
+            }
+        };
 
         debug!("rpc: received id={} {:?}", response.id, response.outcome);
 
@@ -209,16 +223,79 @@ impl RpcClient {
 }
 
 // ============================================================
-// Cleanup
+// one_shot_ssh_call - spawn ssh, send one request, read one reply
 // ============================================================
+//
+// The crux of the Bug-2 fix. Each invocation:
+//   1. spawns `ssh [-p port] -T -o BatchMode=yes user@host sftpflow-shell`
+//   2. writes the NDJSON request to ssh's stdin
+//   3. closes ssh's stdin (drops the writer) — this is the part
+//      that the persistent-connection variant got wrong; without
+//      EOF, the bridge's output never makes it back through sshd
+//   4. reads one response line from ssh's stdout
+//   5. waits for ssh to exit and surfaces a non-zero exit as an error
+fn one_shot_ssh_call(
+    username: &str,
+    host:     &str,
+    port:     Option<u16>,
+    envelope: &RequestEnvelope,
+) -> Result<ResponseEnvelope, RpcError> {
+    let mut cmd = Command::new("ssh");
 
-impl Drop for RpcClient {
-    fn drop(&mut self) {
-        if let Some(ref mut child) = self.ssh_child {
-            // Close the SSH subprocess's stdin by replacing the writer
-            // with a no-op sink. This signals EOF to sftpflow-shell.
-            self.writer = Box::new(io::sink());
-            let _ = child.wait();
-        }
+    if let Some(p) = port {
+        cmd.arg("-p").arg(p.to_string());
     }
+
+    // -T: don't request a remote pty (we're piping NDJSON, not
+    //     driving an interactive shell — pty would echo input back
+    //     and corrupt the framing).
+    // BatchMode=yes: never prompt for a password — auth is by key.
+    cmd.arg("-T").arg("-o").arg("BatchMode=yes");
+    cmd.arg(format!("{}@{}", username, host));
+    cmd.arg("sftpflow-shell");
+
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::inherit());
+
+    debug!("rpc(ssh one-shot): spawning ssh to {}@{}", username, host);
+    let mut child = cmd.spawn().map_err(|e| {
+        RpcError::Io(io::Error::new(
+            e.kind(),
+            format!("failed to spawn ssh: {}", e),
+        ))
+    })?;
+
+    // Write the request, then drop stdin so the remote bridge sees
+    // EOF and flushes its output back to us.
+    {
+        let mut stdin = child.stdin.take().expect("stdin was piped");
+        framing::write_line(&mut stdin, envelope)?;
+        // `stdin` drops here, closing the write half of the pipe.
+    }
+
+    // Read one response line from ssh stdout.
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let mut reader = BufReader::new(stdout);
+    let envelope: Option<ResponseEnvelope> = framing::read_line(&mut reader)?;
+
+    // Drain any trailing bytes so the child's stdout pipe has no
+    // pressure when we wait() on it. Bridge cleanly exits after the
+    // single response, so this is usually empty.
+    let mut sink = Vec::new();
+    let _ = reader.read_to_end(&mut sink);
+
+    let status = child.wait().map_err(|e| {
+        RpcError::Io(io::Error::new(
+            e.kind(),
+            format!("waiting on ssh subprocess: {}", e),
+        ))
+    })?;
+    if !status.success() {
+        return Err(RpcError::Io(io::Error::other(format!(
+            "ssh subprocess exited with status {}", status.code().unwrap_or(-1),
+        ))));
+    }
+
+    envelope.ok_or(RpcError::UnexpectedEof)
 }

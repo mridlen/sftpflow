@@ -11,6 +11,13 @@
 #   sftpflow-1  raft :7900   ssh :22 (host :2231)
 #   sftpflow-2  raft :7900   ssh :22 (host :2232)
 #   sftpflow-3  raft :7900   ssh :22 (host :2233)
+#   sftpflow-4  raft :7900   ssh :22 (host :2234)  -- joiner candidate
+#                                                     for `cluster join`
+#                                                     CLI live-validation;
+#                                                     uses sshd_config_joiner
+#                                                     (no ForceCommand) so
+#                                                     the CLI can spawn a
+#                                                     real shell on it.
 #
 # Each service binds the Raft gRPC port on 0.0.0.0:7900 inside the
 # container; the advertise address is the docker DNS name (e.g.
@@ -92,6 +99,28 @@ services:
       - sftpflow-cluster-3-state:/var/lib/sftpflow
       - sftpflow-cluster-3-hostkeys:/etc/ssh/keys
 
+  # ------------------------------------------------------------
+  # sftpflow-4 — joiner candidate for `cluster join` CLI test
+  # ------------------------------------------------------------
+  # Same image as the others but mounts sshd_config_joiner over
+  # the baked-in sshd_config, dropping the ForceCommand so SSH
+  # sessions land in /bin/sh. The CLI's `cluster join` command
+  # spawns ssh + a small heredoc script that calls `sftpflowd
+  # join`, which can't run through the NDJSON-proxy ForceCommand
+  # the other nodes use.
+  sftpflow-4:
+    <<: *sftpflow-base
+    container_name: sftpflow-cluster-4
+    hostname: sftpflow-4
+    ports:
+      - "2234:22"
+    volumes:
+      - ./test-keys/id_ed25519.pub:/etc/sftpflow/authorized_keys:ro
+      - ./entrypoint-cluster.sh:/usr/local/bin/entrypoint-cluster.sh:ro
+      - ./sshd_config_joiner:/etc/ssh/sshd_config:ro
+      - sftpflow-cluster-4-state:/var/lib/sftpflow
+      - sftpflow-cluster-4-hostkeys:/etc/ssh/keys
+
 # ------------------------------------------------------------
 # Named volumes — one per node, persisted across `down`/`up`
 # ------------------------------------------------------------
@@ -106,6 +135,8 @@ volumes:
   sftpflow-cluster-2-hostkeys:
   sftpflow-cluster-3-state:
   sftpflow-cluster-3-hostkeys:
+  sftpflow-cluster-4-state:
+  sftpflow-cluster-4-hostkeys:
 
 # ------------------------------------------------------------
 # Cluster network — distinct from sftpflow-test so the two envs

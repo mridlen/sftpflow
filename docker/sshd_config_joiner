@@ -1,0 +1,48 @@
+# ============================================================
+# docker/sshd_config_joiner — interactive-shell variant
+# ============================================================
+#
+# Identical to sshd_config except the ForceCommand stanza is
+# removed, so SSH sessions for the sftpflow user land in the
+# real /bin/sh instead of being proxied through sftpflow-shell.
+#
+# Used by the 4th compose service in compose.cluster.yml for
+# live-validating the CLI's `cluster join <user@host>` command:
+# the CLI needs to ssh into the joiner, run a small shell
+# script that calls `sftpflowd join`, and have the script's
+# `read` calls actually consume stdin — none of which works
+# when the session is ForceCommand'd to the NDJSON proxy.
+#
+# All the other auth/security knobs match sshd_config so the
+# cluster-test ssh key (docker/test-keys/id_ed25519.pub) keeps
+# working unchanged.
+
+Port 22
+AddressFamily inet
+ListenAddress 0.0.0.0
+
+HostKey /etc/ssh/keys/ssh_host_ed25519_key
+HostKey /etc/ssh/keys/ssh_host_rsa_key
+
+# ---- Auth ----
+PermitRootLogin no
+PasswordAuthentication no
+ChallengeResponseAuthentication no
+PubkeyAuthentication yes
+PermitEmptyPasswords no
+UsePAM no
+
+AllowUsers sftpflow
+
+AuthorizedKeysFile .ssh/authorized_keys
+
+X11Forwarding no
+AllowTcpForwarding no
+AllowAgentForwarding no
+GatewayPorts no
+PermitTunnel no
+
+LogLevel INFO
+SyslogFacility AUTH
+
+# NOTE: no Match User stanza — SSH sessions get a real /bin/sh.
