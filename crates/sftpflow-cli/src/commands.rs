@@ -64,8 +64,14 @@ pub fn help_exec() {
     println!();
     println!("  run feed <name>              Manually run a feed (outside of schedule)");
     println!("  sync schedules               Reconcile feed schedules with dkron");
-    println!("  connect                      Connect (or reconnect) to the daemon");
-    println!("  config                       Edit server connection settings");
+    println!();
+    println!("  connection add NAME user@host[:port] [dkron URL]");
+    println!("                               Save a named server connection");
+    println!("  connection list              List saved connections");
+    println!("  connection delete NAME       Forget a saved connection");
+    println!("  connect [NAME]               Connect (or reconnect); optionally switch");
+    println!("                               to a named connection first");
+    println!("  config                       Edit active server connection settings");
     println!();
     println!("  exit                         Exit SFTPflow");
     println!("  help / ?                     Show this help");
@@ -74,8 +80,246 @@ pub fn help_exec() {
 // ---- connect ----
 
 /// Connect (or reconnect) to the daemon.
-pub fn connect(state: &mut ShellState) {
+///
+/// With no args: just retries the current `server` connection.
+/// With a NAME arg: switches the active connection to the named
+/// registry entry first, persists the change, then connects.
+pub fn connect(args: &[&str], state: &mut ShellState) {
+    if let Some(name) = args.first() {
+        if !switch_active_connection(name, state) {
+            return;
+        }
+    }
     state.try_connect(); // cli.rs - ShellState::try_connect()
+}
+
+// ---- connection <subcommand> ----
+
+/// Route 'connection add|list|delete ...'.
+pub fn connection(args: &[&str], state: &mut ShellState) {
+    if args.is_empty() {
+        println!("% Usage: connection <add|list|delete> [args]");
+        println!("  connection add NAME user@host[:port] [dkron URL]");
+        println!("  connection list");
+        println!("  connection delete NAME");
+        return;
+    }
+
+    match args[0] {
+        "add"    => connection_add(&args[1..], state),
+        "list"   => connection_list(state),
+        "delete" => connection_delete(&args[1..], state),
+        _ => println!("% Unknown connection subcommand '{}'. Use add, list, or delete.", args[0]),
+    }
+}
+
+/// Validate that a connection NAME contains only safe characters.
+/// Reuses the same allowlist policy as endpoint/feed names: ASCII
+/// alphanumerics, dash, underscore, dot. Reject empty / whitespace
+/// / shell-metacharacter strings up front so the registry stays
+/// trivially safe to display, persist, and key on.
+fn validate_connection_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("connection name cannot be empty".into());
+    }
+    for c in name.chars() {
+        let ok = c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.';
+        if !ok {
+            return Err(format!(
+                "connection name '{}' contains invalid character '{}'; \
+                 use letters, digits, '-', '_', '.'",
+                name, c,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Parse 'user@host[:port]'. Same shape as parse_ssh_target() down
+/// in the cluster section, copied here to keep the two helpers from
+/// growing coupled — connection-add doesn't actually invoke ssh.
+fn parse_user_at_host(target: &str) -> Result<(String, String, Option<u16>), String> {
+    let (user, host_port) = target.split_once('@')
+        .ok_or_else(|| format!("expected user@host[:port], got '{}'", target))?;
+    if user.is_empty() {
+        return Err(format!("empty user in '{}'", target));
+    }
+    if let Some((host, port_str)) = host_port.rsplit_once(':') {
+        let port = port_str.parse::<u16>()
+            .map_err(|_| format!("'{}' is not a valid port number", port_str))?;
+        if host.is_empty() {
+            return Err(format!("empty host in '{}'", target));
+        }
+        Ok((user.to_string(), host.to_string(), Some(port)))
+    } else {
+        if host_port.is_empty() {
+            return Err(format!("empty host in '{}'", target));
+        }
+        Ok((user.to_string(), host_port.to_string(), None))
+    }
+}
+
+/// `connection add NAME user@host[:port] [dkron URL]`
+///
+/// Stores a named server connection in the CLI registry. If no
+/// active connection is currently set (i.e. this is the first
+/// entry the operator has added), the new entry also becomes the
+/// active one and gets copied into `state.config.server`.
+fn connection_add(args: &[&str], state: &mut ShellState) {
+    if args.len() < 2 {
+        println!("% Usage: connection add NAME user@host[:port] [dkron URL]");
+        return;
+    }
+
+    let name = args[0];
+    if let Err(e) = validate_connection_name(name) {
+        println!("% {}", e);
+        return;
+    }
+
+    let (user, host, port) = match parse_user_at_host(args[1]) {
+        Ok(t) => t,
+        Err(msg) => { println!("% {}", msg); return; }
+    };
+
+    // Optional `dkron URL` trailing pair. Strict pairing keeps the
+    // grammar simple — bare URLs without the keyword get rejected.
+    let mut dkron_url: Option<String> = None;
+    let mut i = 2;
+    while i < args.len() {
+        match args[i] {
+            "dkron" => {
+                if i + 1 >= args.len() {
+                    println!("% 'dkron' requires a URL argument");
+                    return;
+                }
+                dkron_url = Some(args[i + 1].to_string());
+                i += 2;
+            }
+            other => {
+                println!("% Unexpected argument '{}'. Expected 'dkron URL'.", other);
+                return;
+            }
+        }
+    }
+
+    if state.config.connections.contains_key(name) {
+        println!("% Connection '{}' already exists. Use 'connection delete {}' first.", name, name);
+        return;
+    }
+
+    let entry = sftpflow_core::ServerConnection {
+        host:      Some(host.clone()),
+        port,
+        username:  Some(user.clone()),
+        dkron_url,
+    };
+
+    info!("Added connection '{}' = {}@{}", name, user, host);
+    state.config.connections.insert(name.to_string(), entry.clone());
+
+    // First entry → also activate, so 'connect' Just Works without
+    // a separate 'connect NAME' step.
+    let activated = if state.config.active_connection.is_none() {
+        state.config.active_connection = Some(name.to_string());
+        state.config.server = entry;
+        true
+    } else {
+        false
+    };
+
+    if let Err(e) = state.config.save() {
+        eprintln!("% Error saving config: {}", e);
+        return;
+    }
+
+    println!("Added connection '{}': {}@{}{}",
+        name, user, host,
+        port.map_or(String::new(), |p| format!(":{}", p)));
+    if activated {
+        println!("This is the first connection — set as active.");
+        println!("Run 'connect' to dial the daemon.");
+    }
+}
+
+/// `connection list` — show all registered connections, marking
+/// the active one with a leading '*'.
+fn connection_list(state: &mut ShellState) {
+    if state.config.connections.is_empty() {
+        println!("No connections configured.");
+        println!("Use 'connection add NAME user@host[:port]' to add one.");
+        return;
+    }
+
+    let active = state.config.active_connection.as_deref();
+    println!("Configured connections:");
+    println!("    {:<16} {:<32} {}", "NAME", "TARGET", "DKRON");
+    println!("    {:-<16} {:-<32} {:-<32}", "", "", "");
+    for (name, conn) in &state.config.connections {
+        let marker = if active == Some(name.as_str()) { "*" } else { " " };
+        let host = conn.host.as_deref().unwrap_or("(no host)");
+        let user = conn.username.as_deref().unwrap_or("(no user)");
+        let port = conn.port.map_or(String::new(), |p| format!(":{}", p));
+        let target = format!("{}@{}{}", user, host, port);
+        let dkron = conn.dkron_url.as_deref().unwrap_or("-");
+        println!("  {} {:<16} {:<32} {}", marker, name, target, dkron);
+    }
+}
+
+/// `connection delete NAME` — remove a registry entry. Clears
+/// `active_connection` if it was the active entry.
+fn connection_delete(args: &[&str], state: &mut ShellState) {
+    if args.is_empty() {
+        println!("% Usage: connection delete NAME");
+        return;
+    }
+    let name = args[0];
+
+    if state.config.connections.remove(name).is_none() {
+        println!("% Connection '{}' does not exist.", name);
+        return;
+    }
+
+    let was_active = state.config.active_connection.as_deref() == Some(name);
+    if was_active {
+        state.config.active_connection = None;
+    }
+
+    if let Err(e) = state.config.save() {
+        eprintln!("% Error saving config: {}", e);
+        return;
+    }
+
+    info!("Deleted connection '{}'", name);
+    println!("Connection '{}' deleted.", name);
+    if was_active {
+        println!("(Was the active connection — `server` settings retained but no entry is now active.)");
+    }
+}
+
+/// Switch the active connection to a named registry entry.
+/// Copies the entry into `state.config.server`, persists, and
+/// returns whether the switch happened. Used by `connect NAME`.
+fn switch_active_connection(name: &str, state: &mut ShellState) -> bool {
+    let entry = match state.config.connections.get(name) {
+        Some(e) => e.clone(),
+        None => {
+            println!("% Connection '{}' does not exist. Use 'connection list' to see registered names.", name);
+            return false;
+        }
+    };
+
+    info!("Switching active connection to '{}'", name);
+    state.config.server = entry;
+    state.config.active_connection = Some(name.to_string());
+
+    if let Err(e) = state.config.save() {
+        eprintln!("% Error saving config: {}", e);
+        return false;
+    }
+
+    println!("Active connection: {}", name);
+    true
 }
 
 // ---- create <type> <name> ----
@@ -580,9 +824,16 @@ pub fn show_pending_server(state: &ShellState) {
 }
 
 /// Commit the pending server connection to disk.
+///
+/// If a named connection is active, the same edits are mirrored
+/// into `connections[active]` so the registry entry stays in sync
+/// with edits made via `config` mode.
 pub fn commit_server(state: &mut ShellState) {
     if let Some(server) = state.pending_server.take() {
-        state.config.server = server;
+        state.config.server = server.clone();
+        if let Some(name) = state.config.active_connection.clone() {
+            state.config.connections.insert(name, server);
+        }
         match state.config.save() {
             Ok(()) => {
                 info!("Committed server connection settings");

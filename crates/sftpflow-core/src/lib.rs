@@ -507,8 +507,21 @@ impl ServerConnection {
 /// Top-level config containing server connection, endpoints, keys, and feeds.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
+    /// Live/active SSH connection settings the CLI uses when it
+    /// runs `connect`. Always populated from whichever named entry
+    /// is active, or set directly via `config` mode.
     #[serde(default)]
     pub server: ServerConnection,
+    /// Named-connection registry. Operators bookmark cluster nodes
+    /// here ("connection add prod-1 admin@10.0.0.1:22") and switch
+    /// between them with "connect NAME" instead of re-typing host/port.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub connections: BTreeMap<String, ServerConnection>,
+    /// Name of the currently active entry in `connections`, if any.
+    /// `config commit` writes `server` back into `connections[active]`
+    /// so registry entries stay in sync with on-the-fly edits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_connection: Option<String>,
     #[serde(default)]
     pub endpoints: BTreeMap<String, Endpoint>,
     #[serde(default)]
