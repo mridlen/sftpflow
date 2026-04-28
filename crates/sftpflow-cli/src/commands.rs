@@ -56,6 +56,8 @@ pub fn help_exec() {
     println!();
     println!("  cluster status               Show cluster leader / members");
     println!("  cluster token [ttl]          Mint a join token (bootstrap node only)");
+    println!("  cluster bootstrap <user@host[:port]>");
+    println!("                               ssh-drive sftpflowd init on a fresh host");
     println!("  cluster join <user@host[:port]>");
     println!("                               Mint+ship a token, then ssh-drive sftpflowd join");
     println!("  cluster remove <node-id>     Remove a node from the voter set");
@@ -2298,7 +2300,7 @@ pub fn set_key_contents_ref(args: &[&str], state: &mut ShellState) {
 /// Route 'cluster status|token|remove|join ...' in exec mode.
 pub fn cluster(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
-        println!("% Usage: cluster <status|token|remove|join> [args]");
+        println!("% Usage: cluster <status|token|remove|join|bootstrap> [args]");
         return;
     }
 
@@ -2341,7 +2343,14 @@ pub fn cluster(args: &[&str], state: &mut ShellState) {
             }
             cluster_join_remote(state, args[1]);
         }
-        _ => println!("% Unknown cluster subcommand '{}'. Use status, token, remove, or join.", args[0]),
+        "bootstrap" => {
+            if args.len() < 2 {
+                println!("% Usage: cluster bootstrap <user@host[:port]>");
+                return;
+            }
+            cluster_bootstrap_remote(args[1]);
+        }
+        _ => println!("% Unknown cluster subcommand '{}'. Use status, token, remove, join, or bootstrap.", args[0]),
     }
 }
 
@@ -2676,6 +2685,184 @@ fn ssh_drive_remote_join(
         writeln!(stdin, "===END-CA===")
             .map_err(|e| format!("writing sentinel: {}", e))?;
         // Drop closes stdin → remote shell sees EOF and stops reading.
+    }
+
+    let status = child.wait()
+        .map_err(|e| format!("ssh wait failed: {}", e))?;
+    if !status.success() {
+        return Err(format!("ssh exited with status {}", status.code().unwrap_or(-1)));
+    }
+    Ok(())
+}
+
+// ============================================================
+// cluster bootstrap — drive `sftpflowd init` over SSH
+// ============================================================
+
+/// `cluster bootstrap <user@host[:port]>` — stand up a brand new
+/// single-node cluster on a remote host without the operator
+/// having to SSH in manually.
+///
+/// Counterpart to `cluster join`. Where join requires an existing
+/// connected bootstrap node (to mint tokens, fetch the CA), this
+/// command runs against *no* prior cluster — there's nothing for
+/// the local CLI to be connected to yet.
+///
+/// Steps:
+///   1. Parse user@host[:port].
+///   2. Read passphrase (env or prompt). The remote daemon needs
+///      it to seal its secrets store; the operator must persist
+///      it on the remote (e.g. /etc/environment) for restarts.
+///   3. SSH in, pipe passphrase on stdin, run `sftpflowd init`
+///      (one-shot), then launch `sftpflowd run` via nohup so it
+///      survives our SSH session ending.
+///   4. Print a connection hint pointing at the new node.
+///
+/// Preconditions on the remote host:
+///   - sftpflowd binary in PATH
+///   - writable state-dir (default /var/lib/sftpflow)
+///   - sshd accepting the operator's key
+fn cluster_bootstrap_remote(target: &str) {
+    // ---- 1. Parse user@host[:port] -----------------------------
+    let (user, host, port) = match parse_ssh_target(target) {
+        Ok(t) => t,
+        Err(msg) => { println!("% {}", msg); return; }
+    };
+
+    // ---- 2. Read passphrase from env or prompt -----------------
+    // Sent inline via SSH stdin so the remote daemon can seal its
+    // new secrets store on first init. The operator is responsible
+    // for making it available to the remote daemon on subsequent
+    // restarts (systemd EnvironmentFile, /etc/environment, etc.) —
+    // we only supply it for *this* invocation.
+    let passphrase = match std::env::var("SFTPFLOW_PASSPHRASE") {
+        Ok(p) if !p.is_empty() => p,
+        _ => {
+            match rpassword::prompt_password("Cluster passphrase (also needed on the remote host): ") {
+                Ok(p) if !p.is_empty() => p,
+                _ => { println!("% No passphrase supplied — aborting."); return; }
+            }
+        }
+    };
+
+    info!(
+        "cluster bootstrap: target={}@{} port={}",
+        user, host, port.unwrap_or(22),
+    );
+    println!("Bootstrapping new cluster on {}@{}...", user, host);
+
+    // ---- 3. SSH + drive remote sftpflowd init + run ------------
+    if let Err(msg) = ssh_drive_remote_bootstrap(user, host, port, &passphrase) {
+        println!("% Remote bootstrap failed: {}", msg);
+        return;
+    }
+
+    // ---- 4. Connect hint ---------------------------------------
+    // The CLI talks to the daemon over SSH (NDJSON tunnel), not the
+    // Raft port. So the post-bootstrap hint walks the operator
+    // through pointing the CLI's `server` config at the new host.
+    println!();
+    println!("Cluster bootstrapped. Daemon is running on {} (Raft on :7900).", host);
+    println!("Point this CLI at it:");
+    println!("  configure terminal");
+    println!("  server host {}", host);
+    if let Some(p) = port {
+        println!("  server port {}", p);
+    }
+    println!("  server username {}", user);
+    println!("  end");
+    println!("  connect");
+}
+
+/// Spawn ssh, pipe just the passphrase on stdin, and drive
+/// `sftpflowd init` followed by a detached `sftpflowd run`.
+///
+/// Two-phase script:
+///   1. `sftpflowd init` runs to completion (one-shot). On
+///      failure we tail its log and exit non-zero — the CLI
+///      surfaces that to the operator.
+///   2. `nohup sftpflowd run` launches in the background with
+///      stdio redirected away from ssh. We sleep ~2s, check
+///      pid-alive, and if `nc` is available also confirm the
+///      Raft port (7900) is listening.
+fn ssh_drive_remote_bootstrap(
+    user:       &str,
+    host:       &str,
+    port:       Option<u16>,
+    passphrase: &str,
+) -> Result<(), String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    // POSIX-sh script (no bashisms) — matches the join helper's style.
+    // Single-quoted Rust raw string so { and } in shell ${} don't
+    // collide with format!'s placeholders. There are no placeholders
+    // in this script (passphrase comes via stdin), so no .format()
+    // call is needed.
+    let remote_script = r#"
+        set -e
+        IFS= read -r SFTPFLOW_PASSPHRASE
+        export SFTPFLOW_PASSPHRASE
+
+        # ---- Phase 1: sftpflowd init (one-shot) ----
+        INIT_LOG=/tmp/sftpflowd-bootstrap-init.log
+        : > "$INIT_LOG"
+        if ! sftpflowd init > "$INIT_LOG" 2>&1; then
+            echo "sftpflowd init failed; tail of $INIT_LOG:" >&2
+            tail -20 "$INIT_LOG" >&2
+            exit 1
+        fi
+        echo "sftpflowd init complete"
+
+        # ---- Phase 2: sftpflowd run (long-running, detached) ----
+        # </dev/null specifically: without it the daemon inherits
+        # the ssh session's pipes and dies on EPIPE when ssh closes.
+        RUN_LOG=/tmp/sftpflowd.log
+        : > "$RUN_LOG"
+        nohup sftpflowd run > "$RUN_LOG" 2>&1 < /dev/null &
+        DAEMON_PID=$!
+        # Give it a moment to fail fast (port collision, bad config).
+        sleep 2
+        if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+            echo "sftpflowd run died early; tail of $RUN_LOG:" >&2
+            tail -20 "$RUN_LOG" >&2
+            exit 1
+        fi
+
+        # ---- Phase 3: Raft port check (best-effort) ----
+        # nc isn't on every minimal install. If it's missing we skip
+        # silently — pid-alive is already a strong success signal.
+        if command -v nc >/dev/null 2>&1; then
+            if ! nc -z localhost 7900 2>/dev/null; then
+                echo "warning: pid $DAEMON_PID alive but Raft port 7900 not yet listening" >&2
+            fi
+        fi
+        echo "sftpflowd run started (pid=$DAEMON_PID); log at $RUN_LOG"
+    "#;
+
+    // Pass the script as a positional argument (not `sh -s`) so
+    // ssh keeps stdin available for the script's `read` of the
+    // passphrase; otherwise the remote shell would slurp the whole
+    // script + passphrase as one undifferentiated stream.
+    let mut cmd = Command::new("ssh");
+    if let Some(p) = port {
+        cmd.arg("-p").arg(p.to_string());
+    }
+    cmd.arg("-o").arg("BatchMode=yes");
+    cmd.arg(format!("{}@{}", user, host));
+    cmd.arg(remote_script);
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::inherit());
+    cmd.stderr(Stdio::inherit());
+
+    let mut child = cmd.spawn()
+        .map_err(|e| format!("could not spawn ssh: {}", e))?;
+    {
+        let mut stdin = child.stdin.take()
+            .ok_or_else(|| "ssh stdin not piped".to_string())?;
+        writeln!(stdin, "{}", passphrase)
+            .map_err(|e| format!("writing passphrase: {}", e))?;
+        // Drop closes stdin → remote shell sees EOF after `read`.
     }
 
     let status = child.wait()
