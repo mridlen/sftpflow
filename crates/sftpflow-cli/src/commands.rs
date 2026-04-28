@@ -56,6 +56,8 @@ pub fn help_exec() {
     println!();
     println!("  cluster status               Show cluster leader / members");
     println!("  cluster token [ttl]          Mint a join token (bootstrap node only)");
+    println!("  cluster join <user@host[:port]>");
+    println!("                               Mint+ship a token, then ssh-drive sftpflowd join");
     println!("  cluster remove <node-id>     Remove a node from the voter set");
     println!();
     println!("  run feed <name>              Manually run a feed (outside of schedule)");
@@ -2293,10 +2295,10 @@ pub fn set_key_contents_ref(args: &[&str], state: &mut ShellState) {
 //   - remove <node-id>  Drop a node from the voter set; the CLI
 //                       double-confirms before sending.
 
-/// Route 'cluster status|token|remove ...' in exec mode.
+/// Route 'cluster status|token|remove|join ...' in exec mode.
 pub fn cluster(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
-        println!("% Usage: cluster <status|token|remove> [args]");
+        println!("% Usage: cluster <status|token|remove|join> [args]");
         return;
     }
 
@@ -2332,7 +2334,14 @@ pub fn cluster(args: &[&str], state: &mut ShellState) {
             };
             cluster_remove(state, node_id);
         }
-        _ => println!("% Unknown cluster subcommand '{}'. Use status, token, or remove.", args[0]),
+        "join" => {
+            if args.len() < 2 {
+                println!("% Usage: cluster join <user@host[:port]>");
+                return;
+            }
+            cluster_join_remote(state, args[1]);
+        }
+        _ => println!("% Unknown cluster subcommand '{}'. Use status, token, remove, or join.", args[0]),
     }
 }
 
@@ -2395,10 +2404,11 @@ fn cluster_token(state: &mut ShellState, ttl_seconds: Option<u32>) {
                 t.expires_at_unix.saturating_sub(unix_now()),
             );
             println!();
-            println!("Hand this token to the joiner along with the cluster CA cert,");
-            println!("then run on the new node:");
-            println!("  sftpflowd join <seed-addr> --token <token> \\");
-            println!("    --ca-cert-file <path-to-ca.crt> --node-id <id> --bind <addr>");
+            println!("To use it manually on the joiner:");
+            println!("  sftpflowd join <seed-addr> --token <token> --ca-cert-file <ca.crt>");
+            println!();
+            println!("Or skip the manual ceremony:");
+            println!("  cluster join <user@host[:port]>   # mint+ship+remote-launch in one shot");
         }
         Err(RpcError::Proto(e)) => println!("% {}", e.message),
         Err(e) => println!("% Error: {}", e),
@@ -2433,6 +2443,247 @@ fn cluster_remove(state: &mut ShellState, node_id: u64) {
         Err(e) => println!("% Error: {}", e),
         _ => {}
     }
+}
+
+/// `cluster join <user@host[:port]>` — drive a join end-to-end.
+///
+/// Hides the manual three-step dance:
+///   1. Mint a token here (proves we're connected to the bootstrap node).
+///   2. Fetch the cluster CA cert via the new ClusterGetCa RPC.
+///   3. Read the bootstrap node's advertise addr from cluster_status.
+///   4. SSH into <user@host[:port]>, pipe the passphrase + CA on stdin,
+///      run `sftpflowd join` over there with `nohup` so the daemon
+///      stays alive after our SSH session ends.
+///   5. Poll cluster_status until the new node appears in the
+///      membership map, or time out.
+///
+/// Preconditions on the remote host:
+///   - sftpflowd binary in PATH
+///   - writable state-dir (default /var/lib/sftpflow)
+///   - sshd accepting the operator's key
+///   - SFTPFLOW_PASSPHRASE accessible to subsequent daemon
+///     restarts (e.g. via systemd unit env or /etc/environment) —
+///     we send it inline for *this* invocation, but the remote
+///     needs a persistent source for restarts to work
+fn cluster_join_remote(state: &mut ShellState, target: &str) {
+    if !has_rpc(state) { return; }
+
+    // ---- 1. Parse user@host[:port] -----------------------------
+    let (user, host, port) = match parse_ssh_target(target) {
+        Ok(t) => t,
+        Err(msg) => { println!("% {}", msg); return; }
+    };
+
+    // ---- 2. Read passphrase from local env ---------------------
+    // Sent inline via SSH stdin so the remote daemon can unlock
+    // its sealed store on first boot. Also assumed to be set on
+    // the remote host for daemon restarts (we don't persist it
+    // there — that's the operator's job via /etc/environment,
+    // a systemd EnvironmentFile, or a secrets manager).
+    let passphrase = match std::env::var("SFTPFLOW_PASSPHRASE") {
+        Ok(p) if !p.is_empty() => p,
+        _ => {
+            match rpassword::prompt_password("Cluster passphrase (also needed on the remote host): ") {
+                Ok(p) if !p.is_empty() => p,
+                _ => { println!("% No passphrase supplied — aborting."); return; }
+            }
+        }
+    };
+
+    // ---- 3. Mint token + verify we're on the bootstrap node ----
+    let rpc = state.rpc.as_mut().unwrap();
+    let token = match rpc.call(Request::ClusterMintToken { ttl_seconds: Some(600) }) {
+        Ok(Response::ClusterToken(t)) => t.token,
+        Err(RpcError::Proto(e)) => {
+            println!("% Could not mint join token: {}", e.message);
+            println!("%   Tip: in M12 only the bootstrap node holds the token-HMAC secret.");
+            println!("%        Reconnect to it via 'config' / 'connect' first.");
+            return;
+        }
+        Err(e) => { println!("% Error minting token: {}", e); return; }
+        _ => return,
+    };
+
+    // ---- 4. Fetch CA cert + bootstrap advertise addr -----------
+    let ca_pem = match rpc.call(Request::ClusterGetCa) {
+        Ok(Response::ClusterCaCert(pem)) => pem,
+        Err(RpcError::Proto(e)) => { println!("% Could not fetch CA: {}", e.message); return; }
+        Err(e) => { println!("% Error fetching CA: {}", e); return; }
+        _ => return,
+    };
+    let seed_advertise = match rpc.call(Request::ClusterStatus) {
+        Ok(Response::ClusterStatus(s)) => {
+            match s.members.iter().find(|m| m.node_id == s.self_id) {
+                Some(m) => m.advertise_addr.clone(),
+                None    => { println!("% Could not find self in cluster status"); return; }
+            }
+        }
+        Err(RpcError::Proto(e)) => { println!("% {}", e.message); return; }
+        Err(e) => { println!("% Error: {}", e); return; }
+        _ => return,
+    };
+    let initial_member_count = match rpc.call(Request::ClusterStatus) {
+        Ok(Response::ClusterStatus(s)) => s.members.len(),
+        _ => 0, // we'll just verify "increased" rather than "+1 exactly"
+    };
+
+    info!(
+        "cluster join: target={}@{} port={} seed_advertise={}",
+        user, host, port.unwrap_or(22), seed_advertise,
+    );
+    println!("Joining {}@{} to cluster (seed = {})", user, host, seed_advertise);
+
+    // ---- 5. ssh + drive remote sftpflowd join ------------------
+    // Stdin payload, three lines:
+    //     <passphrase>\n
+    //     <CA-cert-PEM>\n
+    //     ===END-CA===\n
+    // (the marker lets the remote shell know where the CA ends)
+    if let Err(msg) = ssh_drive_remote_join(
+        user,
+        host,
+        port,
+        &passphrase,
+        &ca_pem,
+        &seed_advertise,
+        &token,
+    ) {
+        println!("% Remote join failed: {}", msg);
+        return;
+    }
+
+    // ---- 6. Poll cluster_status for the new member -------------
+    println!("Waiting for new node to appear in membership (up to 30s)...");
+    for _ in 0..30 {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let rpc = state.rpc.as_mut().unwrap();
+        if let Ok(Response::ClusterStatus(s)) = rpc.call(Request::ClusterStatus) {
+            if s.members.len() > initial_member_count {
+                println!("Joined! Cluster size is now {}.", s.members.len());
+                return;
+            }
+        }
+    }
+    println!("% Timed out after 30s. The remote join may still complete shortly —");
+    println!("%   re-run 'cluster status' to check, or look at /tmp/sftpflowd-join.log");
+    println!("%   on the remote host for diagnostics.");
+}
+
+/// Parse `user@host[:port]` into its three parts. Returns user-readable
+/// error strings on malformed input.
+fn parse_ssh_target(target: &str) -> Result<(&str, &str, Option<u16>), String> {
+    let (user, host_port) = target.split_once('@')
+        .ok_or_else(|| format!("Target must be user@host[:port], got '{}'", target))?;
+    if user.is_empty() {
+        return Err(format!("Empty user in '{}'", target));
+    }
+    // Split off optional :port from the right. IPv6 literals like
+    // user@[::1]:22 aren't supported in M12; ssh's user@host[:port]
+    // is sufficient for the common case.
+    if let Some((host, port_str)) = host_port.rsplit_once(':') {
+        let port = port_str.parse::<u16>()
+            .map_err(|_| format!("'{}' is not a valid port number", port_str))?;
+        if host.is_empty() {
+            return Err(format!("Empty host in '{}'", target));
+        }
+        Ok((user, host, Some(port)))
+    } else {
+        if host_port.is_empty() {
+            return Err(format!("Empty host in '{}'", target));
+        }
+        Ok((user, host_port, None))
+    }
+}
+
+/// Spawn ssh, pipe the join payload on stdin, wait for it to exit.
+///
+/// The remote shell runs a small heredoc-extracted script that:
+///   - reads the passphrase off stdin line 1
+///   - reads CA cert lines until a sentinel marker
+///   - writes CA to a tmp file
+///   - launches `sftpflowd join` via nohup, detaching stdio so
+///     the daemon survives our SSH session closing
+///   - waits ~1s and checks the daemon is still running before
+///     returning success, so we surface immediate errors
+fn ssh_drive_remote_join(
+    user:           &str,
+    host:           &str,
+    port:           Option<u16>,
+    passphrase:     &str,
+    ca_pem:         &str,
+    seed_advertise: &str,
+    token:          &str,
+) -> Result<(), String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let remote_script = format!(r#"
+        set -e
+        IFS= read -r SFTPFLOW_PASSPHRASE
+        export SFTPFLOW_PASSPHRASE
+        # Read CA cert lines until our sentinel.
+        CA_FILE="$(mktemp /tmp/sftpflow-join-ca.XXXXXX.crt)"
+        while IFS= read -r line; do
+            if [ "$line" = "===END-CA===" ]; then break; fi
+            printf '%s\n' "$line" >> "$CA_FILE"
+        done
+        # nohup + redirected stdio so the daemon survives ssh exit.
+        # </dev/null specifically: without it the daemon inherits the
+        # ssh session's pipes and dies on EPIPE when ssh closes.
+        LOG=/tmp/sftpflowd-join.log
+        : > "$LOG"
+        nohup sftpflowd join {seed} \
+            --token {token} \
+            --ca-cert-file "$CA_FILE" \
+            > "$LOG" 2>&1 < /dev/null &
+        DAEMON_PID=$!
+        # Give it a moment to fail fast if the args are wrong.
+        sleep 2
+        if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+            echo "sftpflowd join died early; tail of $LOG:" >&2
+            tail -20 "$LOG" >&2
+            exit 1
+        fi
+        echo "sftpflowd join running (pid=$DAEMON_PID); log at $LOG"
+    "#, seed = seed_advertise, token = token);
+
+    // Pass the script as a positional argument (not `sh -s`) so
+    // ssh keeps stdin available for the script's `read` commands;
+    // otherwise the remote shell would slurp the whole script + CA
+    // payload as one undifferentiated stream.
+    let mut cmd = Command::new("ssh");
+    if let Some(p) = port {
+        cmd.arg("-p").arg(p.to_string());
+    }
+    cmd.arg("-o").arg("BatchMode=yes");
+    cmd.arg(format!("{}@{}", user, host));
+    cmd.arg(remote_script);
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::inherit());
+    cmd.stderr(Stdio::inherit());
+
+    let mut child = cmd.spawn()
+        .map_err(|e| format!("could not spawn ssh: {}", e))?;
+    {
+        let mut stdin = child.stdin.take()
+            .ok_or_else(|| "ssh stdin not piped".to_string())?;
+        writeln!(stdin, "{}", passphrase)
+            .map_err(|e| format!("writing passphrase: {}", e))?;
+        for line in ca_pem.lines() {
+            writeln!(stdin, "{}", line)
+                .map_err(|e| format!("writing CA: {}", e))?;
+        }
+        writeln!(stdin, "===END-CA===")
+            .map_err(|e| format!("writing sentinel: {}", e))?;
+        // Drop closes stdin → remote shell sees EOF and stops reading.
+    }
+
+    let status = child.wait()
+        .map_err(|e| format!("ssh wait failed: {}", e))?;
+    if !status.success() {
+        return Err(format!("ssh exited with status {}", status.code().unwrap_or(-1)));
+    }
+    Ok(())
 }
 
 /// Seconds since the Unix epoch, saturating to 0 on clock errors.

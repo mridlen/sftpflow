@@ -118,9 +118,10 @@ message JoinRequest {
   // nonce for replay protection.
   string token = 1;
 
-  // Node ID the joining node would like to be assigned. M12 requires
-  // operator-supplied IDs; the bootstrap node rejects collisions
-  // with existing members.
+  // Node ID the joining node would like to be assigned, or 0 to let
+  // the seed pick `max(existing_node_ids) + 1`. The actual assigned
+  // ID is returned in JoinResponse.assigned_node_id; the joiner
+  // persists that, not this hint.
   uint64 desired_node_id = 2;
 
   // host:port the joining node is listening on for Raft RPCs. Other
@@ -150,4 +151,10 @@ message JoinResponse {
   // The joining node persists this in node.json and refuses to talk
   // to peers from a different cluster_id thereafter.
   string cluster_id = 4;
+
+  // Node ID the seed actually assigned to the joiner. Equals the
+  // request's `desired_node_id` when that was non-zero; otherwise
+  // it's `max(existing_node_ids) + 1`. Joiners persist this in
+  // node.json — the request hint is advisory only.
+  uint64 assigned_node_id = 5;
 }

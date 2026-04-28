@@ -180,20 +180,25 @@ struct RunArgs {
 
 #[derive(Args, Clone, Debug)]
 struct InitArgs {
-    /// This node's stable u64 ID. Must be unique across the
-    /// cluster. Operator-supplied in M12 (auto-allocation lands
-    /// in M15).
-    #[arg(long, value_name = "N")]
+    /// This node's stable u64 ID. Bootstrap is conventionally 1;
+    /// operator-supplied override mostly for testing or for
+    /// re-bootstrapping with a non-default identity.
+    #[arg(long, value_name = "N", default_value_t = 1)]
     node_id: u64,
 
-    /// host:port the Raft gRPC server binds to on this machine.
-    /// Example: 0.0.0.0:7900
-    #[arg(long, value_name = "ADDR")]
+    /// IP:port the Raft gRPC server binds to on this machine.
+    /// Defaults to `0.0.0.0:7900` — bind on all interfaces, the
+    /// standard cluster port. Override for multi-homed / NAT'd
+    /// hosts.
+    #[arg(long, value_name = "ADDR", default_value = "0.0.0.0:7900")]
     bind: String,
 
     /// host:port other cluster members will dial to reach this
-    /// node. Defaults to --bind. Differs when --bind is a
-    /// wildcard or when traversing NAT.
+    /// node. Defaults to `<hostname>:<bind-port>` — works in any
+    /// environment where peers can resolve this host's hostname
+    /// (docker compose service name, kubernetes service, internal
+    /// DNS). Override when the externally-reachable name differs
+    /// from the OS hostname (NAT, public IP, alias).
     #[arg(long, value_name = "ADDR")]
     advertise: Option<String>,
 
@@ -228,17 +233,22 @@ struct JoinArgs {
     #[arg(long, value_name = "PATH")]
     ca_cert_file: PathBuf,
 
-    /// This node's stable u64 ID. Must not collide with an
-    /// existing member of the target cluster.
+    /// Optional override for this node's u64 ID. By default the
+    /// seed assigns one (`max(existing_node_ids) + 1`) during the
+    /// join handshake and returns it in the JoinResponse. Pass
+    /// `--node-id N` only to force a specific value (e.g. to
+    /// reuse an ID after a previous failed join, or to keep
+    /// numbering aligned with infrastructure conventions).
     #[arg(long, value_name = "N")]
-    node_id: u64,
+    node_id: Option<u64>,
 
-    /// host:port the Raft gRPC server binds to on this machine.
-    #[arg(long, value_name = "ADDR")]
+    /// IP:port the Raft gRPC server binds to on this machine.
+    /// Defaults to `0.0.0.0:7900`.
+    #[arg(long, value_name = "ADDR", default_value = "0.0.0.0:7900")]
     bind: String,
 
     /// host:port other cluster members will dial to reach this
-    /// node. Defaults to --bind.
+    /// node. Defaults to `<hostname>:<bind-port>`.
     #[arg(long, value_name = "ADDR")]
     advertise: Option<String>,
 
@@ -349,7 +359,12 @@ fn cmd_init(daemon: DaemonArgs, args: InitArgs) -> Result<(), String> {
     let bind_addr: std::net::SocketAddr = args.bind.parse().map_err(|e| {
         format!("--bind '{}' must be IP:PORT (e.g. 0.0.0.0:7900): {}", args.bind, e)
     })?;
-    let advertise_addr = args.advertise.clone().unwrap_or_else(|| args.bind.clone());
+    // Default advertise = `<hostname>:<bind-port>`. Picks the OS
+    // hostname so peers in docker compose / k8s can resolve us by
+    // service name without the operator hand-coding it. Falls back
+    // to the bind address if hostname lookup fails.
+    let advertise_addr = args.advertise.clone()
+        .unwrap_or_else(|| default_advertise_for(&bind_addr));
 
     // ---- 4. Generate cluster identity + crypto ----
     let cluster_id = uuid::Uuid::new_v4().to_string();
@@ -511,21 +526,28 @@ fn cmd_join(daemon: DaemonArgs, args: JoinArgs) -> Result<(), String> {
         ));
     }
 
-    // ---- 3. Resolve bind + advertise ----
+    // ---- 3. Resolve bind + advertise + node_id hint ----
     let bind_addr: std::net::SocketAddr = args.bind.parse().map_err(|e| {
         format!("--bind '{}' must be IP:PORT (e.g. 0.0.0.0:7900): {}", args.bind, e)
     })?;
-    let advertise_addr = args.advertise.clone().unwrap_or_else(|| args.bind.clone());
+    let advertise_addr = args.advertise.clone()
+        .unwrap_or_else(|| default_advertise_for(&bind_addr));
+    // `0` is the wire-level signal to the seed to auto-allocate.
+    // The actual id we end up with comes back in the JoinResponse
+    // and is what we persist; the value used here is only the CN
+    // baked into the leaf CSR (cosmetic — mTLS authn uses the CA
+    // chain + SAN, not the CN).
+    let desired_node_id = args.node_id.unwrap_or(0);
 
     // ---- 4. Generate leaf key + CSR ----
-    let leaf = sftpflow_cluster::tls::LeafKeyPair::generate(args.node_id, &advertise_addr)
+    let leaf = sftpflow_cluster::tls::LeafKeyPair::generate(desired_node_id, &advertise_addr)
         .map_err(|e| format!("generating leaf key pair: {}", e))?;
     let csr_der = leaf.csr_der()
         .map_err(|e| format!("serializing leaf CSR: {}", e))?;
 
     info!(
-        "join: dialing seed {} as node_id={} (advertise={})",
-        args.seed, args.node_id, advertise_addr,
+        "join: dialing seed {} as desired_node_id={} (advertise={})",
+        args.seed, desired_node_id, advertise_addr,
     );
 
     // ---- 5. Tokio runtime + dial seed ----
@@ -541,11 +563,26 @@ fn cmd_join(daemon: DaemonArgs, args: JoinArgs) -> Result<(), String> {
             seed_addr:        args.seed.clone(),
             ca_cert_pem:      operator_ca_pem.clone(),
             token:            args.token.clone(),
-            desired_node_id:  args.node_id,
+            desired_node_id,
             advertise_addr:   advertise_addr.clone(),
             csr_der,
         },
     )).map_err(|e| format!("seed join handshake failed: {}", e))?;
+
+    // Honour the seed's assignment, with a sanity check: if the
+    // operator forced a specific id and the seed disagreed, that
+    // means the seed silently overrode our hint, which would be a
+    // bug in the seed handler — refuse to proceed rather than land
+    // a node.json that diverges from what was asked for.
+    let assigned_node_id = join_result.assigned_node_id;
+    if desired_node_id != 0 && assigned_node_id != desired_node_id {
+        return Err(format!(
+            "seed assigned node_id={} but operator requested {} via --node-id; \
+             refusing to proceed (this should not happen — please file a bug)",
+            assigned_node_id, desired_node_id,
+        ));
+    }
+    info!("join: seed assigned node_id={}", assigned_node_id);
 
     // ---- 6. Cross-check the seed's CA matches what we trusted ----
     // The operator handed us --ca-cert-file out of band. The seed
@@ -567,9 +604,12 @@ fn cmd_join(daemon: DaemonArgs, args: JoinArgs) -> Result<(), String> {
     );
 
     // ---- 7. Persist node.json + cluster/*.{crt,key} ----
+    // node_id we record is the seed-assigned one — that's our
+    // canonical identity going forward, regardless of what the
+    // operator hinted.
     let node = node_state::NodeJson {
         version:         node_state::NODE_JSON_VERSION,
-        node_id:         args.node_id,
+        node_id:         assigned_node_id,
         cluster_id:      join_result.cluster_id.clone(),
         advertise_addr:  advertise_addr.clone(),
         label:           args.label.clone(),
@@ -1055,6 +1095,44 @@ fn default_socket_addr() -> String {
 /// - Windows: `%APPDATA%/sftpflow/runs.db` (dev convenience)
 fn default_db_path() -> PathBuf {
     default_state_dir().join("runs.db")
+}
+
+/// Resolve the default advertise address: `<hostname>:<bind-port>`.
+///
+/// Used by `cmd_init`/`cmd_join` when `--advertise` isn't supplied.
+/// In docker compose / kubernetes deployments the OS hostname is
+/// already what peers resolve us by (the service name), so this
+/// gives a sensible default with no operator input. Falls back to
+/// the bind socket's textual form on hostname-lookup failure —
+/// works for any setup where bind happens to be a routable IP.
+fn default_advertise_for(bind: &std::net::SocketAddr) -> String {
+    match read_hostname() {
+        Some(h) => format!("{}:{}", h, bind.port()),
+        None    => bind.to_string(),
+    }
+}
+
+/// Best-effort hostname lookup for the advertise default.
+/// - Unix: prefers `/etc/hostname`, falls back to the `HOSTNAME`
+///   env var (some shells export it; containers commonly do).
+/// - Windows: reads `COMPUTERNAME`.
+/// Returns `None` if neither yields a non-empty string — caller
+/// then falls back to the bind address.
+fn read_hostname() -> Option<String> {
+    #[cfg(unix)]
+    {
+        if let Ok(s) = std::fs::read_to_string("/etc/hostname") {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+        std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty())
+    }
+    #[cfg(not(unix))]
+    {
+        std::env::var("COMPUTERNAME").ok().filter(|s| !s.is_empty())
+    }
 }
 
 /// Platform default base directory for daemon state (runs.db,

@@ -433,15 +433,24 @@ fn make_seed_join_handler(
                  hasn't run on this node yet)".to_string()
             })?.clone();
 
-            // Refuse duplicate node_id up front so the joiner sees
-            // a clean error instead of a successful cert + a silent
-            // failure in the background task.
-            if handle.members().contains_key(&req.desired_node_id) {
-                return Err(format!(
-                    "node_id {} already exists in this cluster",
-                    req.desired_node_id,
-                ));
-            }
+            // ---- Resolve assigned node_id ----
+            // `desired_node_id == 0` is the wire signal for "seed,
+            // please pick". We allocate `max(existing) + 1`. Any
+            // non-zero hint is treated as an operator override and
+            // we reject collisions as before so the joiner sees a
+            // clean error rather than a half-applied membership.
+            let existing: BTreeSet<u64> = handle.members().keys().copied().collect();
+            let assigned_node_id = if req.desired_node_id == 0 {
+                existing.iter().copied().max().unwrap_or(0) + 1
+            } else {
+                if existing.contains(&req.desired_node_id) {
+                    return Err(format!(
+                        "node_id {} already exists in this cluster",
+                        req.desired_node_id,
+                    ));
+                }
+                req.desired_node_id
+            };
 
             let leaf_pem = ca.sign_csr(&req.csr_der)
                 .map_err(|e| format!("signing joiner CSR: {}", e))?;
@@ -455,26 +464,25 @@ fn make_seed_join_handler(
                 added_at_unix:  node_state::now_unix(),
                 label:          None, // M13: pull label from token claims
             };
-            let desired_node_id = req.desired_node_id;
             let advertise_addr  = req.advertise_addr.clone();
             tokio::spawn(async move {
                 let _guard = join_serializer.lock().await;
                 info!(
                     "join: adding node_id={} advertise={} as learner",
-                    desired_node_id, advertise_addr,
+                    assigned_node_id, advertise_addr,
                 );
-                if let Err(e) = handle.add_learner(desired_node_id, member).await {
-                    warn!("join: add_learner({}) failed: {}", desired_node_id, e);
+                if let Err(e) = handle.add_learner(assigned_node_id, member).await {
+                    warn!("join: add_learner({}) failed: {}", assigned_node_id, e);
                     return;
                 }
                 let mut voters: BTreeSet<u64> =
                     handle.members().keys().copied().collect();
-                voters.insert(desired_node_id);
+                voters.insert(assigned_node_id);
                 info!("join: promoting voter set to {:?}", voters);
                 if let Err(e) = handle.change_membership(voters).await {
                     warn!(
                         "join: change_membership for node_id={} failed: {}",
-                        desired_node_id, e,
+                        assigned_node_id, e,
                     );
                 }
             });
@@ -486,6 +494,7 @@ fn make_seed_join_handler(
                 signed_leaf_cert_pem: leaf_pem.into_bytes(),
                 membership_json:      Vec::new(),
                 cluster_id:           cluster_id.clone(),
+                assigned_node_id,
             })
         })
     })

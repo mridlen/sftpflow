@@ -191,6 +191,13 @@ phase1_init_node1() {
     # the life of this test script, holding the daemon's stdio
     # pipe open, and we get logs straight to the host filesystem.
     : > "${logf}"
+    # All host/port/id flags use the daemon's M12-PR-C defaults:
+    # node_id=1 (bootstrap convention), bind=0.0.0.0:7900, advertise
+    # = `<hostname>:7900` (the container's hostname is the service
+    # name from compose.cluster.yml). --label is operator-supplied
+    # cosmetic. --socket points at the unix socket the SSH bridge
+    # consumes, which is wholly determined by docker layout, so we
+    # keep it explicit.
     docker exec \
         -e SFTPFLOW_PASSPHRASE=cluster-test-passphrase \
         "${CONTAINERS[0]}" \
@@ -199,9 +206,6 @@ phase1_init_node1() {
             export RUST_LOG=info
             cd /var/lib/sftpflow
             exec sftpflowd init \
-                --node-id 1 \
-                --bind 0.0.0.0:${RAFT_PORT} \
-                --advertise ${HOSTNAMES[0]}:${RAFT_PORT} \
                 --label bootstrap \
                 --socket unix:/run/sftpflow/sftpflow.sock
         " >"${logf}" 2>&1 </dev/null &
@@ -288,6 +292,12 @@ phase1_join_node() {
     step "running 'sftpflowd join' on ${container} (host-side bg, log -> ${logf})"
     # Same host-side-background pattern as phase1_init_node1.
     : > "${logf}"
+    # --bind / --advertise omitted: daemon defaults to 0.0.0.0:7900
+    # and `<hostname>:7900` respectively. --node-id omitted so the
+    # seed auto-allocates (UX roadmap Commit B); `node_id` here is
+    # only used for the cosmetic --label and as the value the
+    # seed-side polling loop expects to see in the membership map.
+    : "${hostname}"
     docker exec \
         -e SFTPFLOW_PASSPHRASE=cluster-test-passphrase \
         "${container}" \
@@ -298,9 +308,6 @@ phase1_join_node() {
             exec sftpflowd join ${HOSTNAMES[0]}:${RAFT_PORT} \
                 --token ${token} \
                 --ca-cert-file /etc/sftpflow/ca.crt \
-                --node-id ${node_id} \
-                --bind 0.0.0.0:${RAFT_PORT} \
-                --advertise ${hostname}:${RAFT_PORT} \
                 --label joiner-${node_id} \
                 --socket unix:/run/sftpflow/sftpflow.sock
         " >"${logf}" 2>&1 </dev/null &

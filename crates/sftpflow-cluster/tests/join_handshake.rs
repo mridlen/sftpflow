@@ -121,6 +121,7 @@ fn make_test_join_handler(
                 signed_leaf_cert_pem: leaf_pem.into_bytes(),
                 membership_json:      Vec::new(),
                 cluster_id,
+                assigned_node_id:     desired_node_id,
             })
         })
     })

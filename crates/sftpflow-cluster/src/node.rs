@@ -371,6 +371,12 @@ pub struct SeedJoinResult {
     pub signed_leaf_cert_pem: String,
     pub membership_json:      Vec<u8>,
     pub cluster_id:           String,
+    /// Node ID the seed actually allocated to this joiner. Equals
+    /// the request's `desired_node_id` when that was non-zero;
+    /// otherwise it's the seed's `max(existing) + 1`. The joiner
+    /// must persist this in node.json — the operator-supplied hint
+    /// is advisory and may differ.
+    pub assigned_node_id:     u64,
 }
 
 pub async fn dial_seed_join(args: SeedJoinArgs) -> Result<SeedJoinResult, ClusterError> {
@@ -409,5 +415,6 @@ pub async fn dial_seed_join(args: SeedJoinArgs) -> Result<SeedJoinResult, Cluste
             .map_err(|e| ClusterError::Other(format!("leaf cert utf8: {}", e)))?,
         membership_json:      r.membership_json,
         cluster_id:           r.cluster_id,
+        assigned_node_id:     r.assigned_node_id,
     })
 }

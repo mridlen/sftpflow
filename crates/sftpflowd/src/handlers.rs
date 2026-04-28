@@ -736,6 +736,44 @@ pub fn cluster_mint_token(
     Ok(Response::ClusterToken(ClusterToken { token, expires_at_unix }))
 }
 
+/// `cluster_get_ca`: serve this node's copy of `cluster/ca.crt`.
+/// Read-only, no leader gate — every cluster member persists the
+/// CA, and it's public material anyway. Used by the CLI's
+/// `cluster join` command to ship the CA to a new host through
+/// the existing SSH bridge instead of an out-of-band scp.
+pub fn cluster_get_ca(state: &DaemonState) -> Result<Response, ProtoError> {
+    let _ctx = require_cluster(state)?;
+
+    // The state_dir layout is fixed by node_state::ca_cert_path.
+    // We don't have a direct reference to state_dir from the handler
+    // (DaemonState doesn't carry it; main.rs resolves it once at
+    // startup). For now use the default location, which matches
+    // every code path that constructs DaemonState in cluster mode.
+    // M13 will plumb state_dir through DaemonState explicitly.
+    let state_dir = default_state_dir();
+    let pem = std::fs::read_to_string(crate::node_state::ca_cert_path(&state_dir))
+        .map_err(|e| ProtoError {
+            code: error_code::CONFIG_ERROR,
+            message: format!("could not read cluster CA cert: {}", e),
+        })?;
+    Ok(Response::ClusterCaCert(pem))
+}
+
+/// Platform default state-dir, mirroring main.rs::default_state_dir.
+/// Local copy here so handlers.rs doesn't need a reference back
+/// into main.rs (which would create a cycle). Identical layout.
+fn default_state_dir() -> std::path::PathBuf {
+    #[cfg(unix)]
+    {
+        std::path::PathBuf::from("/var/lib/sftpflow")
+    }
+    #[cfg(not(unix))]
+    {
+        let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
+        std::path::PathBuf::from(base).join("sftpflow")
+    }
+}
+
 /// `cluster remove <node_id>`: drop a node from the voter set.
 /// Leader-only — the gate in dispatch ensures we only get here on
 /// the leader, and the underlying `change_membership` would itself

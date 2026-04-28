@@ -84,6 +84,11 @@ pub enum Request {
     /// Remove a node from the cluster's voter set. Leader-only.
     /// The CLI must double-confirm before sending.
     ClusterRemoveNode { node_id: u64 },
+    /// Fetch this node's copy of the cluster CA certificate (PEM).
+    /// Read-only; any cluster member can serve it. Used by the
+    /// CLI's `cluster join` command to ship the CA to a new host
+    /// without an out-of-band scp.
+    ClusterGetCa,
 }
 
 // ============================================================
@@ -129,6 +134,8 @@ pub enum Response {
     /// Reply to ClusterMintToken. Wraps the opaque token string
     /// so the CLI can surface its expiry alongside it.
     ClusterToken(ClusterToken),
+    /// Reply to ClusterGetCa. PEM-encoded cluster CA cert.
+    ClusterCaCert(String),
 }
 
 /// Server identity and version, returned by GetServerInfo.

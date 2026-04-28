@@ -414,6 +414,15 @@ fn dispatch(env: RequestEnvelope, state: &Arc<Mutex<DaemonState>>) -> ResponseEn
             if let Some(rsp) = enforce_leader(id, &guard) { return rsp; }
             result_to_envelope(id, handlers::cluster_remove_node(&guard, node_id))
         }
+
+        // ---- cluster (read CA cert) ----
+        // Read-only: any cluster member serves the same CA cert
+        // (it's the trust anchor every node persisted at init/join
+        // time). Public material; no leader gate.
+        Request::ClusterGetCa => {
+            let guard = state.lock().unwrap();
+            result_to_envelope(id, handlers::cluster_get_ca(&guard))
+        }
     }
 }
 
