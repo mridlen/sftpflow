@@ -847,16 +847,18 @@ pub fn cluster_remove_node(
     let ctx = require_cluster(state)?;
 
     // Refuse to remove the responding node — there's no point in a
-    // node voting itself out, and the operator almost certainly
-    // meant a different ID. M13 will allow it once `cluster leave`
-    // is wired (which gracefully steps down first).
+    // node voting itself out via this RPC, and the operator almost
+    // certainly meant a different ID. The intentional self-removal
+    // path is `cluster leave`, which lands on the leaver itself
+    // (not the leader) and drives the membership change with
+    // explicit confirmation.
     if node_id == ctx.self_id {
         return Err(ProtoError {
             code: error_code::CONFIG_ERROR,
             message: format!(
                 "refusing to remove the responding node (node_id={}) from the voter set; \
-                 use `cluster leave` (M13+) to drain this node, or run `cluster remove` \
-                 against a different node",
+                 use `cluster leave` to drain this node, or run `cluster remove` against a \
+                 different node",
                 node_id,
             ),
         });
@@ -869,4 +871,121 @@ pub fn cluster_remove_node(
     })?;
     info!("cluster_remove_node: node_id={} removed", node_id);
     Ok(Response::Ok)
+}
+
+// ============================================================
+// cluster_leave - graceful self-removal
+// ============================================================
+//
+// The receiving node steps itself out of the cluster.
+//
+//   - Leader path: call `change_membership(voters - self_id)`
+//     directly. openraft commits the new config under the current
+//     term, then this node steps down. The CLI sees Response::Ok
+//     once the membership change has committed.
+//
+//   - Follower / learner path: synthesize a
+//     `ClusterRemoveNode { node_id: self_id }` envelope and forward
+//     it to the current leader over the existing peer-mTLS
+//     transport (the same `forward_envelope_to_peer` used by
+//     server::forward_if_follower). The leader's
+//     `cluster_remove_node` handler accepts it because
+//     leader.self_id != leaver_id, and runs the same
+//     `remove_node_blocking` it always does.
+//
+// We deliberately do NOT route this through dispatch's auto-forward
+// hook — that would ship the ClusterLeave envelope to the leader,
+// where it would read the leader's self_id and try to remove the
+// wrong node. The leaver must be the one that handles ClusterLeave.
+
+pub fn cluster_leave(state: &DaemonState) -> Result<Response, ProtoError> {
+    let ctx = require_cluster(state)?;
+    let self_id = ctx.self_id;
+
+    if ctx.is_leader() {
+        info!(
+            "cluster_leave: this node (node_id={}) is the leader; \
+             stepping down via change_membership",
+            self_id,
+        );
+        ctx.leader_self_remove_blocking().map_err(|msg| ProtoError {
+            code: error_code::CONFIG_ERROR,
+            message: msg,
+        })?;
+        info!(
+            "cluster_leave: node_id={} removed from voter set; \
+             leader has stepped down",
+            self_id,
+        );
+        return Ok(Response::Ok);
+    }
+
+    // ---- Follower / learner path: forward to current leader ----
+    let leader_id = ctx.current_leader().ok_or_else(|| ProtoError {
+        code: error_code::NOT_LEADER,
+        message: "no current leader is known (election in progress or quorum unavailable); \
+                  retry `cluster leave` shortly".to_string(),
+    })?;
+    let leader_addr = ctx.members().get(&leader_id).map(|m| m.advertise_addr.clone())
+        .ok_or_else(|| ProtoError {
+            code: error_code::INTERNAL_ERROR,
+            message: format!("leader node_id={} has no advertise address in membership map", leader_id),
+        })?;
+
+    info!(
+        "cluster_leave: this node (node_id={}) is a follower/learner; \
+         forwarding ClusterRemoveNode to leader node_id={} at {}",
+        self_id, leader_id, leader_addr,
+    );
+
+    // Build the envelope. The id is local — the leader's response
+    // id is correlated against this id (we discard it; only the
+    // outcome matters).
+    let envelope = sftpflow_proto::RequestEnvelope {
+        id: 0,
+        request: sftpflow_proto::Request::ClusterRemoveNode { node_id: self_id },
+    };
+    let envelope_bytes = serde_json::to_vec(&envelope).map_err(|e| ProtoError {
+        code: error_code::INTERNAL_ERROR,
+        message: format!("could not serialize ClusterRemoveNode envelope: {}", e),
+    })?;
+
+    let leaf_cert = ctx.leaf_cert_pem.clone();
+    let leaf_key  = ctx.leaf_key_pem.clone();
+    let ca_cert   = ctx.ca_cert_pem.clone();
+    let runtime   = ctx.runtime.clone();
+    let response_bytes = runtime.block_on(async move {
+        sftpflow_cluster::transport::forward_envelope_to_peer(
+            &leader_addr,
+            &leaf_cert,
+            &leaf_key,
+            &ca_cert,
+            envelope_bytes,
+        ).await
+    }).map_err(|e| ProtoError {
+        code: error_code::NOT_LEADER,
+        message: format!(
+            "failed to forward ClusterRemoveNode for self (node_id={}) to leader (node_id={}): {}",
+            self_id, leader_id, e,
+        ),
+    })?;
+
+    // Unwrap the leader's reply. Surface its error verbatim so the
+    // operator sees exactly why the leader refused (e.g. quorum
+    // would be lost, no such member, etc.).
+    let response: sftpflow_proto::ResponseEnvelope = serde_json::from_slice(&response_bytes)
+        .map_err(|e| ProtoError {
+            code: error_code::INTERNAL_ERROR,
+            message: format!("malformed response envelope from leader: {}", e),
+        })?;
+    match response.outcome {
+        sftpflow_proto::ResponseOutcome::Success { result } => {
+            info!(
+                "cluster_leave: leader confirmed removal of node_id={}",
+                self_id,
+            );
+            Ok(result)
+        }
+        sftpflow_proto::ResponseOutcome::Failure { error } => Err(error),
+    }
 }

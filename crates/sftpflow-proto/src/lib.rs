@@ -84,6 +84,13 @@ pub enum Request {
     /// Remove a node from the cluster's voter set. Leader-only.
     /// The CLI must double-confirm before sending.
     ClusterRemoveNode { node_id: u64 },
+    /// Self-removal: the receiving node steps itself out of the
+    /// cluster. Sent to the node the operator wants to leave (not
+    /// to the leader) — the leaver decides whether to call
+    /// `change_membership` locally (if it is the leader) or to
+    /// forward a `ClusterRemoveNode` for its own id to the current
+    /// leader. The CLI double-confirms before sending.
+    ClusterLeave,
     /// Fetch this node's copy of the cluster CA certificate (PEM).
     /// Read-only; any cluster member can serve it. Used by the
     /// CLI's `cluster join` command to ship the CA to a new host

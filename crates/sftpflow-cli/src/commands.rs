@@ -60,7 +60,8 @@ pub fn help_exec() {
     println!("                               ssh-drive sftpflowd init on a fresh host");
     println!("  cluster join <user@host[:port]>");
     println!("                               Mint+ship a token, then ssh-drive sftpflowd join");
-    println!("  cluster remove <node-id>     Remove a node from the voter set");
+    println!("  cluster remove <node-id>     Remove a different node from the voter set");
+    println!("  cluster leave                Step the connected node out of the cluster");
     println!();
     println!("  run feed <name>              Manually run a feed (outside of schedule)");
     println!("  sync schedules               Reconcile feed schedules with dkron");
@@ -2548,10 +2549,10 @@ pub fn set_key_contents_ref(args: &[&str], state: &mut ShellState) {
 //   - remove <node-id>  Drop a node from the voter set; the CLI
 //                       double-confirms before sending.
 
-/// Route 'cluster status|token|remove|join ...' in exec mode.
+/// Route 'cluster status|token|remove|leave|join|bootstrap ...' in exec mode.
 pub fn cluster(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
-        println!("% Usage: cluster <status|token|remove|join|bootstrap> [args]");
+        println!("% Usage: cluster <status|token|remove|leave|join|bootstrap> [args]");
         return;
     }
 
@@ -2587,6 +2588,7 @@ pub fn cluster(args: &[&str], state: &mut ShellState) {
             };
             cluster_remove(state, node_id);
         }
+        "leave" => cluster_leave(state),
         "join" => {
             if args.len() < 2 {
                 println!("% Usage: cluster join <user@host[:port]>");
@@ -2601,7 +2603,7 @@ pub fn cluster(args: &[&str], state: &mut ShellState) {
             }
             cluster_bootstrap_remote(args[1]);
         }
-        _ => println!("% Unknown cluster subcommand '{}'. Use status, token, remove, join, or bootstrap.", args[0]),
+        _ => println!("% Unknown cluster subcommand '{}'. Use status, token, remove, leave, join, or bootstrap.", args[0]),
     }
 }
 
@@ -2731,6 +2733,70 @@ fn cluster_token(state: &mut ShellState, ttl_seconds: Option<u32>) {
             println!();
             println!("Or skip the manual ceremony:");
             println!("  cluster join <user@host[:port]>   # mint+ship+remote-launch in one shot");
+        }
+        Err(RpcError::Proto(e)) => println!("% {}", e.message),
+        Err(e) => println!("% Error: {}", e),
+        _ => {}
+    }
+}
+
+/// `cluster leave` — graceful self-removal of the connected node.
+///
+/// Fetches `cluster status` first so the confirm prompt can name
+/// the node by id + label (operators connect by hostname; they
+/// rarely remember the node_id off the top of their head). Then
+/// double-confirms and sends `ClusterLeave`.
+///
+/// The leaver's daemon decides the path: leader steps down via
+/// change_membership directly; follower/learner forwards a
+/// ClusterRemoveNode-for-self to the current leader. Either way
+/// the CLI just sees Response::Ok.
+fn cluster_leave(state: &mut ShellState) {
+    if !has_rpc(state) { return; }
+
+    // Look up the connected node's id + label so the confirm
+    // prompt is unambiguous. If the status call fails we still
+    // let the operator proceed against whatever they're connected
+    // to, with the id field shown as "?".
+    let rpc = state.rpc.as_mut().unwrap();
+    let (self_id_str, label_hint) = match rpc.call(Request::ClusterStatus) {
+        Ok(Response::ClusterStatus(s)) => {
+            let label = s.members.iter()
+                .find(|m| m.node_id == s.self_id)
+                .and_then(|m| m.label.clone())
+                .unwrap_or_else(|| "-".to_string());
+            (s.self_id.to_string(), label)
+        }
+        _ => ("?".to_string(), "-".to_string()),
+    };
+
+    println!(
+        "Step the connected node out of the cluster?",
+    );
+    println!("  node_id={}  label={}", self_id_str, label_hint);
+    println!(
+        "If this node is the leader it will step down first; \
+         otherwise it forwards the removal to the current leader.",
+    );
+    println!("This is irreversible. Type the node id again to confirm:");
+
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() {
+        println!("% Could not read confirmation — aborting.");
+        return;
+    }
+    let typed = input.trim();
+    if typed != self_id_str {
+        println!("% Confirmation did not match — aborting.");
+        return;
+    }
+
+    let rpc = state.rpc.as_mut().unwrap();
+    match rpc.call(Request::ClusterLeave) {
+        Ok(Response::Ok) => {
+            info!("cluster leave: node_id={} removed", self_id_str);
+            println!("Node {} has left the cluster.", self_id_str);
+            println!("(daemon is still running — re-join with `cluster join` or stop it manually)");
         }
         Err(RpcError::Proto(e)) => println!("% {}", e.message),
         Err(e) => println!("% Error: {}", e),

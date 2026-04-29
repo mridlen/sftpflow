@@ -156,6 +156,43 @@ impl ClusterContext {
                 .map_err(|e| format!("change_membership: {}", e))
         })
     }
+
+    /// Leader-only self-removal. Drives `change_membership` with
+    /// `current_voters - {self_id}`. openraft commits the new
+    /// config under the current term and then steps this node down,
+    /// so the call returns `Ok` once the cluster has agreed on the
+    /// reduced voter set.
+    ///
+    /// Refuses if this node is the only voter — that would leave
+    /// the cluster without a quorum (use `cluster bootstrap` on a
+    /// fresh host instead of leaving the last voter).
+    ///
+    /// Caller-side preconditions:
+    ///   - `is_leader()` is true (otherwise call the follower-side
+    ///     `forward_self_remove_to_leader` path instead).
+    pub fn leader_self_remove_blocking(&self) -> Result<(), String> {
+        let current = self.handle.members_with_voter_flag();
+        let new_voters: BTreeSet<u64> = current
+            .iter()
+            .filter(|(id, (_, is_voter))| **id != self.self_id && *is_voter)
+            .map(|(id, _)| *id)
+            .collect();
+        if new_voters.is_empty() {
+            return Err(format!(
+                "this node (node_id={}) is the only voter; \
+                 leaving would destroy the cluster",
+                self.self_id,
+            ));
+        }
+
+        let handle = self.handle.clone();
+        self.runtime.block_on(async move {
+            handle
+                .change_membership(new_voters)
+                .await
+                .map_err(|e| format!("change_membership: {}", e))
+        })
+    }
 }
 
 // ============================================================

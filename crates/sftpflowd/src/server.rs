@@ -454,6 +454,18 @@ pub fn dispatch_local(env: RequestEnvelope, state: &SharedDaemonState) -> Respon
             result_to_envelope(id, handlers::cluster_remove_node(&guard, node_id))
         }
 
+        // ---- cluster (self-leave) ----
+        // Intentionally NOT leader-gated and NOT in `is_mutating()`:
+        // the receiver IS the leaver, and it picks the right path
+        // internally (direct change_membership if leader, otherwise
+        // forward a ClusterRemoveNode for its own id to the current
+        // leader). Auto-forwarding ClusterLeave would land on the
+        // leader, which would then try to remove itself by mistake.
+        Request::ClusterLeave => {
+            let guard = state.lock().unwrap();
+            result_to_envelope(id, handlers::cluster_leave(&guard))
+        }
+
         // ---- cluster (read CA cert) ----
         // Read-only: any cluster member serves the same CA cert
         // (it's the trust anchor every node persisted at init/join
@@ -685,6 +697,7 @@ fn method_name(req: &Request) -> &'static str {
         Request::ClusterStatus              => "cluster_status",
         Request::ClusterMintToken { .. }    => "cluster_mint_token",
         Request::ClusterRemoveNode { .. }   => "cluster_remove_node",
+        Request::ClusterLeave               => "cluster_leave",
         Request::ClusterGetCa               => "cluster_get_ca",
     }
 }
