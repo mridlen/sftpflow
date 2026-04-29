@@ -247,20 +247,32 @@ fn list_feed_names(rpc: &mut RpcClient) -> Vec<String> {
 /// Decide whether a just-typed command line might have changed
 /// the registry. We err on the side of "yes" when the first token
 /// matches a mutating verb — false positives just cost one extra
-/// list round-trip on the next prompt.
+/// list round-trip on the next prompt. `--dry-run` / `-n` anywhere
+/// on the line means the daemon didn't actually write, so the
+/// cache stays valid.
 fn dispatch_invalidates_names(line: &str, mode: &Mode) -> bool {
-    let first = line.split_whitespace().next().unwrap_or("");
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    let first = tokens.first().copied().unwrap_or("");
+    let is_dry_run = tokens.iter().any(|t| *t == "--dry-run" || *t == "-n");
+
     match mode {
-        Mode::Exec => matches!(
-            first,
-            "create"
-            | "edit"
-            | "delete"
-            | "rename"
-            | "secret"
-            | "connection"
-            | "connect"
-        ),
+        Mode::Exec => {
+            if is_dry_run {
+                // Previewed delete/rename/secret-delete/cluster-remove —
+                // no daemon-side write, no cache invalidation.
+                return false;
+            }
+            matches!(
+                first,
+                "create"
+                | "edit"
+                | "delete"
+                | "rename"
+                | "secret"
+                | "connection"
+                | "connect"
+            )
+        }
         // `commit` in any edit mode persists a new/updated object,
         // which can change the endpoint/key/feed name list. Other
         // edit-mode commands only mutate pending state.

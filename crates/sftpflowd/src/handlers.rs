@@ -29,6 +29,7 @@ use sftpflow_proto::{
     ClusterMemberInfo,
     ClusterStatus,
     ClusterToken,
+    DryRunReport,
     FeedSummary,
     ProtoError,
     Response,
@@ -970,6 +971,7 @@ pub fn cluster_leave(state: &DaemonState) -> Result<Response, ProtoError> {
     let envelope = sftpflow_proto::RequestEnvelope {
         id: 0,
         caller: None,
+        dry_run: false,
         request: sftpflow_proto::Request::ClusterRemoveNode { node_id: self_id },
     };
     let envelope_bytes = serde_json::to_vec(&envelope).map_err(|e| ProtoError {
@@ -1074,4 +1076,684 @@ pub fn cluster_backup(
         cluster_id:     report.cluster_id,
         node_id:        report.node_id,
     }))
+}
+
+// ============================================================
+// Dry-run handlers
+// ============================================================
+//
+// Each `*_dry_run` mirrors the precondition checks of its real
+// counterpart (so the operator sees the same NOT_FOUND /
+// ALREADY_EXISTS / CONFIG_ERROR they'd hit on a live run) but never
+// calls `save()` and never invokes the dkron client. The work each
+// one does is the cross-reference sweep that is normally a side
+// effect of the rename / delete — surfaced upfront as a
+// `DryRunReport` the CLI renders before asking for confirmation.
+//
+// The dispatch hook in server.rs::dispatch_local routes here when
+// the envelope's `dry_run` flag is set; the audit row records the
+// outcome with a `dry-run:` prefix so live mutations and previews
+// are trivially filterable.
+
+// ---- endpoints ----
+
+/// Preview `delete endpoint <name>`. Lists every feed whose source
+/// or destination would lose its referenced endpoint after deletion.
+pub fn delete_endpoint_dry_run(
+    state: &DaemonState,
+    name:  &str,
+) -> Result<Response, ProtoError> {
+    if !state.config.endpoints.contains_key(name) {
+        return Err(not_found("endpoint", name));
+    }
+
+    let mut effects  = vec![format!("would remove endpoint '{}' from registry", name)];
+    let mut warnings = Vec::new();
+
+    let referencing = feeds_referencing_endpoint(&state.config, name);
+    if referencing.is_empty() {
+        effects.push("no feeds reference this endpoint".to_string());
+    } else {
+        warnings.push(format!(
+            "{} feed(s) reference endpoint '{}' — they will fail at run time after deletion: {}",
+            referencing.len(), name, referencing.join(", "),
+        ));
+    }
+
+    Ok(Response::DryRunReport(DryRunReport {
+        summary: format!("would delete endpoint '{}'", name),
+        effects,
+        warnings,
+    }))
+}
+
+/// Preview `delete key <name>`. Surfaces the encrypt/decrypt process
+/// steps that would be left dangling.
+pub fn delete_key_dry_run(
+    state: &DaemonState,
+    name:  &str,
+) -> Result<Response, ProtoError> {
+    if !state.config.keys.contains_key(name) {
+        return Err(not_found("key", name));
+    }
+
+    let mut effects  = vec![format!("would remove PGP key '{}' from registry", name)];
+    let mut warnings = Vec::new();
+
+    let referencing = feeds_referencing_key(&state.config, name);
+    if referencing.is_empty() {
+        effects.push("no feeds reference this key".to_string());
+    } else {
+        warnings.push(format!(
+            "{} feed(s) reference key '{}' in process steps — those steps will fail after deletion: {}",
+            referencing.len(), name, referencing.join(", "),
+        ));
+    }
+
+    Ok(Response::DryRunReport(DryRunReport {
+        summary: format!("would delete PGP key '{}'", name),
+        effects,
+        warnings,
+    }))
+}
+
+/// Preview `delete feed <name>`. Lists nextstep references in other
+/// feeds that would be left dangling, and notes dkron cleanup.
+pub fn delete_feed_dry_run(
+    state: &DaemonState,
+    name:  &str,
+) -> Result<Response, ProtoError> {
+    if !state.config.feeds.contains_key(name) {
+        return Err(not_found("feed", name));
+    }
+
+    let mut effects  = vec![format!("would remove feed '{}' from registry", name)];
+    let mut warnings = Vec::new();
+
+    if state.dkron_url.is_some() {
+        effects.push(format!("would delete dkron job(s) scheduled for feed '{}'", name));
+    }
+
+    let referencing = feeds_with_nextstep_run(&state.config, name);
+    if referencing.is_empty() {
+        effects.push("no feeds reference this feed via nextstep".to_string());
+    } else {
+        warnings.push(format!(
+            "{} feed(s) have a nextstep `run feed '{}'` — they will fail after deletion: {}",
+            referencing.len(), name, referencing.join(", "),
+        ));
+    }
+
+    Ok(Response::DryRunReport(DryRunReport {
+        summary: format!("would delete feed '{}'", name),
+        effects,
+        warnings,
+    }))
+}
+
+/// Preview `rename endpoint <from> <to>`. Counts source/destination
+/// rewrites and lists the feeds that would change.
+pub fn rename_endpoint_dry_run(
+    state: &DaemonState,
+    from:  &str,
+    to:    &str,
+) -> Result<Response, ProtoError> {
+    if !state.config.endpoints.contains_key(from) {
+        return Err(not_found("endpoint", from));
+    }
+    if state.config.endpoints.contains_key(to) {
+        return Err(already_exists("endpoint", to));
+    }
+
+    let referencing = feeds_referencing_endpoint(&state.config, from);
+    let mut effects = vec![format!("would rename endpoint '{}' → '{}'", from, to)];
+    if referencing.is_empty() {
+        effects.push("no feed source/destination paths to update".to_string());
+    } else {
+        effects.push(format!(
+            "would update source/destination paths in {} feed(s): {}",
+            referencing.len(), referencing.join(", "),
+        ));
+    }
+
+    Ok(Response::DryRunReport(DryRunReport {
+        summary: format!("would rename endpoint '{}' → '{}'", from, to),
+        effects,
+        warnings: Vec::new(),
+    }))
+}
+
+/// Preview `rename key <from> <to>`. Same shape as endpoint rename;
+/// the sweep targets `process` steps instead of feed paths.
+pub fn rename_key_dry_run(
+    state: &DaemonState,
+    from:  &str,
+    to:    &str,
+) -> Result<Response, ProtoError> {
+    if !state.config.keys.contains_key(from) {
+        return Err(not_found("key", from));
+    }
+    if state.config.keys.contains_key(to) {
+        return Err(already_exists("key", to));
+    }
+
+    let referencing = feeds_referencing_key(&state.config, from);
+    let mut effects = vec![format!("would rename PGP key '{}' → '{}'", from, to)];
+    if referencing.is_empty() {
+        effects.push("no process steps to update".to_string());
+    } else {
+        effects.push(format!(
+            "would update encrypt/decrypt steps in {} feed(s): {}",
+            referencing.len(), referencing.join(", "),
+        ));
+    }
+
+    Ok(Response::DryRunReport(DryRunReport {
+        summary: format!("would rename PGP key '{}' → '{}'", from, to),
+        effects,
+        warnings: Vec::new(),
+    }))
+}
+
+/// Preview `rename feed <from> <to>`. Counts nextstep `run feed`
+/// targets that would be rewritten.
+pub fn rename_feed_dry_run(
+    state: &DaemonState,
+    from:  &str,
+    to:    &str,
+) -> Result<Response, ProtoError> {
+    if !state.config.feeds.contains_key(from) {
+        return Err(not_found("feed", from));
+    }
+    if state.config.feeds.contains_key(to) {
+        return Err(already_exists("feed", to));
+    }
+
+    let referencing = feeds_with_nextstep_run(&state.config, from);
+    let mut effects = vec![format!("would rename feed '{}' → '{}'", from, to)];
+    if state.dkron_url.is_some() {
+        effects.push(format!(
+            "would delete dkron job(s) for old name '{}' and re-create them for '{}'",
+            from, to,
+        ));
+    }
+    if referencing.is_empty() {
+        effects.push("no nextstep references to update".to_string());
+    } else {
+        effects.push(format!(
+            "would update `run feed` nextstep targets in {} feed(s): {}",
+            referencing.len(), referencing.join(", "),
+        ));
+    }
+
+    Ok(Response::DryRunReport(DryRunReport {
+        summary: format!("would rename feed '{}' → '{}'", from, to),
+        effects,
+        warnings: Vec::new(),
+    }))
+}
+
+/// Preview `secret delete <name>`. Lists every endpoint /
+/// PGP key in the *config* that would have a dangling `*_ref`
+/// after deletion. The secret value itself is never inspected
+/// (and never sent to the CLI).
+pub fn delete_secret_dry_run(
+    state: &DaemonState,
+    name:  &str,
+) -> Result<Response, ProtoError> {
+    let store = require_secrets(state)?;
+    let exists = store.names().iter().any(|n| n == name);
+
+    let mut effects  = Vec::new();
+    let mut warnings = Vec::new();
+
+    if exists {
+        effects.push(format!("would remove sealed secret '{}'", name));
+    } else {
+        // delete_secret is idempotent in the live path, so still
+        // succeed — but the operator should know they're previewing
+        // a no-op so they don't think it actually did something.
+        effects.push(format!(
+            "secret '{}' is not in the sealed store — delete is a no-op (idempotent)",
+            name,
+        ));
+    }
+
+    let mut referrers = Vec::new();
+    for (ep_name, ep) in state.config.endpoints.iter() {
+        if ep.password_ref.as_deref() == Some(name) {
+            referrers.push(format!("endpoint '{}' password_ref", ep_name));
+        }
+        if ep.ssh_key_ref.as_deref() == Some(name) {
+            referrers.push(format!("endpoint '{}' ssh_key_ref", ep_name));
+        }
+    }
+    for (key_name, key) in state.config.keys.iter() {
+        if key.contents_ref.as_deref() == Some(name) {
+            referrers.push(format!("PGP key '{}' contents_ref", key_name));
+        }
+    }
+    if referrers.is_empty() {
+        effects.push("no config objects reference this secret".to_string());
+    } else {
+        warnings.push(format!(
+            "{} config object(s) reference secret '{}' — feeds using them will fail at run time: {}",
+            referrers.len(), name, referrers.join(", "),
+        ));
+    }
+
+    Ok(Response::DryRunReport(DryRunReport {
+        summary: format!("would delete sealed secret '{}'", name),
+        effects,
+        warnings,
+    }))
+}
+
+/// Preview `cluster remove <node_id>`. Computes the would-be voter
+/// set, prints it next to the current set, and warns when quorum
+/// shrinks or the call would be rejected outright (last voter,
+/// self-removal, unknown node).
+pub fn cluster_remove_node_dry_run(
+    state:   &DaemonState,
+    node_id: u64,
+) -> Result<Response, ProtoError> {
+    let ctx = require_cluster(state)?;
+
+    if node_id == ctx.self_id {
+        return Err(ProtoError {
+            code: error_code::CONFIG_ERROR,
+            message: format!(
+                "refusing to preview removal of the responding node (node_id={}); \
+                 use `cluster leave --dry-run` to preview self-removal instead",
+                node_id,
+            ),
+        });
+    }
+
+    let members = ctx.members_with_voter_flag();
+    if !members.contains_key(&node_id) {
+        return Err(ProtoError {
+            code: error_code::CONFIG_ERROR,
+            message: format!("no member with node_id={} exists", node_id),
+        });
+    }
+
+    // Current voter set (sorted) and the would-be set after removal.
+    let mut current_voters: Vec<u64> = members
+        .iter()
+        .filter(|(_, (_, is_voter))| *is_voter)
+        .map(|(id, _)| *id)
+        .collect();
+    current_voters.sort_unstable();
+    let new_voters: Vec<u64> = current_voters
+        .iter()
+        .copied()
+        .filter(|id| *id != node_id)
+        .collect();
+
+    let label = members
+        .get(&node_id)
+        .and_then(|(m, _)| m.label.clone())
+        .unwrap_or_else(|| "-".to_string());
+
+    let current_quorum = (current_voters.len() / 2) + 1;
+    let new_quorum     = if new_voters.is_empty() { 0 } else { (new_voters.len() / 2) + 1 };
+
+    let mut effects = vec![
+        format!("would remove node_id={} (label={}) from voter set", node_id, label),
+        format!(
+            "voter set: {:?} → {:?}  (size {} → {}, quorum {} → {})",
+            current_voters,
+            new_voters,
+            current_voters.len(),
+            new_voters.len(),
+            current_quorum,
+            new_quorum,
+        ),
+    ];
+
+    let mut warnings = Vec::new();
+    if new_voters.is_empty() {
+        // The real handler refuses with CONFIG_ERROR; surface that
+        // here as a warning rather than failing — the operator
+        // should see both "this would happen" and "the live call
+        // would refuse" so the preview is useful.
+        warnings.push(format!(
+            "removing node_id={} would leave the cluster with no voters; \
+             the live call would refuse with CONFIG_ERROR",
+            node_id,
+        ));
+    } else if new_voters.len() < 3 {
+        // Below 3 voters the cluster is no longer HA — single
+        // failure tolerance disappears.
+        warnings.push(format!(
+            "voter set would drop to {} (no longer HA — a single failure halts the cluster)",
+            new_voters.len(),
+        ));
+    }
+    // Members map only stores voters + learners; if the target was
+    // a learner, the voter sets are unchanged — flag that so the
+    // operator doesn't expect a quorum movement.
+    let was_voter = members
+        .get(&node_id)
+        .map(|(_, is_voter)| *is_voter)
+        .unwrap_or(false);
+    if !was_voter {
+        effects.push(format!(
+            "node_id={} is currently a learner (non-voting); voter set is unchanged",
+            node_id,
+        ));
+    }
+
+    Ok(Response::DryRunReport(DryRunReport {
+        summary: format!("would remove node_id={} from cluster", node_id),
+        effects,
+        warnings,
+    }))
+}
+
+// ---- shared sweep helpers ----
+
+/// Names of feeds whose source or destination paths reference the
+/// given endpoint name. Order is `BTreeMap`-stable (feed name asc).
+fn feeds_referencing_endpoint(config: &Config, endpoint: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (feed_name, feed) in config.feeds.iter() {
+        let hits = feed.sources.iter().any(|p| p.endpoint == endpoint)
+                || feed.destinations.iter().any(|p| p.endpoint == endpoint);
+        if hits {
+            out.push(feed_name.clone());
+        }
+    }
+    out
+}
+
+/// Names of feeds whose process steps reference the given key.
+fn feeds_referencing_key(config: &Config, key: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (feed_name, feed) in config.feeds.iter() {
+        let hits = feed.process.iter().any(|step| match step {
+            ProcessStep::Encrypt { key: k } | ProcessStep::Decrypt { key: k } => k == key,
+        });
+        if hits {
+            out.push(feed_name.clone());
+        }
+    }
+    out
+}
+
+/// Names of feeds whose nextstep `run feed` targets the given feed.
+fn feeds_with_nextstep_run(config: &Config, target: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (feed_name, feed) in config.feeds.iter() {
+        let hits = feed.nextsteps.iter().any(|ns| matches!(
+            &ns.action,
+            NextStepAction::RunFeed { feed: t } if t == target
+        ));
+        if hits {
+            out.push(feed_name.clone());
+        }
+    }
+    out
+}
+
+// ============================================================
+// Tests - dry-run handlers (no live cluster)
+// ============================================================
+//
+// These exercise the dry-run handlers that don't depend on the
+// Raft runtime — every delete/rename preview, plus secret-delete.
+// `cluster_remove_node_dry_run` is integration-tested in
+// crates/sftpflow-cluster (it needs a live ClusterContext).
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sftpflow_core::{
+        Endpoint, Feed, FeedPath, NextStep, NextStepAction, PgpKey,
+        ProcessStep, TriggerCondition,
+    };
+    use sftpflow_proto::Response;
+
+    // ---- DaemonState builder ----
+    //
+    // Construct a minimal DaemonState whose only populated fields are
+    // those the dry-run handlers actually read. We never call any
+    // live mutating handler from these tests, so the empty `paths` /
+    // `started` placeholders are fine — `Config::save` and friends
+    // are not exercised here.
+
+    fn make_state(config: Config) -> crate::server::DaemonState {
+        crate::server::DaemonState {
+            config,
+            started:   std::time::Instant::now(),
+            dkron_url: None,
+            run_db:    None,
+            audit_db:  None,
+            secrets:   None,
+            cluster:   None,
+            paths:     crate::server::DaemonPaths {
+                state_dir:    std::path::PathBuf::from("/tmp/sftpflow-test"),
+                runs_db:      std::path::PathBuf::from("/tmp/sftpflow-test/runs.db"),
+                audit_db:     std::path::PathBuf::from("/tmp/sftpflow-test/audit.db"),
+                secrets_file: std::path::PathBuf::from("/tmp/sftpflow-test/secrets.age"),
+                config_yaml:  std::path::PathBuf::from("/tmp/sftpflow-test/config.yaml"),
+            },
+        }
+    }
+
+    /// Build a Config with one endpoint, one PGP key, two feeds
+    /// where `feed_a` references endpoint `prod` (source) and
+    /// key `kp` (encrypt step), and `feed_b` has a nextstep
+    /// `run feed feed_a`. This is the standard fixture every
+    /// reference-sweep test below uses.
+    fn fixture_config() -> Config {
+        let mut endpoints = std::collections::BTreeMap::new();
+        endpoints.insert("prod".to_string(),  Endpoint::default());
+        endpoints.insert("stage".to_string(), Endpoint::default());
+
+        let mut keys = std::collections::BTreeMap::new();
+        keys.insert("kp".to_string(),    PgpKey::default());
+        keys.insert("other".to_string(), PgpKey::default());
+
+        let feed_a = Feed {
+            sources: vec![FeedPath {
+                endpoint: "prod".to_string(),
+                path:     "/in".to_string(),
+            }],
+            destinations: vec![FeedPath {
+                endpoint: "prod".to_string(),
+                path:     "/out".to_string(),
+            }],
+            process: vec![ProcessStep::Encrypt { key: "kp".to_string() }],
+            ..Default::default()
+        };
+        let feed_b = Feed {
+            sources: vec![FeedPath {
+                endpoint: "stage".to_string(),
+                path:     "/x".to_string(),
+            }],
+            nextsteps: vec![NextStep {
+                action: NextStepAction::RunFeed { feed: "feed_a".to_string() },
+                on:     vec![TriggerCondition::Success],
+            }],
+            ..Default::default()
+        };
+        let mut feeds = std::collections::BTreeMap::new();
+        feeds.insert("feed_a".to_string(), feed_a);
+        feeds.insert("feed_b".to_string(), feed_b);
+
+        Config { endpoints, keys, feeds, ..Default::default() }
+    }
+
+    fn unwrap_report(r: Response) -> sftpflow_proto::DryRunReport {
+        match r {
+            Response::DryRunReport(rep) => rep,
+            other => panic!("expected DryRunReport, got {:?}", other),
+        }
+    }
+
+    // ---- delete_endpoint_dry_run ----
+
+    #[test]
+    fn delete_endpoint_dry_run_flags_referencing_feeds() {
+        let state = make_state(fixture_config());
+        let report = unwrap_report(
+            delete_endpoint_dry_run(&state, "prod").unwrap(),
+        );
+        assert!(report.summary.contains("delete endpoint 'prod'"));
+        // Two refs (source + destination) but in one feed → one warning.
+        assert_eq!(report.warnings.len(), 1);
+        assert!(report.warnings[0].contains("feed_a"));
+        // State must still contain the endpoint after a preview.
+        assert!(state.config.endpoints.contains_key("prod"));
+    }
+
+    #[test]
+    fn delete_endpoint_dry_run_unreferenced_endpoint_has_no_warnings() {
+        // A fresh endpoint with no feeds touching it → zero warnings,
+        // and the effects list explicitly says "no feeds reference".
+        let mut config = fixture_config();
+        config.endpoints.insert("solo".to_string(), Endpoint::default());
+        let state = make_state(config);
+        let report = unwrap_report(
+            delete_endpoint_dry_run(&state, "solo").unwrap(),
+        );
+        assert!(report.warnings.is_empty());
+        assert!(report.effects.iter().any(|e| e.contains("no feeds reference")));
+    }
+
+    #[test]
+    fn delete_endpoint_dry_run_missing_endpoint_returns_not_found() {
+        let state = make_state(fixture_config());
+        let err = delete_endpoint_dry_run(&state, "ghost").unwrap_err();
+        assert_eq!(err.code, error_code::NOT_FOUND);
+    }
+
+    // ---- delete_key_dry_run / delete_feed_dry_run ----
+
+    #[test]
+    fn delete_key_dry_run_flags_process_step_references() {
+        let state  = make_state(fixture_config());
+        let report = unwrap_report(delete_key_dry_run(&state, "kp").unwrap());
+        assert_eq!(report.warnings.len(), 1);
+        assert!(report.warnings[0].contains("feed_a"));
+    }
+
+    #[test]
+    fn delete_feed_dry_run_flags_nextstep_references() {
+        let state  = make_state(fixture_config());
+        let report = unwrap_report(delete_feed_dry_run(&state, "feed_a").unwrap());
+        assert_eq!(report.warnings.len(), 1);
+        assert!(report.warnings[0].contains("feed_b"));
+    }
+
+    #[test]
+    fn delete_feed_dry_run_includes_dkron_effect_when_configured() {
+        let mut state = make_state(fixture_config());
+        state.dkron_url = Some("http://dkron:8080".into());
+        let report = unwrap_report(delete_feed_dry_run(&state, "feed_b").unwrap());
+        assert!(report.effects.iter().any(|e| e.contains("dkron job")));
+    }
+
+    // ---- rename_*_dry_run ----
+
+    #[test]
+    fn rename_endpoint_dry_run_lists_reference_count() {
+        let state  = make_state(fixture_config());
+        let report = unwrap_report(
+            rename_endpoint_dry_run(&state, "prod", "prod-2").unwrap(),
+        );
+        assert!(report.summary.contains("'prod' → 'prod-2'"));
+        // One feed with both source + destination references gets
+        // one entry in the list (the helper de-dupes by feed name).
+        assert!(report.effects.iter().any(|e| e.contains("1 feed(s)") && e.contains("feed_a")));
+    }
+
+    #[test]
+    fn rename_endpoint_dry_run_already_exists_errors() {
+        let state = make_state(fixture_config());
+        let err = rename_endpoint_dry_run(&state, "prod", "stage").unwrap_err();
+        assert_eq!(err.code, error_code::ALREADY_EXISTS);
+    }
+
+    #[test]
+    fn rename_feed_dry_run_lists_nextstep_targets() {
+        let state  = make_state(fixture_config());
+        let report = unwrap_report(
+            rename_feed_dry_run(&state, "feed_a", "feed_aa").unwrap(),
+        );
+        assert!(report.effects.iter().any(|e|
+            e.contains("nextstep targets") && e.contains("feed_b")
+        ));
+    }
+
+    // ---- delete_secret_dry_run ----
+
+    #[test]
+    fn delete_secret_dry_run_requires_open_store() {
+        let state = make_state(fixture_config());
+        // No secrets configured → CONFIG_ERROR (live handler does the
+        // same; the dry-run path mirrors it so the operator sees the
+        // same precondition message in preview mode).
+        let err = delete_secret_dry_run(&state, "anything").unwrap_err();
+        assert_eq!(err.code, error_code::CONFIG_ERROR);
+    }
+
+    #[test]
+    fn delete_secret_dry_run_flags_endpoint_and_key_references() {
+        // Real SecretStore so the existence-vs-no-op effect picks
+        // the "would remove" path. Mark one endpoint password_ref
+        // and one key contents_ref as referencing the secret being
+        // previewed; the dry-run report should warn about both.
+        use crate::secrets::SecretStore;
+        use age::secrecy::SecretString;
+        let dir  = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.age");
+
+        // Open the store with a fixed test passphrase. The dry-run
+        // handler never decrypts anything — `names()` is enough.
+        let mut store = SecretStore::open(&path, SecretString::new("pw".into())).unwrap();
+        store.put("db-pass".into(), "value".into()).unwrap();
+
+        let mut config = fixture_config();
+        // Endpoint references the secret via password_ref.
+        if let Some(ep) = config.endpoints.get_mut("prod") {
+            ep.password_ref = Some("db-pass".into());
+        }
+        // Key references the secret via contents_ref.
+        if let Some(k) = config.keys.get_mut("kp") {
+            k.contents_ref = Some("db-pass".into());
+        }
+
+        let mut state = make_state(config);
+        state.secrets = Some(store);
+
+        let report = unwrap_report(delete_secret_dry_run(&state, "db-pass").unwrap());
+        assert!(report.effects.iter().any(|e| e.contains("would remove sealed secret")));
+        // One warning, mentioning both referrer kinds.
+        assert_eq!(report.warnings.len(), 1);
+        assert!(report.warnings[0].contains("endpoint 'prod' password_ref"));
+        assert!(report.warnings[0].contains("PGP key 'kp' contents_ref"));
+    }
+
+    #[test]
+    fn delete_secret_dry_run_missing_secret_is_no_op() {
+        // Secret that isn't in the store → effects mention the
+        // idempotent no-op explicitly, never warns.
+        use crate::secrets::SecretStore;
+        use age::secrecy::SecretString;
+        let dir   = tempfile::tempdir().unwrap();
+        let path  = dir.path().join("secrets.age");
+        let store = SecretStore::open(&path, SecretString::new("pw".into())).unwrap();
+
+        let mut state = make_state(fixture_config());
+        state.secrets = Some(store);
+
+        let report = unwrap_report(delete_secret_dry_run(&state, "ghost").unwrap());
+        assert!(report.effects.iter().any(|e|
+            e.contains("not in the sealed store") && e.contains("idempotent")
+        ));
+        assert!(report.warnings.is_empty());
+    }
 }

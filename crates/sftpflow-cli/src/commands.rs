@@ -32,6 +32,70 @@ fn has_rpc(state: &ShellState) -> bool {
 }
 
 // ============================================================
+// --dry-run argument handling
+// ============================================================
+//
+// Destructive commands (delete, rename, secret delete, cluster
+// remove) accept `--dry-run` (or `-n`) anywhere in their argument
+// list. `take_dry_run_flag` strips the flag and returns
+// (dry_run, remaining_args), so the per-type handler logic stays
+// unchanged whether the operator typed it or not.
+//
+// We accept the flag in any position so command-line muscle memory
+// (`delete feed nightly --dry-run` and `delete --dry-run feed
+// nightly` both work). Anything that matches `--dry-run` or `-n`
+// is removed; any other token survives unchanged.
+
+/// Strip `--dry-run` / `-n` from `args`, returning the flag value
+/// and the remaining tokens in their original order.
+fn take_dry_run_flag<'a>(args: &[&'a str]) -> (bool, Vec<&'a str>) {
+    let mut dry_run   = false;
+    let mut remaining = Vec::with_capacity(args.len());
+    for arg in args {
+        if *arg == "--dry-run" || *arg == "-n" {
+            dry_run = true;
+        } else {
+            remaining.push(*arg);
+        }
+    }
+    (dry_run, remaining)
+}
+
+/// Render a daemon-side `DryRunReport` to stdout. Used by every
+/// destructive CLI command that supports `--dry-run`. Format:
+///
+///   DRY RUN: <summary>
+///   Effects:
+///     - <effect>
+///   Warnings:
+///     - <warning>
+///   (no changes were made)
+///
+/// Sections with empty bodies print "(none)" so the operator
+/// always sees the structure and never has to wonder whether the
+/// preview was incomplete.
+fn print_dry_run_report(report: &sftpflow_proto::DryRunReport) {
+    println!("DRY RUN: {}", report.summary);
+    println!("Effects:");
+    if report.effects.is_empty() {
+        println!("  (none)");
+    } else {
+        for effect in &report.effects {
+            println!("  - {}", effect);
+        }
+    }
+    println!("Warnings:");
+    if report.warnings.is_empty() {
+        println!("  (none)");
+    } else {
+        for warning in &report.warnings {
+            println!("  ! {}", warning);
+        }
+    }
+    println!("(no changes were made)");
+}
+
+// ============================================================
 // Exec mode commands
 // ============================================================
 
@@ -41,17 +105,21 @@ pub fn help_exec() {
     println!();
     println!("  create <type> <name>         Create a new object");
     println!("  edit <type> <name>           Edit an existing object");
-    println!("  delete <type> <name>         Delete an object");
-    println!("  rename <type> <old> <new>    Rename (updates all references)");
+    println!("  delete [--dry-run] <type> <name>");
+    println!("                               Delete an object (preview with --dry-run)");
+    println!("  rename [--dry-run] <type> <old> <new>");
+    println!("                               Rename (preview with --dry-run; updates references)");
     println!();
     println!("  show endpoints|keys|feeds    List all of a type");
     println!("  show secrets                 List sealed secret names");
     println!("  show <type> <name>           Show details for one object");
     println!("  show runs <feed> [limit]     Show run history for a feed");
+    println!("  show audit [limit]           Show recent cluster mutations");
     println!("  show version                 Show SFTPflow version");
     println!();
     println!("  secret add <name>            Add/replace a sealed secret (prompts for value)");
-    println!("  secret delete <name>         Remove a sealed secret");
+    println!("  secret delete [--dry-run] <name>");
+    println!("                               Remove a sealed secret (preview with --dry-run)");
     println!("  secret list                  List sealed secret names");
     println!();
     println!("  cluster status               Show cluster leader / members");
@@ -60,7 +128,8 @@ pub fn help_exec() {
     println!("                               ssh-drive sftpflowd init on a fresh host");
     println!("  cluster join <user@host[:port]>");
     println!("                               Mint+ship a token, then ssh-drive sftpflowd join");
-    println!("  cluster remove <node-id>     Remove a different node from the voter set");
+    println!("  cluster remove [--dry-run] <node-id>");
+    println!("                               Remove another node (preview with --dry-run)");
     println!("  cluster leave                Step the connected node out of the cluster");
     println!("  cluster backup <server-path> Hot backup the connected node to <path>.tar.gz");
     println!();
@@ -498,26 +567,38 @@ fn edit_feed(name: &str, state: &mut ShellState) {
 
 // ---- delete <type> <name> ----
 
-/// Route 'delete endpoint|key|feed <name>'.
+/// Route 'delete [--dry-run] endpoint|key|feed <name>'.
 pub fn delete(args: &[&str], state: &mut ShellState) {
+    let (dry_run, args) = take_dry_run_flag(args);
     if args.len() < 2 {
-        println!("% Usage: delete <endpoint|key|feed> <name>");
+        println!("% Usage: delete [--dry-run] <endpoint|key|feed> <name>");
         return;
     }
 
     match args[0] {
-        "endpoint" => delete_endpoint(args[1], state),
-        "key"      => delete_key(args[1], state),
-        "feed"     => delete_feed(args[1], state),
+        "endpoint" => delete_endpoint(args[1], dry_run, state),
+        "key"      => delete_key(args[1], dry_run, state),
+        "feed"     => delete_feed(args[1], dry_run, state),
         _ => println!("% Unknown type '{}'. Use 'endpoint', 'key', or 'feed'.", args[0]),
     }
 }
 
-fn delete_endpoint(name: &str, state: &mut ShellState) {
+fn delete_endpoint(name: &str, dry_run: bool, state: &mut ShellState) {
     if !has_rpc(state) { return; }
     let rpc = state.rpc.as_mut().unwrap();
+    let req = Request::DeleteEndpoint { name: name.to_string() };
 
-    match rpc.call(Request::DeleteEndpoint { name: name.to_string() }) {
+    if dry_run {
+        match rpc.call_dry_run(req) {
+            Ok(Response::DryRunReport(r)) => print_dry_run_report(&r),
+            Err(RpcError::Proto(e)) => println!("% {}", e.message),
+            Err(e) => println!("% Error: {}", e),
+            _ => {}
+        }
+        return;
+    }
+
+    match rpc.call(req) {
         Ok(Response::Ok) => {
             info!("Deleted endpoint '{}'", name);
             println!("Endpoint '{}' deleted.", name);
@@ -528,11 +609,22 @@ fn delete_endpoint(name: &str, state: &mut ShellState) {
     }
 }
 
-fn delete_key(name: &str, state: &mut ShellState) {
+fn delete_key(name: &str, dry_run: bool, state: &mut ShellState) {
     if !has_rpc(state) { return; }
     let rpc = state.rpc.as_mut().unwrap();
+    let req = Request::DeleteKey { name: name.to_string() };
 
-    match rpc.call(Request::DeleteKey { name: name.to_string() }) {
+    if dry_run {
+        match rpc.call_dry_run(req) {
+            Ok(Response::DryRunReport(r)) => print_dry_run_report(&r),
+            Err(RpcError::Proto(e)) => println!("% {}", e.message),
+            Err(e) => println!("% Error: {}", e),
+            _ => {}
+        }
+        return;
+    }
+
+    match rpc.call(req) {
         Ok(Response::Ok) => {
             info!("Deleted key '{}'", name);
             println!("Key '{}' deleted.", name);
@@ -543,12 +635,23 @@ fn delete_key(name: &str, state: &mut ShellState) {
     }
 }
 
-fn delete_feed(name: &str, state: &mut ShellState) {
+fn delete_feed(name: &str, dry_run: bool, state: &mut ShellState) {
     // Dkron cleanup is handled daemon-side after DeleteFeed.
     if !has_rpc(state) { return; }
     let rpc = state.rpc.as_mut().unwrap();
+    let req = Request::DeleteFeed { name: name.to_string() };
 
-    match rpc.call(Request::DeleteFeed { name: name.to_string() }) {
+    if dry_run {
+        match rpc.call_dry_run(req) {
+            Ok(Response::DryRunReport(r)) => print_dry_run_report(&r),
+            Err(RpcError::Proto(e)) => println!("% {}", e.message),
+            Err(e) => println!("% Error: {}", e),
+            _ => {}
+        }
+        return;
+    }
+
+    match rpc.call(req) {
         Ok(Response::Ok) => {
             info!("Deleted feed '{}'", name);
             println!("Feed '{}' deleted.", name);
@@ -561,26 +664,38 @@ fn delete_feed(name: &str, state: &mut ShellState) {
 
 // ---- rename <type> <old> <new> ----
 
-/// Route 'rename endpoint|key|feed <old> <new>'.
+/// Route 'rename [--dry-run] endpoint|key|feed <old> <new>'.
 pub fn rename(args: &[&str], state: &mut ShellState) {
+    let (dry_run, args) = take_dry_run_flag(args);
     if args.len() < 3 {
-        println!("% Usage: rename <endpoint|key|feed> <oldname> <newname>");
+        println!("% Usage: rename [--dry-run] <endpoint|key|feed> <oldname> <newname>");
         return;
     }
 
     match args[0] {
-        "endpoint" => rename_endpoint(args[1], args[2], state),
-        "key"      => rename_key(args[1], args[2], state),
-        "feed"     => rename_feed(args[1], args[2], state),
+        "endpoint" => rename_endpoint(args[1], args[2], dry_run, state),
+        "key"      => rename_key(args[1], args[2], dry_run, state),
+        "feed"     => rename_feed(args[1], args[2], dry_run, state),
         _ => println!("% Unknown type '{}'. Use 'endpoint', 'key', or 'feed'.", args[0]),
     }
 }
 
-fn rename_endpoint(old_name: &str, new_name: &str, state: &mut ShellState) {
+fn rename_endpoint(old_name: &str, new_name: &str, dry_run: bool, state: &mut ShellState) {
     if !has_rpc(state) { return; }
     let rpc = state.rpc.as_mut().unwrap();
+    let req = Request::RenameEndpoint { from: old_name.to_string(), to: new_name.to_string() };
 
-    match rpc.call(Request::RenameEndpoint { from: old_name.to_string(), to: new_name.to_string() }) {
+    if dry_run {
+        match rpc.call_dry_run(req) {
+            Ok(Response::DryRunReport(r)) => print_dry_run_report(&r),
+            Err(RpcError::Proto(e)) => println!("% {}", e.message),
+            Err(e) => println!("% Error: {}", e),
+            _ => {}
+        }
+        return;
+    }
+
+    match rpc.call(req) {
         Ok(Response::Ok) => {
             info!("Renamed endpoint '{}' → '{}'", old_name, new_name);
             println!("Endpoint '{}' renamed to '{}'.", old_name, new_name);
@@ -591,11 +706,22 @@ fn rename_endpoint(old_name: &str, new_name: &str, state: &mut ShellState) {
     }
 }
 
-fn rename_key(old_name: &str, new_name: &str, state: &mut ShellState) {
+fn rename_key(old_name: &str, new_name: &str, dry_run: bool, state: &mut ShellState) {
     if !has_rpc(state) { return; }
     let rpc = state.rpc.as_mut().unwrap();
+    let req = Request::RenameKey { from: old_name.to_string(), to: new_name.to_string() };
 
-    match rpc.call(Request::RenameKey { from: old_name.to_string(), to: new_name.to_string() }) {
+    if dry_run {
+        match rpc.call_dry_run(req) {
+            Ok(Response::DryRunReport(r)) => print_dry_run_report(&r),
+            Err(RpcError::Proto(e)) => println!("% {}", e.message),
+            Err(e) => println!("% Error: {}", e),
+            _ => {}
+        }
+        return;
+    }
+
+    match rpc.call(req) {
         Ok(Response::Ok) => {
             info!("Renamed key '{}' → '{}'", old_name, new_name);
             println!("Key '{}' renamed to '{}'.", old_name, new_name);
@@ -606,11 +732,22 @@ fn rename_key(old_name: &str, new_name: &str, state: &mut ShellState) {
     }
 }
 
-fn rename_feed(old_name: &str, new_name: &str, state: &mut ShellState) {
+fn rename_feed(old_name: &str, new_name: &str, dry_run: bool, state: &mut ShellState) {
     if !has_rpc(state) { return; }
     let rpc = state.rpc.as_mut().unwrap();
+    let req = Request::RenameFeed { from: old_name.to_string(), to: new_name.to_string() };
 
-    match rpc.call(Request::RenameFeed { from: old_name.to_string(), to: new_name.to_string() }) {
+    if dry_run {
+        match rpc.call_dry_run(req) {
+            Ok(Response::DryRunReport(r)) => print_dry_run_report(&r),
+            Err(RpcError::Proto(e)) => println!("% {}", e.message),
+            Err(e) => println!("% Error: {}", e),
+            _ => {}
+        }
+        return;
+    }
+
+    match rpc.call(req) {
         Ok(Response::Ok) => {
             info!("Renamed feed '{}' → '{}'", old_name, new_name);
             println!("Feed '{}' renamed to '{}'.", old_name, new_name);
@@ -2442,7 +2579,8 @@ fn format_duration(secs: f64) -> String {
 // value is sent to the daemon over the already-encrypted RPC
 // channel, where it's re-sealed into the credential store.
 
-/// Route 'secret add|list|delete ...' in exec mode.
+/// Route 'secret add|list|delete ...' in exec mode. The `delete`
+/// subcommand also accepts `--dry-run` (or `-n`) for a preview.
 pub fn secret(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
         println!("% Usage: secret <add|list|delete> [name]");
@@ -2459,11 +2597,16 @@ pub fn secret(args: &[&str], state: &mut ShellState) {
         }
         "list"   => secret_list(state),
         "delete" => {
-            if args.len() < 2 {
-                println!("% Usage: secret delete <name>");
+            // Strip `--dry-run`/`-n` from the trailing args so the
+            // subcommand parser only sees positional tokens. We let
+            // operators put the flag in either position
+            // (`secret delete --dry-run X` or `secret delete X -n`).
+            let (dry_run, rest) = take_dry_run_flag(&args[1..]);
+            if rest.is_empty() {
+                println!("% Usage: secret delete [--dry-run] <name>");
                 return;
             }
-            secret_delete(args[1], state);
+            secret_delete(rest[0], dry_run, state);
         }
         _ => println!("% Unknown secret subcommand '{}'. Use add, list, or delete.", args[0]),
     }
@@ -2526,12 +2669,23 @@ fn secret_list(state: &mut ShellState) {
     }
 }
 
-/// Send a DeleteSecret RPC.
-fn secret_delete(name: &str, state: &mut ShellState) {
+/// Send a DeleteSecret RPC, or its dry-run preview.
+fn secret_delete(name: &str, dry_run: bool, state: &mut ShellState) {
     if !has_rpc(state) { return; }
     let rpc = state.rpc.as_mut().unwrap();
+    let req = Request::DeleteSecret { name: name.to_string() };
 
-    match rpc.call(Request::DeleteSecret { name: name.to_string() }) {
+    if dry_run {
+        match rpc.call_dry_run(req) {
+            Ok(Response::DryRunReport(r)) => print_dry_run_report(&r),
+            Err(RpcError::Proto(e)) => println!("% {}", e.message),
+            Err(e) => println!("% Error: {}", e),
+            _ => {}
+        }
+        return;
+    }
+
+    match rpc.call(req) {
         Ok(Response::Ok) => {
             info!("Deleted secret '{}'", name);
             println!("Secret '{}' deleted.", name);
@@ -2662,18 +2816,22 @@ pub fn cluster(args: &[&str], state: &mut ShellState) {
             cluster_token(state, ttl);
         }
         "remove" => {
-            if args.len() < 2 {
-                println!("% Usage: cluster remove <node-id>");
+            // Strip `--dry-run` / `-n` so the positional parser only
+            // sees the node-id. Order-insensitive: `cluster remove
+            // 3 --dry-run` and `cluster remove --dry-run 3` both work.
+            let (dry_run, rest) = take_dry_run_flag(&args[1..]);
+            if rest.is_empty() {
+                println!("% Usage: cluster remove [--dry-run] <node-id>");
                 return;
             }
-            let node_id = match args[1].parse::<u64>() {
+            let node_id = match rest[0].parse::<u64>() {
                 Ok(n) => n,
                 Err(_) => {
                     println!("% node-id must be a non-negative integer");
                     return;
                 }
             };
-            cluster_remove(state, node_id);
+            cluster_remove(state, node_id, dry_run);
         }
         "leave" => cluster_leave(state),
         "join" => {
@@ -2940,8 +3098,23 @@ fn cluster_backup_remote(state: &mut ShellState, out_path: &str) {
 }
 
 /// Send ClusterRemoveNode after a double-confirm on stdin.
-fn cluster_remove(state: &mut ShellState, node_id: u64) {
+/// In dry-run mode skips the confirm and prints the daemon's
+/// preview instead of mutating membership.
+fn cluster_remove(state: &mut ShellState, node_id: u64, dry_run: bool) {
     if !has_rpc(state) { return; }
+
+    if dry_run {
+        // No confirmation prompt for previews — the whole point is
+        // for the operator to inspect the plan before deciding.
+        let rpc = state.rpc.as_mut().unwrap();
+        match rpc.call_dry_run(Request::ClusterRemoveNode { node_id }) {
+            Ok(Response::DryRunReport(r)) => print_dry_run_report(&r),
+            Err(RpcError::Proto(e)) => println!("% {}", e.message),
+            Err(e) => println!("% Error: {}", e),
+            _ => {}
+        }
+        return;
+    }
 
     println!("Remove node_id={} from the cluster voter set?", node_id);
     println!("This is irreversible. Type the node id again to confirm:");

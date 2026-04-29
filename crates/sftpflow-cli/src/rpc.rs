@@ -209,13 +209,34 @@ impl RpcClient {
     /// Send a request to the daemon and return the response.
     /// Returns RpcError::Proto if the daemon returned an error envelope.
     pub fn call(&mut self, request: Request) -> Result<Response, RpcError> {
+        self.call_with(request, false)
+    }
+
+    /// Send a request with the envelope's `dry_run` flag set. The daemon
+    /// returns a `Response::DryRunReport` for the supported destructive
+    /// RPCs and `INVALID_PARAMS` for any other method, so this should
+    /// only be invoked from CLI sites that have already opted into a
+    /// preview-shaped command (e.g. `delete feed --dry-run`).
+    pub fn call_dry_run(&mut self, request: Request) -> Result<Response, RpcError> {
+        self.call_with(request, true)
+    }
+
+    /// Inner one-shot path used by both `call` and `call_dry_run`.
+    /// Pulls a fresh correlation id, stamps the envelope, and ships
+    /// it through whichever transport this client is configured with.
+    fn call_with(
+        &mut self,
+        request: Request,
+        dry_run: bool,
+    ) -> Result<Response, RpcError> {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let envelope = RequestEnvelope {
             id,
             caller: self.caller.clone(),
+            dry_run,
             request,
         };
-        debug!("rpc: sending id={} {:?}", id, envelope);
+        debug!("rpc: sending id={} dry_run={} {:?}", id, dry_run, envelope);
 
         let response = match &mut self.inner {
             RpcInner::Persistent { reader, writer } => {

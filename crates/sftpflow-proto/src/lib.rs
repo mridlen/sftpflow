@@ -169,6 +169,14 @@ pub enum Response {
     BackupReport(BackupReport),
     /// Reply to GetAuditLog. Newest-first ordering by `ts_unix`.
     AuditLog(Vec<AuditEntry>),
+    /// Reply to a request that was sent with `dry_run=true` on the
+    /// envelope. Carries a structured preview of what *would* happen
+    /// (summary line, side-effect list, warnings) without any state
+    /// being mutated. Only a fixed allowlist of mutating RPCs honors
+    /// the dry-run flag — the rest reply with INVALID_PARAMS so the
+    /// CLI never silently lets a real mutation through under a
+    /// preview-shaped command.
+    DryRunReport(DryRunReport),
 }
 
 /// Server identity and version, returned by GetServerInfo.
@@ -318,6 +326,43 @@ pub struct BackupReport {
     pub node_id: Option<u64>,
 }
 
+// ============================================================
+// DryRunReport - preview payload for `--dry-run` previews
+// ============================================================
+//
+// A daemon-side "what would happen if I ran this for real" answer.
+// Returned by every mutating RPC handler that supports dry-run mode
+// (delete/rename of endpoints/keys/feeds, delete_secret, and
+// cluster_remove_node). The CLI renders the three lists below as
+// plain text under the destructive command's confirm flow.
+//
+// The shape is intentionally generic — `summary` is the headline
+// (e.g. "would delete feed 'nightly'"), `effects` enumerates the
+// concrete state changes that would land (reference rewrites,
+// orphaned references, voter set deltas), and `warnings` flags
+// anything the operator should look at twice (a removed endpoint
+// still being referenced by N feeds, a quorum that drops to a
+// single voter, etc.).
+//
+// Empty `effects` / `warnings` are valid and just mean "nothing
+// notable" — a delete with zero references produces an effects
+// list of one entry ("would remove `<thing>` from the registry")
+// and no warnings.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DryRunReport {
+    /// One-line summary of the action that would have been taken.
+    /// Always populated.
+    pub summary: String,
+    /// Bullet-list of concrete side-effects the real run would have.
+    /// Cross-reference rewrites, dkron job deletions, voter set
+    /// transitions, etc. Order is render order.
+    pub effects: Vec<String>,
+    /// Operator-facing warnings — orphaned references, quorum
+    /// implications, in-use secret removals, etc. Empty when nothing
+    /// is unusual.
+    pub warnings: Vec<String>,
+}
+
 /// One row of the cluster mutation audit log, returned by GetAuditLog.
 ///
 /// Audit rows are append-only. The daemon records one entry per
@@ -415,14 +460,32 @@ pub mod error_code {
 /// at the transport layer; `caller` just records what the CLI was
 /// told to call them. `#[serde(default)]` keeps older CLIs (which
 /// don't set this field) compatible.
+///
+/// `dry_run` asks the daemon to compute the effect of a mutating
+/// RPC without applying it. Only an allowlist of mutating RPCs
+/// (delete/rename of endpoints/keys/feeds, delete_secret,
+/// cluster_remove_node) honors the flag — anything else returns
+/// INVALID_PARAMS so the CLI can never silently let a real
+/// mutation slip through under a preview-shaped command. The
+/// audit row records dry-runs with an outcome of `"dry-run:ok"` /
+/// `"dry-run:err:<code>"` so they're trivially filterable. Same
+/// `#[serde(default, skip_serializing_if)]` shape as `caller` so
+/// older daemons (which never read the flag) keep working.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RequestEnvelope {
     pub id: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caller: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dry_run: bool,
     #[serde(flatten)]
     pub request: Request,
 }
+
+/// `skip_serializing_if` predicate for the `dry_run` envelope flag.
+/// Free function (rather than a closure) so serde's macro can take
+/// it by path — matches the existing `Option::is_none` pattern.
+fn is_false(b: &bool) -> bool { !*b }
 
 /// A response as it appears on the wire. Exactly one of
 /// `result` or `error` is present.
@@ -526,6 +589,7 @@ mod tests {
         let env = RequestEnvelope {
             id: 1,
             caller: None,
+            dry_run: false,
             request: Request::Ping,
         };
         let json = serde_json::to_string(&env).unwrap();
@@ -533,6 +597,8 @@ mod tests {
         assert!(json.contains(r#""id":1"#));
         // No caller stamped → field omitted from the wire form.
         assert!(!json.contains(r#""caller""#));
+        // dry_run defaults to false → field omitted too.
+        assert!(!json.contains(r#""dry_run""#));
 
         let parsed: RequestEnvelope = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, env);
@@ -543,6 +609,7 @@ mod tests {
         let env = RequestEnvelope {
             id: 7,
             caller: Some("alice@prod-1".into()),
+            dry_run: false,
             request: Request::DeleteFeed { name: "nightly".into() },
         };
         let json = serde_json::to_string(&env).unwrap();
@@ -553,13 +620,30 @@ mod tests {
     }
 
     #[test]
+    fn dry_run_round_trips_when_set() {
+        let env = RequestEnvelope {
+            id: 99,
+            caller: None,
+            dry_run: true,
+            request: Request::DeleteFeed { name: "nightly".into() },
+        };
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains(r#""dry_run":true"#));
+
+        let parsed: RequestEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, env);
+        assert!(parsed.dry_run);
+    }
+
+    #[test]
     fn legacy_envelope_without_caller_still_parses() {
-        // Older CLIs predate the `caller` field. Their envelopes
-        // must still deserialize cleanly via #[serde(default)].
+        // Older CLIs predate the `caller` and `dry_run` fields. Their
+        // envelopes must still deserialize cleanly via #[serde(default)].
         let json = r#"{"id":3,"method":"ping"}"#;
         let parsed: RequestEnvelope = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.id, 3);
         assert_eq!(parsed.caller, None);
+        assert!(!parsed.dry_run);
     }
 
     #[test]
@@ -567,6 +651,7 @@ mod tests {
         let env = RequestEnvelope {
             id: 42,
             caller: None,
+            dry_run: false,
             request: Request::GetFeed { name: "nightly".to_string() },
         };
         let json = serde_json::to_string(&env).unwrap();
@@ -574,6 +659,26 @@ mod tests {
         assert!(json.contains(r#""name":"nightly""#));
 
         let parsed: RequestEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, env);
+    }
+
+    #[test]
+    fn dry_run_report_round_trips() {
+        let env = ResponseEnvelope::success(
+            5,
+            Response::DryRunReport(DryRunReport {
+                summary:  "would delete feed 'nightly'".into(),
+                effects:  vec!["would remove feed 'nightly' from registry".into()],
+                warnings: vec!["feed 'weekly' references 'nightly' via nextstep".into()],
+            }),
+        );
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains(r#""kind":"dry_run_report""#));
+        assert!(json.contains(r#""summary""#));
+        assert!(json.contains(r#""effects""#));
+        assert!(json.contains(r#""warnings""#));
+
+        let parsed: ResponseEnvelope = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, env);
     }
 
@@ -610,10 +715,16 @@ mod tests {
     fn ndjson_framing_round_trips_multiple_messages() {
         let mut buf: Vec<u8> = Vec::new();
 
-        let req1 = RequestEnvelope { id: 1, caller: None, request: Request::Ping };
+        let req1 = RequestEnvelope {
+            id: 1,
+            caller: None,
+            dry_run: false,
+            request: Request::Ping,
+        };
         let req2 = RequestEnvelope {
             id: 2,
             caller: None,
+            dry_run: false,
             request: Request::GetEndpoint { name: "prod-sftp".into() },
         };
 

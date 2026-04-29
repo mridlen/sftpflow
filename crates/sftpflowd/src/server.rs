@@ -327,22 +327,53 @@ pub fn dispatch(env: RequestEnvelope, state: &SharedDaemonState) -> ResponseEnve
 pub fn dispatch_local(env: RequestEnvelope, state: &SharedDaemonState) -> ResponseEnvelope {
     // Snapshot the bits the audit hook needs BEFORE we move `env`
     // into the match. We only clone the request when the RPC is
-    // mutating — read-only paths skip the clone entirely.
+    // mutating — read-only paths skip the clone entirely. Dry-run
+    // previews of mutating RPCs are still audited (the operator
+    // still ran a destructive-shaped command), but with a
+    // `dry-run:` outcome prefix so they're trivially filterable.
     let mutating         = is_mutating(&env.request);
     let caller_for_audit = if mutating { env.caller.clone() } else { None };
     let request_for_audit = if mutating { Some(env.request.clone()) } else { None };
+    let dry_run_for_audit = env.dry_run;
+
+    // Reject `dry_run=true` on RPCs that don't have a preview path.
+    // The CLI's destructive-command sites are the only callers that
+    // set this flag, so reaching this guard means either an old CLI
+    // talking to a new daemon (no chance — old CLIs never set the
+    // bit) or a hand-crafted envelope. Either way, fail loud rather
+    // than silently letting a real mutation slip through under a
+    // preview-shaped command.
+    if env.dry_run && !supports_dry_run(&env.request) {
+        let response = ResponseEnvelope::failure(
+            env.id,
+            error_code::INVALID_PARAMS,
+            format!(
+                "dry_run is not supported for `{}` — only delete/rename of \
+                 endpoints/keys/feeds, delete_secret, and cluster_remove_node \
+                 honor the flag",
+                method_name(&env.request),
+            ),
+        );
+        if let Some(req) = request_for_audit {
+            record_audit(state, caller_for_audit.as_deref(),
+                         &req, &response, dry_run_for_audit);
+        }
+        return response;
+    }
 
     let response = dispatch_local_inner(env, state);
 
     if let Some(req) = request_for_audit {
-        record_audit(state, caller_for_audit.as_deref(), &req, &response);
+        record_audit(state, caller_for_audit.as_deref(),
+                     &req, &response, dry_run_for_audit);
     }
 
     response
 }
 
 fn dispatch_local_inner(env: RequestEnvelope, state: &SharedDaemonState) -> ResponseEnvelope {
-    let id = env.id;
+    let id      = env.id;
+    let dry_run = env.dry_run;
 
     match env.request {
         // ---- liveness / introspection ----
@@ -372,12 +403,20 @@ fn dispatch_local_inner(env: RequestEnvelope, state: &SharedDaemonState) -> Resp
         Request::DeleteEndpoint { name } => {
             let mut guard = state.lock().unwrap();
             if let Some(rsp) = enforce_leader(id, &guard) { return rsp; }
-            result_to_envelope(id, handlers::delete_endpoint(&mut guard, &name))
+            if dry_run {
+                result_to_envelope(id, handlers::delete_endpoint_dry_run(&guard, &name))
+            } else {
+                result_to_envelope(id, handlers::delete_endpoint(&mut guard, &name))
+            }
         }
         Request::RenameEndpoint { from, to } => {
             let mut guard = state.lock().unwrap();
             if let Some(rsp) = enforce_leader(id, &guard) { return rsp; }
-            result_to_envelope(id, handlers::rename_endpoint(&mut guard, from, to))
+            if dry_run {
+                result_to_envelope(id, handlers::rename_endpoint_dry_run(&guard, &from, &to))
+            } else {
+                result_to_envelope(id, handlers::rename_endpoint(&mut guard, from, to))
+            }
         }
 
         // ---- keys (read) ----
@@ -399,12 +438,20 @@ fn dispatch_local_inner(env: RequestEnvelope, state: &SharedDaemonState) -> Resp
         Request::DeleteKey { name } => {
             let mut guard = state.lock().unwrap();
             if let Some(rsp) = enforce_leader(id, &guard) { return rsp; }
-            result_to_envelope(id, handlers::delete_key(&mut guard, &name))
+            if dry_run {
+                result_to_envelope(id, handlers::delete_key_dry_run(&guard, &name))
+            } else {
+                result_to_envelope(id, handlers::delete_key(&mut guard, &name))
+            }
         }
         Request::RenameKey { from, to } => {
             let mut guard = state.lock().unwrap();
             if let Some(rsp) = enforce_leader(id, &guard) { return rsp; }
-            result_to_envelope(id, handlers::rename_key(&mut guard, from, to))
+            if dry_run {
+                result_to_envelope(id, handlers::rename_key_dry_run(&guard, &from, &to))
+            } else {
+                result_to_envelope(id, handlers::rename_key(&mut guard, from, to))
+            }
         }
 
         // ---- feeds (read) ----
@@ -426,12 +473,20 @@ fn dispatch_local_inner(env: RequestEnvelope, state: &SharedDaemonState) -> Resp
         Request::DeleteFeed { name } => {
             let mut guard = state.lock().unwrap();
             if let Some(rsp) = enforce_leader(id, &guard) { return rsp; }
-            result_to_envelope(id, handlers::delete_feed(&mut guard, &name))
+            if dry_run {
+                result_to_envelope(id, handlers::delete_feed_dry_run(&guard, &name))
+            } else {
+                result_to_envelope(id, handlers::delete_feed(&mut guard, &name))
+            }
         }
         Request::RenameFeed { from, to } => {
             let mut guard = state.lock().unwrap();
             if let Some(rsp) = enforce_leader(id, &guard) { return rsp; }
-            result_to_envelope(id, handlers::rename_feed(&mut guard, from, to))
+            if dry_run {
+                result_to_envelope(id, handlers::rename_feed_dry_run(&guard, &from, &to))
+            } else {
+                result_to_envelope(id, handlers::rename_feed(&mut guard, from, to))
+            }
         }
 
         // ---- execution ----
@@ -476,7 +531,11 @@ fn dispatch_local_inner(env: RequestEnvelope, state: &SharedDaemonState) -> Resp
         Request::DeleteSecret { name } => {
             let mut guard = state.lock().unwrap();
             if let Some(rsp) = enforce_leader(id, &guard) { return rsp; }
-            result_to_envelope(id, handlers::delete_secret(&mut guard, &name))
+            if dry_run {
+                result_to_envelope(id, handlers::delete_secret_dry_run(&guard, &name))
+            } else {
+                result_to_envelope(id, handlers::delete_secret(&mut guard, &name))
+            }
         }
         Request::ListSecrets => {
             let guard = state.lock().unwrap();
@@ -511,7 +570,11 @@ fn dispatch_local_inner(env: RequestEnvelope, state: &SharedDaemonState) -> Resp
         Request::ClusterRemoveNode { node_id } => {
             let guard = state.lock().unwrap();
             if let Some(rsp) = enforce_leader(id, &guard) { return rsp; }
-            result_to_envelope(id, handlers::cluster_remove_node(&guard, node_id))
+            if dry_run {
+                result_to_envelope(id, handlers::cluster_remove_node_dry_run(&guard, node_id))
+            } else {
+                result_to_envelope(id, handlers::cluster_remove_node(&guard, node_id))
+            }
         }
 
         // ---- cluster (self-leave) ----
@@ -576,6 +639,23 @@ fn is_mutating(req: &Request) -> bool {
       | Request::SyncSchedules
       | Request::PutSecret      { .. }
       | Request::DeleteSecret   { .. }
+      | Request::ClusterRemoveNode { .. }
+    )
+}
+
+/// Allowlist of RPCs that honor the envelope's `dry_run` flag.
+/// Anything else paired with `dry_run=true` is rejected with
+/// INVALID_PARAMS in `dispatch_local` so a destructive command
+/// can never silently land as a real mutation.
+fn supports_dry_run(req: &Request) -> bool {
+    matches!(req,
+        Request::DeleteEndpoint    { .. }
+      | Request::RenameEndpoint    { .. }
+      | Request::DeleteKey         { .. }
+      | Request::RenameKey         { .. }
+      | Request::DeleteFeed        { .. }
+      | Request::RenameFeed        { .. }
+      | Request::DeleteSecret      { .. }
       | Request::ClusterRemoveNode { .. }
     )
 }
@@ -847,15 +927,28 @@ fn record_audit(
     caller:   Option<&str>,
     request:  &Request,
     response: &ResponseEnvelope,
+    dry_run:  bool,
 ) {
     // Grab a thread-local handle by cloning under the lock. Brief
     // critical section: the actual INSERT happens unlocked. We
     // can't share an AuditDb across threads behind a guard cheaply
     // (rusqlite::Connection is !Sync), so we just take the lock
     // for the whole INSERT. WAL mode keeps reads from blocking.
-    let outcome = match &response.outcome {
+    //
+    // Dry-runs get a `dry-run:` prefix on the outcome so live and
+    // preview rows are trivially filterable in `show audit`. The
+    // payload-shape (caller / rpc / args_hash) stays identical to
+    // the live row so the operator can see "the same person
+    // previewed and then ran this delete" by eyeballing two
+    // adjacent rows.
+    let live_outcome = match &response.outcome {
         sftpflow_proto::ResponseOutcome::Success { .. } => "ok".to_string(),
         sftpflow_proto::ResponseOutcome::Failure { error } => format!("err:{}", error.code),
+    };
+    let outcome = if dry_run {
+        format!("dry-run:{}", live_outcome)
+    } else {
+        live_outcome
     };
     let rpc       = method_name(request);
     let args_hash = audit::args_hash(request);
