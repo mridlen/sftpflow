@@ -685,17 +685,75 @@ fn require_cluster<'a>(
 
 /// `cluster status`: snapshot of leader, voters, learners.
 /// Read-only, any node can answer.
+///
+/// Beyond bare membership, this fills:
+///   - responder uptime (from `DaemonState.started`)
+///   - responder's local last_log / last_applied indices
+///   - leader-only per-peer `matched_log_index` + `lag`
+///
+/// Lag and matched are only meaningful when the responder is the
+/// current leader (openraft only reports replication metrics on
+/// leaders). When a follower answers, those fields stay `None` and
+/// the CLI prints a footer noting that.
 pub fn cluster_status(state: &DaemonState) -> Result<Response, ProtoError> {
     let ctx = require_cluster(state)?;
+
+    // ---- responder-side scalars --------------------------------
+    let uptime_secs              = state.started.elapsed().as_secs();
+    let responder_last_log       = ctx.last_log_index();
+    let responder_last_applied   = ctx.last_applied_index();
+    let leader_id                = ctx.current_leader();
+    let responder_is_leader      = ctx.is_leader();
+
+    // ---- per-peer replication progress (leader-only) ----------
+    // `replication_progress` is `Some(map)` exactly when this node
+    // is the active leader. Followers get `None` here and we leave
+    // matched_log_index / lag as None on every member row.
+    let replication = if responder_is_leader {
+        ctx.replication_progress()
+    } else {
+        None
+    };
+
+    // The leader's own matched index is its last_log_index (it is
+    // trivially "caught up" to itself). We use this for the lag
+    // baseline and for the leader's row.
+    let leader_baseline = responder_last_log;
 
     let mut members: Vec<ClusterMemberInfo> = ctx
         .members_with_voter_flag()
         .into_iter()
-        .map(|(node_id, (member, is_voter))| ClusterMemberInfo {
-            node_id,
-            advertise_addr: member.advertise_addr,
-            label:          member.label,
-            is_voter,
+        .map(|(node_id, (member, is_voter))| {
+            let (matched_log_index, lag) = match replication.as_ref() {
+                None => (None, None),
+                Some(rep) => {
+                    // The leader's own row: use its last_log_index
+                    // as matched, lag = 0. openraft's replication
+                    // map omits the leader itself from the map.
+                    if node_id == ctx.self_id {
+                        (leader_baseline, leader_baseline.map(|_| 0u64))
+                    } else {
+                        let matched = rep.get(&node_id).copied().flatten();
+                        let lag = match (leader_baseline, matched) {
+                            (Some(tip), Some(m)) => Some(tip.saturating_sub(m)),
+                            // Peer has acknowledged nothing yet — report
+                            // full tip as the lag so operators see the gap.
+                            (Some(tip), None)    => Some(tip),
+                            _                    => None,
+                        };
+                        (matched, lag)
+                    }
+                }
+            };
+
+            ClusterMemberInfo {
+                node_id,
+                advertise_addr: member.advertise_addr,
+                label:          member.label,
+                is_voter,
+                matched_log_index,
+                lag,
+            }
         })
         .collect();
     // BTreeMap iteration is already sorted by key, but be explicit:
@@ -704,10 +762,14 @@ pub fn cluster_status(state: &DaemonState) -> Result<Response, ProtoError> {
     members.sort_by_key(|m| m.node_id);
 
     Ok(Response::ClusterStatus(ClusterStatus {
-        cluster_id: ctx.cluster_id.clone(),
-        self_id:    ctx.self_id,
-        leader_id:  ctx.current_leader(),
+        cluster_id:                  ctx.cluster_id.clone(),
+        self_id:                     ctx.self_id,
+        leader_id,
         members,
+        responder_uptime_secs:       uptime_secs,
+        responder_last_log_index:    responder_last_log,
+        responder_last_applied_index: responder_last_applied,
+        responder_is_leader,
     }))
 }
 

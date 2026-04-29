@@ -292,6 +292,44 @@ impl ClusterHandle {
             .collect()
     }
 
+    // ------------------------------------------------------------
+    // status helpers (used by `cluster status`)
+    // ------------------------------------------------------------
+
+    /// This node's local last-log index (tip of its Raft log).
+    /// `None` before the first append. Cheap — reads cached metrics.
+    pub fn last_log_index(&self) -> Option<u64> {
+        self.raft.metrics().borrow().last_log_index
+    }
+
+    /// This node's local last-applied state-machine index.
+    /// Drawn from `metrics.last_applied.index`. `None` if no entry
+    /// has been applied yet.
+    pub fn last_applied_index(&self) -> Option<u64> {
+        self.raft
+            .metrics()
+            .borrow()
+            .last_applied
+            .as_ref()
+            .map(|l| l.index)
+    }
+
+    /// Per-peer matched log index, as the *leader* sees it.
+    ///
+    /// Returns `None` when this node is not the current leader
+    /// (openraft only populates `RaftMetrics::replication` on the
+    /// leader). When `Some`, the inner map's keys match the leader's
+    /// view of cluster members; values are `None` for peers that
+    /// have not yet acknowledged any log entry.
+    pub fn replication_progress(&self) -> Option<BTreeMap<u64, Option<u64>>> {
+        let m = self.raft.metrics().borrow().clone();
+        m.replication.map(|rep| {
+            rep.into_iter()
+                .map(|(nid, log_id_opt)| (nid, log_id_opt.map(|l| l.index)))
+                .collect()
+        })
+    }
+
     /// Append an empty log entry — useful as a smoke test that the
     /// leader is alive and replication works end-to-end.
     pub async fn append_noop(&self) -> Result<(), ClusterError> {

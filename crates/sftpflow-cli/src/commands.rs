@@ -2612,18 +2612,33 @@ fn cluster_status(state: &mut ShellState) {
 
     match rpc.call(Request::ClusterStatus) {
         Ok(Response::ClusterStatus(status)) => {
-            println!("Cluster:  {}", status.cluster_id);
+            // Header block: cluster id, leader, this node, uptime,
+            // responder's local log tip / state-machine tip.
+            println!("Cluster:    {}", status.cluster_id);
             match status.leader_id {
-                Some(id) => println!("Leader:   node_id={}", id),
-                None     => println!("Leader:   <election in progress>"),
+                Some(id) => println!("Leader:     node_id={}", id),
+                None     => println!("Leader:     <election in progress>"),
             }
-            println!("This node: {}", status.self_id);
+            println!("This node:  {}", status.self_id);
+            println!("Uptime:     {}", format_uptime(status.responder_uptime_secs));
+            println!(
+                "Log tip:    {}    Applied: {}",
+                fmt_opt_index(status.responder_last_log_index),
+                fmt_opt_index(status.responder_last_applied_index),
+            );
             println!();
-            // Header + separator. Width chosen to fit a typical
-            // 8-byte node_id, an IP:port advertise addr, and a
-            // short label without wrapping at 80 columns.
-            println!("  {:<8} {:<8} {:<24} {}", "NODE", "ROLE", "ADVERTISE", "LABEL");
-            println!("  {:-<8} {:-<8} {:-<24} {:-<20}", "", "", "", "");
+
+            // Member table. MATCHED/LAG are only populated when the
+            // responder is the leader; we render "-" for both when
+            // they are None so the column widths stay deterministic.
+            println!(
+                "  {:<8} {:<10} {:<24} {:<10} {:<8} {}",
+                "NODE", "ROLE", "ADVERTISE", "MATCHED", "LAG", "LABEL",
+            );
+            println!(
+                "  {:-<8} {:-<10} {:-<24} {:-<10} {:-<8} {:-<20}",
+                "", "", "", "", "", "",
+            );
             for m in &status.members {
                 let role = if Some(m.node_id) == status.leader_id {
                     "leader"
@@ -2635,16 +2650,63 @@ fn cluster_status(state: &mut ShellState) {
                 let self_marker = if m.node_id == status.self_id { " *" } else { "" };
                 let label_str = m.label.as_deref().unwrap_or("-");
                 println!(
-                    "  {:<8} {:<8} {:<24} {}{}",
-                    m.node_id, role, m.advertise_addr, label_str, self_marker,
+                    "  {:<8} {:<10} {:<24} {:<10} {:<8} {}{}",
+                    m.node_id,
+                    role,
+                    m.advertise_addr,
+                    fmt_opt_index(m.matched_log_index),
+                    fmt_opt_index(m.lag),
+                    label_str,
+                    self_marker,
                 );
             }
             println!();
             println!("(* = this node)");
+            // Be honest about which fields are unavailable when a
+            // follower answered. Operators can `connect <leader>`
+            // and re-run for the lag view.
+            if !status.responder_is_leader {
+                println!(
+                    "(MATCHED/LAG only populated by the leader; \
+                     this responder is a follower)",
+                );
+            }
         }
         Err(RpcError::Proto(e)) => println!("% {}", e.message),
         Err(e) => println!("% Error: {}", e),
         _ => {}
+    }
+}
+
+// ============================================================
+// cluster_status formatters
+// ============================================================
+
+/// Format a u64 log index for display, "-" when None. Centralized
+/// so MATCHED/LAG/Applied/Log tip columns stay aligned.
+fn fmt_opt_index(idx: Option<u64>) -> String {
+    match idx {
+        Some(i) => i.to_string(),
+        None    => "-".to_string(),
+    }
+}
+
+/// Render a wall-clock duration (in seconds) as a compact
+/// human string: "37s", "12m 04s", "3h 12m", "5d 02h". Days are
+/// the largest unit — operators rarely need years for daemon uptime.
+fn format_uptime(total_secs: u64) -> String {
+    let days  = total_secs / 86_400;
+    let hours = (total_secs % 86_400) / 3_600;
+    let mins  = (total_secs % 3_600) / 60;
+    let secs  = total_secs % 60;
+    if days > 0 {
+        format!("{}d {:02}h", days, hours)
+    } else if hours > 0 {
+        format!("{}h {:02}m", hours, mins)
+    } else if mins > 0 {
+        format!("{}m {:02}s", mins, secs)
+    } else {
+        format!("{}s", secs)
     }
 }
 

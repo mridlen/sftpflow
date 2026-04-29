@@ -211,6 +211,25 @@ pub struct ClusterStatus {
     /// All members openraft knows about (voters + learners). Order
     /// is by node_id ascending so output is deterministic.
     pub members: Vec<ClusterMemberInfo>,
+    /// Wall-clock seconds since the responder's daemon started.
+    /// Defaulted on older daemons that don't populate this field.
+    #[serde(default)]
+    pub responder_uptime_secs: u64,
+    /// Responder's local last-log index (leader: tip of the cluster
+    /// log; follower: this node's tip). `None` if the responder has
+    /// no log yet.
+    #[serde(default)]
+    pub responder_last_log_index: Option<u64>,
+    /// Responder's local last-applied index (state-machine tip).
+    /// Always populated when a state machine has applied at least
+    /// one entry; otherwise `None`.
+    #[serde(default)]
+    pub responder_last_applied_index: Option<u64>,
+    /// True if the responding node is itself the leader. When false,
+    /// per-member matched/lag fields below are unavailable (only the
+    /// leader sees replication progress).
+    #[serde(default)]
+    pub responder_is_leader: bool,
 }
 
 /// One row of cluster status output.
@@ -223,6 +242,17 @@ pub struct ClusterMemberInfo {
     /// True if this node was a voter at the last applied membership
     /// change. False means this is a learner (non-voting replica).
     pub is_voter: bool,
+    /// Highest log index the leader has seen this peer acknowledge
+    /// (openraft replication-metrics matched index). Only populated
+    /// when the responder is the leader; `None` otherwise. For the
+    /// leader's own row this mirrors leader's last_log_index.
+    #[serde(default)]
+    pub matched_log_index: Option<u64>,
+    /// `leader.last_log_index - matched_log_index`, saturating at 0.
+    /// Same availability rule as `matched_log_index`. The CLI surfaces
+    /// large values as the "this peer is falling behind" signal.
+    #[serde(default)]
+    pub lag: Option<u64>,
 }
 
 /// Outcome of a ClusterMintToken request. The token string itself

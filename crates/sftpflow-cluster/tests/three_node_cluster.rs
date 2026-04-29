@@ -201,6 +201,58 @@ async fn three_node_cluster_elects_replicates_and_resizes() {
     })
     .await;
 
+    // ---- 8. Exercise the new status helpers ------------------
+    // After replication the leader's `replication_progress()` map
+    // must be `Some` and contain the two followers, both caught up
+    // to the leader's last_log_index. Followers must report `None`
+    // for `replication_progress` (per openraft 0.9 semantics).
+    let leader_h = leader_handle;
+    let follower_handles: Vec<&ClusterHandle> = [&h1, &h2, &h3]
+        .into_iter()
+        .filter(|h| !std::ptr::eq(*h, leader_h))
+        .collect();
+
+    // Wait for the leader's view of replication to fully catch up.
+    // Right after `append_noop`, the leader's matched-index map can
+    // briefly trail; poll until both followers match leader.tip.
+    wait_for(
+        "leader replication map caught up",
+        Duration::from_secs(5),
+        || {
+            let tip = match leader_h.last_log_index() {
+                Some(i) => i,
+                None => return false,
+            };
+            let rep = match leader_h.replication_progress() {
+                Some(r) => r,
+                None => return false,
+            };
+            follower_handles.iter().all(|fh| {
+                let id = fh.raw_metrics().id;
+                matches!(rep.get(&id), Some(Some(matched)) if *matched >= tip)
+            })
+        },
+    )
+    .await;
+
+    // Followers don't expose replication metrics — confirm that.
+    for fh in &follower_handles {
+        assert!(
+            fh.replication_progress().is_none(),
+            "non-leader should report None for replication_progress",
+        );
+    }
+
+    // Sanity-check the index helpers themselves.
+    assert!(
+        leader_h.last_log_index().is_some(),
+        "leader should have a last_log_index after append_noop",
+    );
+    assert!(
+        leader_h.last_applied_index().is_some(),
+        "leader should have a last_applied_index after append_noop",
+    );
+
     // Tear down — Drop on each ClusterNode aborts the gRPC task.
     drop(node1);
     drop(node2);

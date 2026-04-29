@@ -93,6 +93,22 @@ impl ClusterContext {
         self.handle.members_with_voter_flag()
     }
 
+    /// This node's local last-log index. See ClusterHandle.
+    pub fn last_log_index(&self) -> Option<u64> {
+        self.handle.last_log_index()
+    }
+
+    /// This node's local last-applied state-machine index.
+    pub fn last_applied_index(&self) -> Option<u64> {
+        self.handle.last_applied_index()
+    }
+
+    /// Leader-only per-peer matched index. `None` if this node is
+    /// not currently the leader.
+    pub fn replication_progress(&self) -> Option<BTreeMap<u64, Option<u64>>> {
+        self.handle.replication_progress()
+    }
+
     /// Mint a join token using this node's TokenSecret. Returns
     /// `(token, expires_at_unix)`. Errors if this node doesn't
     /// hold the secret (i.e. it's not the bootstrap node in M12).
