@@ -2,10 +2,17 @@
 // cli.rs - Interactive shell loop and command dispatch
 // ============================================================
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use rustyline::error::ReadlineError;
-use rustyline::DefaultEditor;
+use rustyline::history::FileHistory;
+use rustyline::Editor;
+
+use sftpflow_proto::{Request, Response}; // sftpflow-proto
 
 use crate::commands; // commands.rs
+use crate::completer::{HelperData, NameCache, ShellHelper}; // completer.rs
 use crate::feed::{Config, Endpoint, Feed, NextStep, PgpKey, ServerConnection}; // feed.rs
 use crate::rpc::RpcClient; // rpc.rs
 
@@ -120,8 +127,17 @@ impl ShellState {
 
 /// Main entry point for the interactive shell.
 pub fn run(socket_addr: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
-    let mut rl = DefaultEditor::new()?;
     let mut state = ShellState::new(socket_addr);
+
+    // Shared state between the readline editor and the loop.
+    // The completer reads `mode` + `names`; the loop syncs them
+    // before each prompt. RefCell-protected so the Completer
+    // (which only gets &self) can read while we mutate from out
+    // here between readline calls.
+    let helper_data = Rc::new(RefCell::new(HelperData::default()));
+
+    let mut rl: Editor<ShellHelper, FileHistory> = Editor::new()?;
+    rl.set_helper(Some(ShellHelper { data: Rc::clone(&helper_data) }));
 
     // Load history if available
     let history_path = history_path();
@@ -129,6 +145,11 @@ pub fn run(socket_addr: Option<String>) -> Result<(), Box<dyn std::error::Error>
 
     // ---- REPL loop ----
     while state.running {
+        // Refresh completer cache + sync mode so tab-completion
+        // sees the current shell state. Cheap when the cache is
+        // clean — only round-trips after mutating commands.
+        sync_helper(&mut state, &helper_data);
+
         let prompt = state.prompt();
         match rl.readline(&prompt) {
             Ok(line) => {
@@ -137,6 +158,15 @@ pub fn run(socket_addr: Option<String>) -> Result<(), Box<dyn std::error::Error>
                     continue;
                 }
                 let _ = rl.add_history_entry(&line);
+
+                // Mark the cache dirty before dispatch so the next
+                // prompt re-fetches if this command may have
+                // changed names. Checked against the mode at the
+                // time of dispatch (commit-in-edit-mode counts).
+                if dispatch_invalidates_names(&line, &state.mode) {
+                    helper_data.borrow_mut().names_dirty = true;
+                }
+
                 dispatch(&line, &mut state);
             }
             Err(ReadlineError::Interrupted | ReadlineError::Eof) => {
@@ -155,6 +185,87 @@ pub fn run(socket_addr: Option<String>) -> Result<(), Box<dyn std::error::Error>
     let _ = rl.save_history(&history_path);
 
     Ok(())
+}
+
+// ============================================================
+// Completer-cache sync
+// ============================================================
+
+/// Push the current Mode into the helper and (if the cache is
+/// dirty) re-fetch the registry name lists from the daemon.
+/// Connection names come from local config; the rest from RPC.
+fn sync_helper(state: &mut ShellState, helper_data: &Rc<RefCell<HelperData>>) {
+    // Always sync the mode — cheap, no RPC.
+    helper_data.borrow_mut().mode = state.mode.clone();
+
+    // Skip the refresh when the cache is already up to date.
+    if !helper_data.borrow().names_dirty {
+        return;
+    }
+
+    // Local: connection registry comes from CLI-side config.
+    let connections: Vec<String> = state.config.connections.keys().cloned().collect();
+
+    // Remote: registry name lists from the daemon. Errors are
+    // non-fatal — we just leave the list empty so the operator
+    // sees no completions for that type rather than crashing
+    // their shell.
+    let (endpoints, keys, feeds, secrets) = if let Some(rpc) = state.rpc.as_mut() {
+        (
+            list_string_names(rpc, Request::ListEndpoints),
+            list_string_names(rpc, Request::ListKeys),
+            list_feed_names(rpc),
+            list_string_names(rpc, Request::ListSecrets),
+        )
+    } else {
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+    };
+
+    let mut data = helper_data.borrow_mut();
+    data.names = NameCache { endpoints, keys, feeds, secrets, connections };
+    data.names_dirty = false;
+}
+
+/// Issue a Names-returning RPC and unwrap to a Vec<String>.
+/// Used for ListEndpoints / ListKeys / ListSecrets.
+fn list_string_names(rpc: &mut RpcClient, req: Request) -> Vec<String> {
+    match rpc.call(req) {
+        Ok(Response::Names(n)) => n,
+        _ => Vec::new(),
+    }
+}
+
+/// ListFeeds returns FeedSummaries, not Names — extract the
+/// name field from each summary.
+fn list_feed_names(rpc: &mut RpcClient) -> Vec<String> {
+    match rpc.call(Request::ListFeeds) {
+        Ok(Response::FeedSummaries(s)) => s.into_iter().map(|fs| fs.name).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Decide whether a just-typed command line might have changed
+/// the registry. We err on the side of "yes" when the first token
+/// matches a mutating verb — false positives just cost one extra
+/// list round-trip on the next prompt.
+fn dispatch_invalidates_names(line: &str, mode: &Mode) -> bool {
+    let first = line.split_whitespace().next().unwrap_or("");
+    match mode {
+        Mode::Exec => matches!(
+            first,
+            "create"
+            | "edit"
+            | "delete"
+            | "rename"
+            | "secret"
+            | "connection"
+            | "connect"
+        ),
+        // `commit` in any edit mode persists a new/updated object,
+        // which can change the endpoint/key/feed name list. Other
+        // edit-mode commands only mutate pending state.
+        _ => first == "commit",
+    }
 }
 
 // ---- Command dispatch ----

@@ -5,9 +5,10 @@ use std::process;
 // `feed` keeps the existing `feed::Config` call sites in this crate unchanged.
 pub use sftpflow_core as feed;
 
-mod cli;      // cli.rs - interactive shell loop and command dispatch
-mod commands; // commands.rs - command implementations
-pub mod rpc;  // rpc.rs - RPC client for talking to sftpflowd
+mod cli;       // cli.rs - interactive shell loop and command dispatch
+mod commands;  // commands.rs - command implementations
+mod completer; // completer.rs - rustyline tab-completion helper
+pub mod rpc;   // rpc.rs - RPC client for talking to sftpflowd
 
 fn main() {
     // Initialize logging (set RUST_LOG=info to see log output)
