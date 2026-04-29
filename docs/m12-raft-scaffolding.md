@@ -186,14 +186,17 @@ Stable node identity: `node.json` is written once at `init` or `join` and never 
 
 ### 4.3 Join token format
 
+v2 (current — landed as part of UX roadmap #7):
+
 ```
-sftpflow-join-v1.<cluster_id>.<expiry_unix>.<nonce_b64>.<hmac_b64>
+sjv2.<cluster_fp>.<expiry_unix>.<nonce_b64>.<hmac_b64>
 ```
 
-- `cluster_id`: UUID v4 generated at `init`, stored in `node.json`.
+- `sjv2`: format-version tag. v1 was `sftpflow-join-v1.<UUID>.<...>` and ran ~131 chars; v2 trims to ~62.
+- `cluster_fp`: first 6 chars of URL-safe-base64(SHA256(cluster_id)) (~36 bits). Advisory only — the HMAC keyed on the cluster's secret is the actual authentication. Server validates by recomputing the fingerprint from its own `cluster_id` and comparing.
 - `expiry_unix`: token expires 1 hour after minting (configurable).
-- `nonce_b64`: 128 bits of randomness, single-use.
-- `hmac_b64`: HMAC-SHA256 over the preceding fields, keyed with a per-cluster token secret (32 random bytes generated at `init`, stored encrypted in the secrets blob under the reserved name `__cluster_token_key__`).
+- `nonce_b64`: 12 random bytes (96 bits), single-use, URL-safe base64 → 16 chars.
+- `hmac_b64`: HMAC-SHA256 over the preceding fields, keyed with a per-cluster token secret (32 random bytes generated at `init`, stored encrypted in the secrets blob under the reserved name `__cluster_token_key__`), then truncated to the leftmost 16 bytes (HMAC-SHA-256-128 per RFC 4868) → 22 chars.
 
 Used nonces are recorded in a small `cluster/tokens_used.json` file on the bootstrap node so tokens cannot be replayed. Single-use is the right default even though the HMAC alone would let us skip the used-nonce list — replay protection is cheap insurance against a leaked token.
 

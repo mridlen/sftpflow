@@ -4,14 +4,26 @@
 //
 // Wire format (single ASCII string the operator copy-pastes):
 //
-//   sftpflow-join-v1.<cluster_id>.<exp_unix>.<nonce_b64>.<hmac_b64>
+//   sjv2.<cluster_fp>.<exp_unix>.<nonce_b64>.<hmac_b64>
 //
 // Where:
-//   - cluster_id  - UUID generated at `sftpflowd init`
+//   - sjv2        - format version tag ("sftpflow join v2", short).
+//                   v1 was the 131-char form with the literal
+//                   "sftpflow-join-v1" prefix and a full UUID
+//                   cluster_id; v2 trims it to ~60 chars.
+//   - cluster_fp  - first 6 chars of URL-safe-base64( SHA256(cluster_id) ),
+//                   ~36 bits. Advisory only — the HMAC keyed on the
+//                   cluster's TokenSecret is the actual authentication.
+//                   Server validates by recomputing the fingerprint
+//                   from its own cluster_id and comparing.
 //   - exp_unix    - u64 expiry timestamp, wall-clock seconds since UNIX epoch
-//   - nonce_b64   - 16 random bytes, URL-safe base64 (no padding)
-//   - hmac_b64    - HMAC-SHA256 of "<v1>.<cluster_id>.<exp_unix>.<nonce_b64>"
-//                   keyed with the cluster's TokenSecret, URL-safe base64
+//   - nonce_b64   - 12 random bytes, URL-safe base64 (no padding) → 16 chars.
+//                   96 bits is plenty against random collision; replay
+//                   protection lives in `UsedNonces`, not in nonce length.
+//   - hmac_b64    - HMAC-SHA256 of "<sjv2>.<cluster_fp>.<exp_unix>.<nonce_b64>"
+//                   keyed with the cluster's TokenSecret, then truncated
+//                   to the leftmost 16 bytes (HMAC-SHA-256-128 per
+//                   RFC 4868), URL-safe base64 → 22 chars.
 //
 // Replay protection: the bootstrap node maintains a set of nonces
 // already redeemed (`UsedNonces`); validate() rejects any nonce in
@@ -30,12 +42,33 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 
-const PREFIX:    &str = "sftpflow-join-v1";
-const NONCE_LEN: usize = 16;
+const PREFIX:    &str = "sjv2";
+const NONCE_LEN: usize = 12;
+const HMAC_LEN:  usize = 16;
+const FP_LEN:    usize = 6;
 
 type HmacSha256 = Hmac<Sha256>;
+
+// ============================================================
+// Cluster fingerprint
+// ============================================================
+
+/// Derive the 6-char fingerprint embedded in v2 tokens.
+///
+/// Why a fingerprint instead of the raw cluster_id: the raw form
+/// is a 36-char UUID and dominates token length. Replacing it with
+/// `b64(sha256(cluster_id))[..6]` saves 30 chars while staying a
+/// stable, deterministic identifier per cluster. ~36 bits of
+/// collision space is adequate because the fingerprint is *only*
+/// an early-rejection / friendly-error aid; the HMAC, keyed on the
+/// cluster's secret, is what actually authenticates the token.
+fn cluster_fingerprint(cluster_id: &str) -> String {
+    let digest = Sha256::digest(cluster_id.as_bytes());
+    let encoded = B64.encode(digest);
+    encoded.chars().take(FP_LEN).collect()
+}
 
 // ============================================================
 // TokenSecret - the HMAC key
@@ -152,14 +185,18 @@ pub fn mint(
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
     let nonce_b64 = B64.encode(nonce_bytes);
 
-    let signed_part = format!("{}.{}.{}.{}", PREFIX, cluster_id, exp, nonce_b64);
+    let cluster_fp  = cluster_fingerprint(cluster_id);
+    let signed_part = format!("{}.{}.{}.{}", PREFIX, cluster_fp, exp, nonce_b64);
 
-    // HMAC the signed part. `Mac::update` cannot fail; key length
-    // is fixed so `new_from_slice` only fails on programmer error.
+    // HMAC the signed part, then truncate to HMAC_LEN bytes
+    // (HMAC-SHA-256-128 per RFC 4868). `Mac::update` cannot fail;
+    // key length is fixed so `new_from_slice` only fails on
+    // programmer error.
     let mut mac = <HmacSha256 as Mac>::new_from_slice(secret.as_bytes())
         .expect("hmac key length is constant");
     mac.update(signed_part.as_bytes());
-    let hmac_b64 = B64.encode(mac.finalize().into_bytes());
+    let full_tag = mac.finalize().into_bytes();
+    let hmac_b64 = B64.encode(&full_tag[..HMAC_LEN]);
 
     Ok(format!("{}.{}", signed_part, hmac_b64))
 }
@@ -194,7 +231,7 @@ pub fn validate(
     if parts.len() != 5 {
         return Err(TokenError::Malformed("expected 5 dot-separated parts"));
     }
-    let (prefix, cid, exp_str, nonce_b64, hmac_b64) =
+    let (prefix, supplied_fp, exp_str, nonce_b64, hmac_b64) =
         (parts[0], parts[1], parts[2], parts[3], parts[4]);
 
     if prefix != PREFIX {
@@ -202,24 +239,37 @@ pub fn validate(
     }
 
     // ---- 2. Cluster identity match -------------------------
-    if cid != cluster_id {
+    // The token carries only a fingerprint; recompute ours and
+    // compare. Fingerprint mismatch → token was minted for a
+    // different cluster (or the operator pasted the wrong one).
+    let our_fp = cluster_fingerprint(cluster_id);
+    if supplied_fp != our_fp {
         return Err(TokenError::WrongCluster {
-            expected: cluster_id.to_string(),
-            got:      cid.to_string(),
+            expected: our_fp,
+            got:      supplied_fp.to_string(),
         });
     }
 
     // ---- 3. HMAC verification ------------------------------
-    let signed_part = format!("{}.{}.{}.{}", prefix, cid, exp_str, nonce_b64);
+    let signed_part = format!("{}.{}.{}.{}", prefix, supplied_fp, exp_str, nonce_b64);
     let supplied_hmac = B64
         .decode(hmac_b64)
         .map_err(|_| TokenError::Malformed("hmac not valid base64"))?;
+    if supplied_hmac.len() != HMAC_LEN {
+        return Err(TokenError::Malformed("hmac wrong length"));
+    }
 
     let mut mac = <HmacSha256 as Mac>::new_from_slice(secret.as_bytes())
         .expect("hmac key length is constant");
     mac.update(signed_part.as_bytes());
-    // verify_slice does constant-time comparison.
-    mac.verify_slice(&supplied_hmac).map_err(|_| TokenError::BadHmac)?;
+    let full_tag = mac.finalize().into_bytes();
+    // Constant-time comparison of the truncated MAC. We don't use
+    // `verify_truncated_left` because the API is awkward across
+    // hmac crate versions; a manual constant-time loop on the
+    // already-decoded bytes is equivalent and obvious.
+    if !ct_eq(&full_tag[..HMAC_LEN], &supplied_hmac) {
+        return Err(TokenError::BadHmac);
+    }
 
     // ---- 4. Expiry -----------------------------------------
     let exp_unix: u64 = exp_str
@@ -239,10 +289,23 @@ pub fn validate(
     }
 
     Ok(ValidatedToken {
-        cluster_id: cid.to_string(),
+        cluster_id: cluster_id.to_string(),
         nonce_b64:  nonce_b64.to_string(),
         exp_unix,
     })
+}
+
+/// Constant-time byte-slice equality. Length-mismatched inputs
+/// short-circuit (length is not secret here).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 // ============================================================
@@ -264,6 +327,34 @@ mod tests {
         let v = validate(&secret, &token, cluster, &used).unwrap();
         assert_eq!(v.cluster_id, cluster);
         assert!(v.exp_unix > 0);
+    }
+
+    #[test]
+    fn v2_token_is_compact() {
+        // Locks in the size win that justified the v2 format change.
+        // For a typical 2026-era epoch the token lands around 62
+        // chars; allow a small slack for exp_unix growing a digit.
+        let (secret, cluster, _) = fresh();
+        let token = mint(&secret, cluster, 3600).unwrap();
+        assert!(token.starts_with("sjv2."), "expected sjv2 prefix, got {}", token);
+        assert!(
+            token.len() <= 70,
+            "v2 token should be ≤70 chars, was {}: {}", token.len(), token,
+        );
+    }
+
+    #[test]
+    fn fingerprint_is_stable_per_cluster() {
+        // Same cluster_id → same fingerprint; different clusters →
+        // (overwhelmingly) different fingerprints.
+        assert_eq!(
+            cluster_fingerprint("cluster-aaa-111"),
+            cluster_fingerprint("cluster-aaa-111"),
+        );
+        assert_ne!(
+            cluster_fingerprint("cluster-aaa-111"),
+            cluster_fingerprint("cluster-bbb-222"),
+        );
     }
 
     #[test]
