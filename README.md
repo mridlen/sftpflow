@@ -58,6 +58,54 @@ Requires **Rust 1.80+** (edition 2024) and a working C toolchain
 (MSVC on Windows; gcc/clang on Linux). The build is pure Rust where
 possible — `protoc` ships vendored, no system install needed.
 
+#### Prerequisites
+
+Install the latest stable Rust via [rustup](https://rustup.rs) plus a
+C toolchain for your platform.
+
+**Linux (Debian / Ubuntu):**
+
+```sh
+sudo apt update
+sudo apt install -y build-essential pkg-config libssl-dev git curl
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"
+```
+
+**Linux (RHEL / Fedora):**
+
+```sh
+sudo dnf install -y gcc gcc-c++ make pkgconf-pkg-config openssl-devel git curl
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"
+```
+
+**macOS:**
+
+```sh
+xcode-select --install
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"
+```
+
+**Windows:**
+
+1. Install [Visual Studio Build Tools](https://visualstudio.microsoft.com/downloads/)
+   and select the **"Desktop development with C++"** workload (this
+   provides the MSVC linker and Windows SDK).
+2. Install [Git for Windows](https://git-scm.com/download/win).
+3. Install Rust via [rustup-init.exe](https://www.rust-lang.org/tools/install)
+   and accept the default `stable-x86_64-pc-windows-msvc` toolchain.
+
+After install, verify and (optionally) refresh the toolchain:
+
+```sh
+rustc --version          # should report 1.80 or newer
+rustup update stable     # pull the latest stable release
+```
+
+#### Build
+
 ```sh
 git clone https://github.com/mridlen/sftpflow.git
 cd sftpflow
