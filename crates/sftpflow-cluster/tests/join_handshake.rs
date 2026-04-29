@@ -173,6 +173,7 @@ async fn join_handshake_end_to_end() {
         cluster_id:        cluster_id.to_string(),
         token_secret:      Some(token_secret.clone()),
         join_handler:      Some(join_handler),
+        forward_handler:   None,
     }).await.expect("start n1");
 
     let h1 = n1_node.handle();
@@ -224,6 +225,7 @@ async fn join_handshake_end_to_end() {
         cluster_id:        cluster_id.to_string(),
         token_secret:      None,
         join_handler:      None,
+        forward_handler:   None,
     }).await.expect("start n2");
     let h2 = n2_node.handle();
 
@@ -262,6 +264,7 @@ async fn join_handshake_end_to_end() {
         cluster_id:        cluster_id.to_string(),
         token_secret:      None,
         join_handler:      None,
+        forward_handler:   None,
     }).await.expect("start n3");
     let h3 = n3_node.handle();
 

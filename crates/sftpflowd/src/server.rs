@@ -30,6 +30,11 @@ use sftpflow_proto::{
     ResponseEnvelope,
 };
 
+/// Public alias for the daemon's primary state container. Wrapped
+/// so threads (NDJSON connections + the gRPC forward handler)
+/// share the same instance behind a single Mutex.
+pub type SharedDaemonState = Arc<Mutex<DaemonState>>;
+
 use crate::cluster_runtime::ClusterContext; // cluster_runtime.rs - runtime cluster bundle
 use crate::handlers; // handlers.rs - RPC method implementations
 use crate::history::RunDb; // history.rs - SQLite run history
@@ -67,29 +72,36 @@ pub struct DaemonState {
 // Entry point - parse address, pick listener, serve
 // ============================================================
 
-/// Parse `addr` ("unix:/path", "tcp:host:port", or "host:port") and
-/// run the appropriate accept loop until the listener errors out.
-///
-/// `cluster` is `Some` whenever the daemon is running as a Raft
-/// member (init / join / cluster-mode restart). Pass `None` for
-/// the legacy single-node path; mutating RPCs then run unguarded.
-pub fn run(
-    addr: &str,
-    config: Config,
-    run_db: Option<RunDb>,
+/// Build a fresh `SharedDaemonState`. Exposed so the daemon's
+/// startup paths can stash a clone of the Arc into the cluster
+/// forward handler *before* handing the same Arc to `run`.
+pub fn build_shared_state(
+    config:  Config,
+    run_db:  Option<RunDb>,
     secrets: Option<SecretStore>,
     cluster: Option<ClusterContext>,
-) -> std::io::Result<()> {
+) -> SharedDaemonState {
     let dkron_url = config.server.dkron_url.clone();
-    let state = Arc::new(Mutex::new(DaemonState {
+    Arc::new(Mutex::new(DaemonState {
         config,
         started: Instant::now(),
         dkron_url,
         run_db,
         secrets,
         cluster,
-    }));
+    }))
+}
 
+/// Parse `addr` ("unix:/path", "tcp:host:port", or "host:port") and
+/// run the appropriate accept loop until the listener errors out.
+///
+/// Takes a pre-built `SharedDaemonState` so the daemon can wire up
+/// the cluster forward handler against the same Arc before serving
+/// begins. Use `build_shared_state` to construct one.
+pub fn run(
+    addr:  &str,
+    state: SharedDaemonState,
+) -> std::io::Result<()> {
     // Split into (scheme, rest). Anything without a known scheme
     // prefix is treated as a bare "host:port" and defaults to TCP.
     let (scheme, rest) = match addr.split_once(':') {
@@ -122,7 +134,7 @@ pub fn run(
 // TCP listener
 // ============================================================
 
-fn serve_tcp(addr: &str, state: Arc<Mutex<DaemonState>>) -> std::io::Result<()> {
+fn serve_tcp(addr: &str, state: SharedDaemonState) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr)?;
     info!("tcp listener bound to {}", addr);
 
@@ -144,7 +156,7 @@ fn serve_tcp(addr: &str, state: Arc<Mutex<DaemonState>>) -> std::io::Result<()> 
     Ok(())
 }
 
-fn handle_tcp(stream: TcpStream, state: Arc<Mutex<DaemonState>>) -> std::io::Result<()> {
+fn handle_tcp(stream: TcpStream, state: SharedDaemonState) -> std::io::Result<()> {
     // Split the stream into separate read/write halves so we can wrap
     // the reader in a BufReader while writing through the original.
     let writer = stream.try_clone()?;
@@ -158,7 +170,7 @@ fn handle_tcp(stream: TcpStream, state: Arc<Mutex<DaemonState>>) -> std::io::Res
 // ============================================================
 
 #[cfg(unix)]
-fn serve_unix(path: &str, state: Arc<Mutex<DaemonState>>) -> std::io::Result<()> {
+fn serve_unix(path: &str, state: SharedDaemonState) -> std::io::Result<()> {
     // Best-effort cleanup of a stale socket file from a previous run.
     // If we can't remove it, the bind() below will surface the error.
     let _ = std::fs::remove_file(path);
@@ -184,7 +196,7 @@ fn serve_unix(path: &str, state: Arc<Mutex<DaemonState>>) -> std::io::Result<()>
 }
 
 #[cfg(unix)]
-fn handle_unix(stream: UnixStream, state: Arc<Mutex<DaemonState>>) -> std::io::Result<()> {
+fn handle_unix(stream: UnixStream, state: SharedDaemonState) -> std::io::Result<()> {
     let writer = stream.try_clone()?;
     let reader = BufReader::new(stream);
     // connection_loop() - below
@@ -201,7 +213,7 @@ fn handle_unix(stream: UnixStream, state: Arc<Mutex<DaemonState>>) -> std::io::R
 fn connection_loop<R, W>(
     mut reader: R,
     mut writer: W,
-    state: Arc<Mutex<DaemonState>>,
+    state: SharedDaemonState,
 ) -> std::io::Result<()>
 where
     R: BufRead,
@@ -238,18 +250,45 @@ where
 // Request dispatch
 // ============================================================
 //
-// Thin routing layer: reads from state, calls into handlers.rs for
-// actual business logic. Read-only RPCs lock briefly and release;
-// mutating RPCs hold the lock through the full mutation + save.
+// Two entry points:
 //
-// Mutating RPCs additionally pass through `enforce_leader` first
-// (cluster mode only) — followers fail loud with NOT_LEADER. Reads
-// run unguarded so `cluster status`, `show feeds`, etc. work from
-// any node. M13 turns the gate into automatic forwarding.
+//   `dispatch`        - public, used by NDJSON connection threads.
+//                       For mutating RPCs in cluster mode it tries
+//                       to forward to the current leader first;
+//                       falls back to local handling if we ARE the
+//                       leader, if no cluster is configured, or if
+//                       the request is read-only.
+//
+//   `dispatch_local`  - public, used by the cluster gRPC forward
+//                       handler. Same body as `dispatch` minus the
+//                       forwarding hook. Called when this node has
+//                       received a forwarded envelope from a peer
+//                       follower; further forwarding would loop.
+//
+// Mutating RPCs in `dispatch_local` still pass through
+// `enforce_leader` so a stale follower (one that demoted between
+// receiving a forward and processing it) returns NOT_LEADER cleanly
+// instead of writing local state.
 
-fn dispatch(env: RequestEnvelope, state: &Arc<Mutex<DaemonState>>) -> ResponseEnvelope {
+pub fn dispatch(env: RequestEnvelope, state: &SharedDaemonState) -> ResponseEnvelope {
     let id = env.id;
     debug!("dispatch id={} request={:?}", id, env.request);
+
+    // Cluster forwarding: for mutating RPCs in cluster mode, ship
+    // the whole envelope to the current leader. Follower → leader
+    // routing is invisible to the CLI: it gets the same response
+    // the leader produced, with the original request id preserved.
+    if is_mutating(&env.request) {
+        if let Some(rsp) = forward_if_follower(&env, state) {
+            return rsp;
+        }
+    }
+
+    dispatch_local(env, state)
+}
+
+pub fn dispatch_local(env: RequestEnvelope, state: &SharedDaemonState) -> ResponseEnvelope {
+    let id = env.id;
 
     match env.request {
         // ---- liveness / introspection ----
@@ -423,6 +462,230 @@ fn dispatch(env: RequestEnvelope, state: &Arc<Mutex<DaemonState>>) -> ResponseEn
             let guard = state.lock().unwrap();
             result_to_envelope(id, handlers::cluster_get_ca(&guard))
         }
+    }
+}
+
+// ============================================================
+// is_mutating - which RPCs need to land on the leader
+// ============================================================
+
+/// Returns true for any RPC whose handling either writes config
+/// state, mutates the sealed store, dispatches a feed transfer, or
+/// changes Raft membership. These are the requests we forward to
+/// the current leader from a follower. Read-only RPCs return false
+/// and are always served locally.
+fn is_mutating(req: &Request) -> bool {
+    matches!(req,
+        Request::PutEndpoint    { .. }
+      | Request::DeleteEndpoint { .. }
+      | Request::RenameEndpoint { .. }
+      | Request::PutKey         { .. }
+      | Request::DeleteKey      { .. }
+      | Request::RenameKey      { .. }
+      | Request::PutFeed        { .. }
+      | Request::DeleteFeed     { .. }
+      | Request::RenameFeed     { .. }
+      | Request::RunFeedNow     { .. }
+      | Request::SyncSchedules
+      | Request::PutSecret      { .. }
+      | Request::DeleteSecret   { .. }
+      | Request::ClusterRemoveNode { .. }
+    )
+}
+
+// ============================================================
+// forward_if_follower - cluster-mode forwarding gate
+// ============================================================
+//
+// Snapshots just the bits we need under the daemon-state mutex,
+// then drops the lock BEFORE doing any network I/O. Holding the
+// state mutex across a gRPC round-trip would block every other
+// NDJSON connection on this node for the duration of the forward
+// (~tens of ms in the happy case, longer on a stale leader).
+//
+// Returns:
+//   - `None`               -> we are the leader (or single-node);
+//                             caller should dispatch locally.
+//   - `Some(envelope)`     -> we are a follower; the envelope is
+//                             either the leader's response or a
+//                             synthesized error if forwarding
+//                             couldn't complete.
+
+fn forward_if_follower(
+    env:   &RequestEnvelope,
+    state: &SharedDaemonState,
+) -> Option<ResponseEnvelope> {
+    // ---- 1. Snapshot under the lock --------------------------
+    // Capture is_leader + the bits we need to do the forward call,
+    // then release the mutex so the network round-trip doesn't
+    // serialize all other connections behind us.
+    let snapshot: Option<(u64, String)> = {
+        let guard = state.lock().unwrap();
+        let cluster = guard.cluster.as_ref()?;
+        if cluster.is_leader() {
+            return None;
+        }
+        let leader_id = cluster.current_leader();
+        let leader_addr = leader_id.and_then(|id|
+            cluster.members().get(&id).map(|m| m.advertise_addr.clone())
+        );
+        match (leader_id, leader_addr) {
+            (Some(lid), Some(addr)) => Some((lid, addr)),
+            _ => None,
+        }
+    };
+
+    let (leader_id, leader_addr) = match snapshot {
+        Some(s) => s,
+        None => {
+            return Some(ResponseEnvelope::failure(
+                env.id,
+                error_code::NOT_LEADER,
+                "this node is not the cluster leader and no current leader is known \
+                 (election in progress or quorum unavailable); retry shortly"
+                    .to_string(),
+            ));
+        }
+    };
+
+    // ---- 2. Serialize the envelope ---------------------------
+    let envelope_bytes = match serde_json::to_vec(env) {
+        Ok(b) => b,
+        Err(e) => {
+            return Some(ResponseEnvelope::failure(
+                env.id,
+                error_code::INTERNAL_ERROR,
+                format!("could not serialize request envelope for forwarding: {}", e),
+            ));
+        }
+    };
+
+    // ---- 3. Forward over the cluster gRPC channel ------------
+    // Re-acquire just long enough to grab the forwarder; the
+    // forward itself is async and blocks on the cluster runtime.
+    let forwarder = {
+        let guard = state.lock().unwrap();
+        // Cluster could (in theory) have been torn down between
+        // the snapshot and now. Fail loud if so.
+        match guard.cluster.as_ref() {
+            Some(c) => ForwarderHandle {
+                runtime:       c.runtime.clone(),
+                leaf_cert_pem: c.leaf_cert_pem.clone(),
+                leaf_key_pem:  c.leaf_key_pem.clone(),
+                ca_cert_pem:   c.ca_cert_pem.clone(),
+            },
+            None => {
+                return Some(ResponseEnvelope::failure(
+                    env.id,
+                    error_code::INTERNAL_ERROR,
+                    "cluster context disappeared between leader-check and forward".to_string(),
+                ));
+            }
+        }
+    };
+
+    info!(
+        "forwarding id={} method={} to leader node_id={} at {}",
+        env.id,
+        method_name(&env.request),
+        leader_id,
+        leader_addr,
+    );
+
+    let response_bytes = forwarder.forward_blocking(&leader_addr, envelope_bytes);
+
+    let response_bytes = match response_bytes {
+        Ok(b)  => b,
+        Err(e) => {
+            warn!(
+                "forwarding id={} to leader node_id={} at {} failed: {}",
+                env.id, leader_id, leader_addr, e,
+            );
+            return Some(ResponseEnvelope::failure(
+                env.id,
+                error_code::NOT_LEADER,
+                format!(
+                    "this node is not the cluster leader; failed to forward to current \
+                     leader (node_id={}) at {}: {}",
+                    leader_id, leader_addr, e,
+                ),
+            ));
+        }
+    };
+
+    // ---- 4. Deserialize the leader's response envelope -------
+    match serde_json::from_slice::<ResponseEnvelope>(&response_bytes) {
+        Ok(env) => Some(env),
+        Err(e)  => Some(ResponseEnvelope::failure(
+            env.id,
+            error_code::INTERNAL_ERROR,
+            format!("malformed response envelope from leader: {}", e),
+        )),
+    }
+}
+
+/// Snapshot of the cluster forward bits we need, held outside the
+/// state mutex so the gRPC call doesn't block other NDJSON conns.
+struct ForwarderHandle {
+    runtime:       tokio::runtime::Handle,
+    leaf_cert_pem: String,
+    leaf_key_pem:  String,
+    ca_cert_pem:   String,
+}
+
+impl ForwarderHandle {
+    fn forward_blocking(
+        &self,
+        leader_addr:   &str,
+        envelope_json: Vec<u8>,
+    ) -> Result<Vec<u8>, String> {
+        let leaf_cert = self.leaf_cert_pem.clone();
+        let leaf_key  = self.leaf_key_pem.clone();
+        let ca_cert   = self.ca_cert_pem.clone();
+        let addr      = leader_addr.to_string();
+        self.runtime.block_on(async move {
+            sftpflow_cluster::transport::forward_envelope_to_peer(
+                &addr,
+                &leaf_cert,
+                &leaf_key,
+                &ca_cert,
+                envelope_json,
+            ).await
+        })
+    }
+}
+
+/// Tiny diagnostic helper: pull a short method-name string out of
+/// a Request for log lines. Avoids dumping the full Debug repr.
+fn method_name(req: &Request) -> &'static str {
+    match req {
+        Request::Ping                       => "ping",
+        Request::GetServerInfo              => "get_server_info",
+        Request::ListEndpoints              => "list_endpoints",
+        Request::GetEndpoint    { .. }      => "get_endpoint",
+        Request::PutEndpoint    { .. }      => "put_endpoint",
+        Request::DeleteEndpoint { .. }      => "delete_endpoint",
+        Request::RenameEndpoint { .. }      => "rename_endpoint",
+        Request::ListKeys                   => "list_keys",
+        Request::GetKey         { .. }      => "get_key",
+        Request::PutKey         { .. }      => "put_key",
+        Request::DeleteKey      { .. }      => "delete_key",
+        Request::RenameKey      { .. }      => "rename_key",
+        Request::ListFeeds                  => "list_feeds",
+        Request::GetFeed        { .. }      => "get_feed",
+        Request::PutFeed        { .. }      => "put_feed",
+        Request::DeleteFeed     { .. }      => "delete_feed",
+        Request::RenameFeed     { .. }      => "rename_feed",
+        Request::RunFeedNow     { .. }      => "run_feed_now",
+        Request::SyncSchedules              => "sync_schedules",
+        Request::GetRunHistory  { .. }      => "get_run_history",
+        Request::PutSecret      { .. }      => "put_secret",
+        Request::DeleteSecret   { .. }      => "delete_secret",
+        Request::ListSecrets                => "list_secrets",
+        Request::ClusterStatus              => "cluster_status",
+        Request::ClusterMintToken { .. }    => "cluster_mint_token",
+        Request::ClusterRemoveNode { .. }   => "cluster_remove_node",
+        Request::ClusterGetCa               => "cluster_get_ca",
     }
 }
 

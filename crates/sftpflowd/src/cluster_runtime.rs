@@ -28,7 +28,7 @@ use sftpflow_cluster::proto::{JoinRequest as PJoinRequest, JoinResponse as PJoin
 use sftpflow_cluster::state::ClusterMember;
 use sftpflow_cluster::tls::ClusterCa;
 use sftpflow_cluster::token::{self, TokenSecret};
-use sftpflow_cluster::transport::JoinHandler;
+use sftpflow_cluster::transport::{JoinHandler, NdjsonForwardHandler};
 
 use crate::node_state::{self, NodeJson};
 
@@ -61,6 +61,16 @@ pub struct ClusterContext {
     /// OS thread spawned by `std::thread::spawn`, not on a tokio
     /// worker, so `block_on` does not deadlock.
     pub runtime:      tokio::runtime::Handle,
+
+    /// This node's mTLS materials. Held here so the NDJSON
+    /// dispatcher can dial the current leader to forward mutating
+    /// requests over the existing peer-to-peer gRPC channel
+    /// (NdjsonForwardService). Same triple every other peer call
+    /// uses (Raft AppendEntries, Vote, etc.) — kept on the heap as
+    /// String to avoid cloning around 'static lifetime quirks.
+    pub leaf_cert_pem: String,
+    pub leaf_key_pem:  String,
+    pub ca_cert_pem:   String,
 }
 
 impl ClusterContext {
@@ -180,6 +190,12 @@ pub struct BootstrapParams {
     /// hand out join tokens for future `cluster join` flows. Only
     /// the bootstrap node holds one in M12.
     pub token_secret: TokenSecret,
+
+    /// Daemon-supplied callback that runs a forwarded NDJSON
+    /// envelope through the local-only dispatcher. Installed on
+    /// every node so any current leader can accept forwards from
+    /// any current follower.
+    pub forward_handler: NdjsonForwardHandler,
 }
 
 // ============================================================
@@ -206,6 +222,12 @@ pub struct JoinExistingParams {
     /// PEM of this node's leaf private key (generated locally;
     /// never leaves this node).
     pub leaf_key_pem: String,
+
+    /// Daemon-supplied callback that runs a forwarded NDJSON
+    /// envelope through the local-only dispatcher. Installed on
+    /// every node so any current leader can accept forwards from
+    /// any current follower.
+    pub forward_handler: NdjsonForwardHandler,
 }
 
 // ============================================================
@@ -312,6 +334,7 @@ async fn start_with_join_handler(params: BootstrapParams) -> Result<ClusterNode,
         cluster_id:        params.node.cluster_id.clone(),
         token_secret:      Some(params.token_secret),
         join_handler:      Some(join_handler),
+        forward_handler:   Some(params.forward_handler),
     };
 
     info!(
@@ -370,6 +393,7 @@ pub async fn join_existing(params: JoinExistingParams) -> Result<ClusterNode, St
         cluster_id:        params.node.cluster_id.clone(),
         token_secret:      None,
         join_handler:      None,
+        forward_handler:   Some(params.forward_handler),
     };
 
     info!(

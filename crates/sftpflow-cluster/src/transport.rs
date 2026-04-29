@@ -48,11 +48,17 @@ use crate::proto::raft_service_client::RaftServiceClient;
 use crate::proto::raft_service_server::{RaftService, RaftServiceServer};
 use crate::proto::admin_service_server::{AdminService, AdminServiceServer};
 use crate::proto::bootstrap_service_server::{BootstrapService, BootstrapServiceServer};
+use crate::proto::ndjson_forward_service_client::NdjsonForwardServiceClient;
+use crate::proto::ndjson_forward_service_server::{
+    NdjsonForwardService, NdjsonForwardServiceServer,
+};
 use crate::proto::{
     JoinRequest as PJoinRequest,
     JoinResponse as PJoinResponse,
     MintTokenRequest as PMintTokenRequest,
     MintTokenResponse as PMintTokenResponse,
+    NdjsonForwardRequest as PNdjsonForwardRequest,
+    NdjsonForwardResponse as PNdjsonForwardResponse,
     RaftRpcRequest,
     RaftRpcResponse,
 };
@@ -453,6 +459,112 @@ impl BootstrapService for BootstrapServiceImpl {
 }
 
 // ============================================================
+// NdjsonForwardService server impl
+// ============================================================
+//
+// The daemon hands us a callback that consumes a serialized
+// RequestEnvelope and returns a serialized ResponseEnvelope. We
+// just unwrap the gRPC envelope around it; loop prevention,
+// leader checks, and actual handler dispatch all live behind the
+// callback (in sftpflowd::server::dispatch_local).
+
+/// Closure type the daemon supplies to handle forwarded NDJSON
+/// envelopes. Async because the underlying NDJSON dispatch may
+/// block on locks; running on its own task lets the gRPC server
+/// keep accepting other RPCs in the meantime.
+pub type NdjsonForwardHandler = Arc<
+    dyn Fn(Vec<u8>)
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+#[derive(Clone)]
+pub struct NdjsonForwardServiceImpl {
+    handler: NdjsonForwardHandler,
+}
+
+impl NdjsonForwardServiceImpl {
+    pub fn new(handler: NdjsonForwardHandler) -> Self {
+        Self { handler }
+    }
+}
+
+#[tonic::async_trait]
+impl NdjsonForwardService for NdjsonForwardServiceImpl {
+    async fn forward(
+        &self,
+        request: Request<PNdjsonForwardRequest>,
+    ) -> Result<Response<PNdjsonForwardResponse>, Status> {
+        require_mtls(&request)?;
+        let envelope_json = request.into_inner().envelope_json;
+
+        let response_json = (self.handler)(envelope_json)
+            .await
+            .map_err(|e| Status::internal(format!("forward dispatch: {}", e)))?;
+
+        Ok(Response::new(PNdjsonForwardResponse {
+            envelope_json: response_json,
+        }))
+    }
+}
+
+/// Default no-op forward handler installed when the daemon hasn't
+/// supplied one (legacy / single-node startup paths). Always
+/// returns an error — callers shouldn't be reaching this on a
+/// node that isn't supposed to accept forwards.
+pub fn no_forward_handler() -> NdjsonForwardHandler {
+    Arc::new(|_envelope| {
+        Box::pin(async {
+            Err("this node does not have an NDJSON forward handler installed".to_string())
+        })
+    })
+}
+
+// ============================================================
+// Client helper: dial a peer and forward an NDJSON envelope
+// ============================================================
+//
+// Used by followers to ship a serialized RequestEnvelope to the
+// current leader. Returns the leader's serialized ResponseEnvelope
+// so the caller can write it back to the CLI verbatim. mTLS uses
+// the same leaf cert + cluster CA every other peer-to-peer call
+// uses.
+
+pub async fn forward_envelope_to_peer(
+    peer_advertise_addr: &str,
+    leaf_cert_pem:       &str,
+    leaf_key_pem:        &str,
+    ca_cert_pem:         &str,
+    envelope_json:       Vec<u8>,
+) -> Result<Vec<u8>, String> {
+    // Match the SNI rule used elsewhere in this file: host portion
+    // of the advertise address. IPv4-literal advertise addresses
+    // need the SAN-IP entry that cert generation already emits.
+    let host = peer_advertise_addr
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(peer_advertise_addr);
+
+    let tls = tls::client_tls_config(leaf_cert_pem, leaf_key_pem, ca_cert_pem, host);
+
+    let endpoint = Endpoint::from_shared(format!("https://{}", peer_advertise_addr))
+        .map_err(|e| format!("endpoint: {}", e))?
+        .tls_config(tls)
+        .map_err(|e| format!("tls: {}", e))?;
+    let channel = endpoint.connect().await
+        .map_err(|e| format!("connect: {}", e))?;
+
+    let mut client = NdjsonForwardServiceClient::new(channel);
+    let resp = client
+        .forward(PNdjsonForwardRequest { envelope_json })
+        .await
+        .map_err(|s| format!("forward rpc: {}", s))?;
+
+    Ok(resp.into_inner().envelope_json)
+}
+
+// ============================================================
 // mTLS gate for RaftService and AdminService
 // ============================================================
 
@@ -468,11 +580,12 @@ fn require_mtls<T>(req: &Request<T>) -> Result<(), Status> {
 // ============================================================
 
 pub async fn run_grpc_server(
-    bind_addr:    std::net::SocketAddr,
-    tls_cfg:      ServerTlsConfig,
-    raft_svc:     RaftServiceImpl,
-    admin_svc:    AdminServiceImpl,
+    bind_addr:     std::net::SocketAddr,
+    tls_cfg:       ServerTlsConfig,
+    raft_svc:      RaftServiceImpl,
+    admin_svc:     AdminServiceImpl,
     bootstrap_svc: BootstrapServiceImpl,
+    forward_svc:   NdjsonForwardServiceImpl,
 ) -> Result<(), tonic::transport::Error> {
     log::info!("cluster gRPC server listening on {}", bind_addr);
     Server::builder()
@@ -480,6 +593,7 @@ pub async fn run_grpc_server(
         .add_service(RaftServiceServer::new(raft_svc))
         .add_service(AdminServiceServer::new(admin_svc))
         .add_service(BootstrapServiceServer::new(bootstrap_svc))
+        .add_service(NdjsonForwardServiceServer::new(forward_svc))
         .serve(bind_addr)
         .await
 }

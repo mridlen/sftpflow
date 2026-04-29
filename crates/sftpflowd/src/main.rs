@@ -45,8 +45,11 @@ use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand};
 use log::{error, info, warn};
+use tokio::sync::OnceCell;
 
 use sftpflow_core::Config;
+use sftpflow_proto::{RequestEnvelope, ResponseEnvelope};
+use sftpflow_cluster::transport::NdjsonForwardHandler;
 
 pub mod dkron;       // dkron.rs - Dkron scheduler reconciliation
 mod handlers;        // handlers.rs - RPC method implementations
@@ -55,6 +58,8 @@ mod secrets;         // secrets.rs - sealed credential store (age-encrypted)
 mod server;          // server.rs - listener + connection handling + dispatch
 mod node_state;      // node_state.rs - per-node persistent state (M12+)
 mod cluster_runtime; // cluster_runtime.rs - async Raft orchestration (M12+)
+
+use crate::server::SharedDaemonState;
 
 // ============================================================
 // CLI shape
@@ -445,14 +450,24 @@ fn cmd_init(daemon: DaemonArgs, args: InitArgs) -> Result<(), String> {
         .build()
         .map_err(|e| format!("building tokio runtime: {}", e))?;
 
+    // Forward handler is plumbed into the cluster gRPC server so
+    // any peer (current or future leader) can dispatch a forwarded
+    // NDJSON envelope into our local handler. The cell is populated
+    // below once SharedDaemonState exists — until then forwards
+    // hit a clear "not yet ready" error.
+    let dispatch_cell: DispatchCell = Arc::new(OnceCell::new());
+    let leaf_key_pem  = leaf.key_pem();
+    let ca_cert_pem   = ca.cert_pem();
+    let leaf_cert_clone = leaf_cert_pem.clone();
     let cluster_node = rt.block_on(cluster_runtime::bootstrap(cluster_runtime::BootstrapParams {
-        state_dir:     state_dir.clone(),
-        node:          node.clone(),
+        state_dir:       state_dir.clone(),
+        node:            node.clone(),
         bind_addr,
-        ca:            ca.clone(),
+        ca:              ca.clone(),
         leaf_cert_pem,
-        leaf_key_pem:  leaf.key_pem(),
-        token_secret:  token_secret.clone(),
+        leaf_key_pem:    leaf_key_pem.clone(),
+        token_secret:    token_secret.clone(),
+        forward_handler: build_forward_handler(dispatch_cell.clone()),
     }))?;
 
     info!(
@@ -463,13 +478,20 @@ fn cmd_init(daemon: DaemonArgs, args: InitArgs) -> Result<(), String> {
     // ---- 9. Enter NDJSON serve loop ----
     info!("NDJSON server listening on {}", ndjson_addr);
     let cluster_ctx = cluster_runtime::ClusterContext {
-        handle:       cluster_node.handle(),
-        cluster_id:   node.cluster_id.clone(),
-        self_id:      node.node_id,
-        token_secret: Some(token_secret),
-        runtime:      rt.handle().clone(),
+        handle:        cluster_node.handle(),
+        cluster_id:    node.cluster_id.clone(),
+        self_id:       node.node_id,
+        token_secret:  Some(token_secret),
+        runtime:       rt.handle().clone(),
+        leaf_cert_pem: leaf_cert_clone,
+        leaf_key_pem,
+        ca_cert_pem,
     };
-    let serve_result = server::run(&ndjson_addr, config, run_db, Some(secrets_store), Some(cluster_ctx))
+    let shared = server::build_shared_state(config, run_db, Some(secrets_store), Some(cluster_ctx));
+    // Wire the forward handler now that SharedDaemonState exists.
+    let _ = dispatch_cell.set(shared.clone());
+
+    let serve_result = server::run(&ndjson_addr, shared)
         .map_err(|e| format!("NDJSON server: {}", e));
 
     // Explicit teardown order: drop cluster node first (aborts
@@ -681,14 +703,19 @@ fn cmd_join(daemon: DaemonArgs, args: JoinArgs) -> Result<(), String> {
     };
 
     // ---- 9. Bring up Raft as a joiner ----
+    let dispatch_cell: DispatchCell = Arc::new(OnceCell::new());
+    let leaf_key_pem  = leaf.key_pem();
+    let ca_cert_pem   = join_result.ca_cert_pem.clone();
+    let leaf_cert_pem = join_result.signed_leaf_cert_pem.clone();
     let cluster_node = rt.block_on(cluster_runtime::join_existing(
         cluster_runtime::JoinExistingParams {
-            state_dir:     state_dir.clone(),
-            node:          node.clone(),
+            state_dir:       state_dir.clone(),
+            node:            node.clone(),
             bind_addr,
-            ca_cert_pem:   join_result.ca_cert_pem.clone(),
-            leaf_cert_pem: join_result.signed_leaf_cert_pem.clone(),
-            leaf_key_pem:  leaf.key_pem(),
+            ca_cert_pem:     ca_cert_pem.clone(),
+            leaf_cert_pem:   leaf_cert_pem.clone(),
+            leaf_key_pem:    leaf_key_pem.clone(),
+            forward_handler: build_forward_handler(dispatch_cell.clone()),
         },
     ))?;
 
@@ -704,13 +731,19 @@ fn cmd_join(daemon: DaemonArgs, args: JoinArgs) -> Result<(), String> {
     // node mints. `cluster token` against this node will surface
     // the asymmetry as a clear CONFIG_ERROR.
     let cluster_ctx = cluster_runtime::ClusterContext {
-        handle:       cluster_node.handle(),
-        cluster_id:   node.cluster_id.clone(),
-        self_id:      node.node_id,
-        token_secret: None,
-        runtime:      rt.handle().clone(),
+        handle:        cluster_node.handle(),
+        cluster_id:    node.cluster_id.clone(),
+        self_id:       node.node_id,
+        token_secret:  None,
+        runtime:       rt.handle().clone(),
+        leaf_cert_pem,
+        leaf_key_pem,
+        ca_cert_pem,
     };
-    let serve_result = server::run(&ndjson_addr, config, run_db, secret_store, Some(cluster_ctx))
+    let shared = server::build_shared_state(config, run_db, secret_store, Some(cluster_ctx));
+    let _ = dispatch_cell.set(shared.clone());
+
+    let serve_result = server::run(&ndjson_addr, shared)
         .map_err(|e| format!("NDJSON server: {}", e));
 
     drop(cluster_node);
@@ -898,6 +931,12 @@ fn cmd_run_cluster(
     // The if/else returns the ClusterNode plus an Option<TokenSecret>
     // so the bootstrap branch can hand the secret on to ClusterContext
     // (joiners always pass None — they can't mint tokens in M12).
+    let dispatch_cell: DispatchCell = Arc::new(OnceCell::new());
+    // Hold onto clones of the cert/key bytes for ClusterContext —
+    // the StartConfig path moves them by value into the Raft layer.
+    let leaf_cert_for_ctx = leaf_cert_pem.clone();
+    let leaf_key_for_ctx  = leaf_key_pem.clone();
+    let ca_cert_for_ctx   = ca_cert_pem.clone();
     let (cluster_node, token_secret_for_ctx) = if is_bootstrap {
         // ---- 6a. Bootstrap-node restart ----
         let ca_key_pem = node_state::read_pem(&ca_key_path)?;
@@ -931,13 +970,14 @@ fn cmd_run_cluster(
         info!("cluster restart: bootstrap-node path (CA key + token secret loaded)");
 
         let node_handle = rt.block_on(cluster_runtime::resume_bootstrap(cluster_runtime::BootstrapParams {
-            state_dir:     state_dir.clone(),
-            node:          node.clone(),
+            state_dir:       state_dir.clone(),
+            node:            node.clone(),
             bind_addr,
             ca,
             leaf_cert_pem,
             leaf_key_pem,
-            token_secret:  token_secret.clone(),
+            token_secret:    token_secret.clone(),
+            forward_handler: build_forward_handler(dispatch_cell.clone()),
         }))?;
         (node_handle, Some(token_secret))
     } else {
@@ -945,12 +985,13 @@ fn cmd_run_cluster(
         info!("cluster restart: joiner path (CA cert only — no CA key, no token secret)");
 
         let node_handle = rt.block_on(cluster_runtime::join_existing(cluster_runtime::JoinExistingParams {
-            state_dir:     state_dir.clone(),
-            node:          node.clone(),
+            state_dir:       state_dir.clone(),
+            node:            node.clone(),
             bind_addr,
             ca_cert_pem,
             leaf_cert_pem,
             leaf_key_pem,
+            forward_handler: build_forward_handler(dispatch_cell.clone()),
         }))?;
         (node_handle, None)
     };
@@ -959,13 +1000,19 @@ fn cmd_run_cluster(
     let socket_addr = daemon.socket.clone().unwrap_or_else(default_socket_addr);
     info!("NDJSON server listening on {}", socket_addr);
     let cluster_ctx = cluster_runtime::ClusterContext {
-        handle:       cluster_node.handle(),
-        cluster_id:   node.cluster_id.clone(),
-        self_id:      node.node_id,
-        token_secret: token_secret_for_ctx,
-        runtime:      rt.handle().clone(),
+        handle:        cluster_node.handle(),
+        cluster_id:    node.cluster_id.clone(),
+        self_id:       node.node_id,
+        token_secret:  token_secret_for_ctx,
+        runtime:       rt.handle().clone(),
+        leaf_cert_pem: leaf_cert_for_ctx,
+        leaf_key_pem:  leaf_key_for_ctx,
+        ca_cert_pem:   ca_cert_for_ctx,
     };
-    let serve_result = server::run(&socket_addr, config, run_db, secret_store, Some(cluster_ctx))
+    let shared = server::build_shared_state(config, run_db, secret_store, Some(cluster_ctx));
+    let _ = dispatch_cell.set(shared.clone());
+
+    let serve_result = server::run(&socket_addr, shared)
         .map_err(|e| format!("NDJSON server: {}", e));
 
     // Same teardown order as cmd_init/cmd_join: drop the cluster
@@ -1068,8 +1115,55 @@ fn cmd_run_legacy(daemon: DaemonArgs) -> Result<(), String> {
     // server::run() - server.rs
     // No cluster handle: legacy single-node mode runs every RPC
     // unguarded, like pre-M12. M13 deletes this fallback.
-    server::run(&socket_addr, config, run_db, secret_store, None)
+    let shared = server::build_shared_state(config, run_db, secret_store, None);
+    server::run(&socket_addr, shared)
         .map_err(|e| format!("server error: {}", e))
+}
+
+// ============================================================
+// build_forward_handler - wires the gRPC NdjsonForwardService
+//                         into the local NDJSON dispatcher
+// ============================================================
+//
+// Same OnceCell trick we use for the seed-side join handler: the
+// forward handler closure has to be passed into ClusterNode::start
+// before SharedDaemonState exists, but it needs SharedDaemonState
+// to actually run the dispatch. So we hand it an `Arc<OnceCell<...>>`
+// at construction time and have the daemon's startup code `.set()`
+// the cell once both pieces are constructed.
+//
+// Loop prevention: the handler always calls `dispatch_local`, never
+// `dispatch`. A stale follower receiving a forwarded envelope will
+// thus return NOT_LEADER through `enforce_leader` rather than
+// re-forwarding back into the cluster.
+
+type DispatchCell = Arc<OnceCell<SharedDaemonState>>;
+
+fn build_forward_handler(cell: DispatchCell) -> NdjsonForwardHandler {
+    Arc::new(move |envelope_json: Vec<u8>| {
+        let cell = cell.clone();
+        Box::pin(async move {
+            let state = cell.get().ok_or_else(|| {
+                "forward handler called before daemon state was wired up — \
+                 retry after the node finishes startup".to_string()
+            })?.clone();
+
+            let env: RequestEnvelope = serde_json::from_slice(&envelope_json)
+                .map_err(|e| format!("malformed forwarded envelope: {}", e))?;
+
+            // dispatch_local takes a std::sync::Mutex internally and
+            // some handlers (RunFeedNow) build a fresh tokio runtime,
+            // so move the work onto a blocking thread to avoid
+            // hijacking a tonic worker. The CLI-facing latency cost
+            // is the spawn_blocking handoff (~1µs).
+            let response_env: ResponseEnvelope = tokio::task::spawn_blocking(move || {
+                crate::server::dispatch_local(env, &state)
+            }).await.map_err(|e| format!("dispatch task panicked: {}", e))?;
+
+            serde_json::to_vec(&response_env)
+                .map_err(|e| format!("could not encode response envelope: {}", e))
+        })
+    })
 }
 
 // ============================================================

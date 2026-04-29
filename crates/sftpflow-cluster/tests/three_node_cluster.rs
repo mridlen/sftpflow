@@ -81,6 +81,7 @@ async fn start_node(
         cluster_id:        cluster_id.to_string(),
         token_secret:      None,
         join_handler:      None,
+        forward_handler:   None,
     };
     ClusterNode::start(cfg).await.expect("start node")
 }

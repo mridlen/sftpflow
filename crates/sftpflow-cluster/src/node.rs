@@ -41,10 +41,13 @@ use crate::store::open_for_raft;
 use crate::tls;
 use crate::token::{TokenSecret, UsedNonces};
 use crate::transport::{
+    no_forward_handler,
     run_grpc_server,
     AdminServiceImpl,
     BootstrapServiceImpl,
     JoinHandler,
+    NdjsonForwardHandler,
+    NdjsonForwardServiceImpl,
     PeerNetworkFactory,
     RaftServiceImpl,
 };
@@ -121,6 +124,14 @@ pub struct StartConfig {
     /// the bootstrap node (where token_secret is also Some). The
     /// closure is constructed in PR-B's join handler.
     pub join_handler: Option<JoinHandler>,
+
+    /// Daemon-supplied callback that runs a forwarded NDJSON
+    /// envelope through the local-only dispatcher. Installed on
+    /// every node so any current leader can accept forwards from
+    /// any current follower. `None` falls back to the no-op
+    /// handler (refuses every forward) — used by tests and any
+    /// future single-node mode that doesn't need the gRPC server.
+    pub forward_handler: Option<NdjsonForwardHandler>,
 }
 
 // ============================================================
@@ -196,6 +207,10 @@ impl ClusterNode {
             cfg.join_handler.clone().unwrap_or_else(no_join_handler),
         );
 
+        let forward_svc = NdjsonForwardServiceImpl::new(
+            cfg.forward_handler.clone().unwrap_or_else(no_forward_handler),
+        );
+
         // ---- 5. TLS + spawn ----------------------------------
         let tls_cfg = tls::server_tls_config(
             &cfg.leaf_cert_pem,
@@ -205,7 +220,7 @@ impl ClusterNode {
 
         let bind_addr = cfg.bind_addr;
         let server_task = tokio::spawn(async move {
-            run_grpc_server(bind_addr, tls_cfg, raft_svc, admin_svc, bootstrap_svc).await
+            run_grpc_server(bind_addr, tls_cfg, raft_svc, admin_svc, bootstrap_svc, forward_svc).await
         });
 
         // Touch unused field so compiler doesn't complain in M12

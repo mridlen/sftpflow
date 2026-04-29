@@ -99,6 +99,43 @@ message MintTokenResponse {
 }
 
 // ============================================================
+// NdjsonForwardService - follower→leader request forwarding
+// ============================================================
+//
+// When a follower receives a mutating NDJSON RPC from a CLI it
+// can't service locally (config writes have to land on the leader),
+// it ships the entire serialized RequestEnvelope here. The leader
+// runs it through its own NDJSON dispatcher exactly as if the CLI
+// had connected directly, then returns the resulting
+// ResponseEnvelope. The follower writes that envelope back to the
+// CLI verbatim, preserving the request's correlation id.
+//
+// Loop prevention: the leader-side handler always invokes the
+// local-only dispatch path (no second forward), so a stale
+// follower receiving a forwarded request just returns NOT_LEADER
+// rather than re-forwarding.
+//
+// mTLS required — only cluster members can forward.
+
+service NdjsonForwardService {
+  rpc Forward(NdjsonForwardRequest) returns (NdjsonForwardResponse);
+}
+
+message NdjsonForwardRequest {
+  // JSON-serialized sftpflow_proto::RequestEnvelope (the same
+  // bytes that crossed the NDJSON wire from the CLI to the
+  // follower, minus the trailing newline).
+  bytes envelope_json = 1;
+}
+
+message NdjsonForwardResponse {
+  // JSON-serialized sftpflow_proto::ResponseEnvelope. Carries the
+  // original request's id so the CLI's correlation logic still
+  // matches even though a different node produced the response.
+  bytes envelope_json = 1;
+}
+
+// ============================================================
 // BootstrapService - join the cluster (anonymous-TLS allowed)
 // ============================================================
 //
