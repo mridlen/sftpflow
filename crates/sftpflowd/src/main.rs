@@ -54,6 +54,7 @@ use sftpflow_cluster::transport::NdjsonForwardHandler;
 pub mod dkron;       // dkron.rs - Dkron scheduler reconciliation
 mod backup;          // backup.rs - hot snapshot + cold restore of node state
 mod handlers;        // handlers.rs - RPC method implementations
+mod health;          // health.rs - HTTP /healthz + /readyz probe endpoints
 mod history;         // history.rs - SQLite run history persistence
 mod secrets;         // secrets.rs - sealed credential store (age-encrypted)
 mod server;          // server.rs - listener + connection handling + dispatch
@@ -133,6 +134,15 @@ struct DaemonArgs {
     /// legacy single-node fallback; arrives with cluster mode.
     #[arg(long, value_name = "PATH", global = true)]
     state_dir: Option<PathBuf>,
+
+    /// Address the HTTP healthcheck server binds to (host:port).
+    /// Serves `GET /healthz` (liveness) and `GET /readyz`
+    /// (readiness) for docker-compose / Kubernetes probes and
+    /// load balancers. Defaults to `0.0.0.0:7901` (one above the
+    /// cluster Raft default). Pass `disabled` to opt out — useful
+    /// when running multiple daemons on one host.
+    #[arg(long, value_name = "ADDR", global = true, default_value = "0.0.0.0:7901")]
+    health_bind: String,
 }
 
 // ============================================================
@@ -526,6 +536,8 @@ fn cmd_init(daemon: DaemonArgs, args: InitArgs) -> Result<(), String> {
     // Wire the forward handler now that SharedDaemonState exists.
     let _ = dispatch_cell.set(shared.clone());
 
+    maybe_spawn_health(&daemon.health_bind, shared.clone());
+
     let serve_result = server::run(&ndjson_addr, shared)
         .map_err(|e| format!("NDJSON server: {}", e));
 
@@ -778,6 +790,8 @@ fn cmd_join(daemon: DaemonArgs, args: JoinArgs) -> Result<(), String> {
     let paths = build_daemon_paths(state_dir.clone(), db_path.clone(), secrets_path.clone());
     let shared = server::build_shared_state(config, run_db, secret_store, Some(cluster_ctx), paths);
     let _ = dispatch_cell.set(shared.clone());
+
+    maybe_spawn_health(&daemon.health_bind, shared.clone());
 
     let serve_result = server::run(&ndjson_addr, shared)
         .map_err(|e| format!("NDJSON server: {}", e));
@@ -1103,6 +1117,8 @@ fn cmd_run_cluster(
     let shared = server::build_shared_state(config, run_db, secret_store, Some(cluster_ctx), paths);
     let _ = dispatch_cell.set(shared.clone());
 
+    maybe_spawn_health(&daemon.health_bind, shared.clone());
+
     let serve_result = server::run(&socket_addr, shared)
         .map_err(|e| format!("NDJSON server: {}", e));
 
@@ -1209,8 +1225,29 @@ fn cmd_run_legacy(daemon: DaemonArgs) -> Result<(), String> {
     // unguarded, like pre-M12. M13 deletes this fallback.
     let paths = build_daemon_paths(state_dir, db_path, secrets_path);
     let shared = server::build_shared_state(config, run_db, secret_store, None, paths);
+
+    maybe_spawn_health(&daemon.health_bind, shared.clone());
+
     server::run(&socket_addr, shared)
         .map_err(|e| format!("server error: {}", e))
+}
+
+// ============================================================
+// maybe_spawn_health - opt-out wrapper around health::spawn
+// ============================================================
+//
+// `--health-bind disabled` (case-insensitive) skips the
+// healthcheck server entirely; useful when running multiple
+// daemons on one host without playing port games. Anything else
+// is treated as a host:port. Bind failures inside `health::spawn`
+// are logged-and-swallowed so they never take the daemon down.
+
+fn maybe_spawn_health(addr: &str, shared: server::SharedDaemonState) {
+    if addr.eq_ignore_ascii_case("disabled") || addr.eq_ignore_ascii_case("off") {
+        info!("healthcheck server disabled (--health-bind {})", addr);
+        return;
+    }
+    health::spawn(addr, shared); // health.rs - HTTP probe endpoints
 }
 
 // ============================================================
