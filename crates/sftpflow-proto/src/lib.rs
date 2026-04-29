@@ -104,6 +104,18 @@ pub enum Request {
     /// back from the server in v1; future versions may stream it
     /// inline. The path must be absolute server-side.
     ClusterBackup { out_path: String },
+
+    /// Read-only: fetch the most recent rows from this node's
+    /// audit log. The audit log records one row per successful (or
+    /// failed) mutating RPC: timestamp, caller (the CLI-attributed
+    /// `<user>@<host>`), method name, sha256 hash of the params,
+    /// and outcome (`ok` or `err:<code>`). Useful for "who changed
+    /// what when" investigations.
+    ///
+    /// `limit` defaults to 50 if `None`. `since_unix` filters to
+    /// rows with `ts_unix >= since_unix` so an operator can scope
+    /// to a window without paginating.
+    GetAuditLog { limit: Option<u32>, since_unix: Option<i64> },
 }
 
 // ============================================================
@@ -155,6 +167,8 @@ pub enum Response {
     /// server-side path, size, sha256, and source-node identifiers
     /// so the operator can verify the file post-scp.
     BackupReport(BackupReport),
+    /// Reply to GetAuditLog. Newest-first ordering by `ts_unix`.
+    AuditLog(Vec<AuditEntry>),
 }
 
 /// Server identity and version, returned by GetServerInfo.
@@ -304,6 +318,37 @@ pub struct BackupReport {
     pub node_id: Option<u64>,
 }
 
+/// One row of the cluster mutation audit log, returned by GetAuditLog.
+///
+/// Audit rows are append-only. The daemon records one entry per
+/// mutating RPC (handler success or failure both produce a row);
+/// read-only RPCs do not appear here. `args_hash` is the sha256 of
+/// the serialized `params` JSON — sensitive values (PutSecret etc.)
+/// stay sealed but the hash still gives a consistent fingerprint
+/// for "did the operator submit the same input twice?" questions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AuditEntry {
+    /// Auto-incremented row id.
+    pub id: i64,
+    /// Unix epoch seconds when the RPC dispatched.
+    pub ts_unix: i64,
+    /// ISO 8601 UTC timestamp matching `ts_unix`. Cached at write
+    /// time so the CLI doesn't reformat on every render.
+    pub ts_iso: String,
+    /// CLI-attributed `<user>@<host>` (or system user for socket
+    /// dev mode). `None` for envelopes the CLI didn't stamp — older
+    /// daemons forwarding in mid-cluster, or hand-crafted requests.
+    pub caller: Option<String>,
+    /// Method name from `Request`, snake_case (e.g. "put_endpoint").
+    pub rpc: String,
+    /// Lowercase hex sha256 (64 chars) of the request's `params`
+    /// JSON. Empty string for parameterless mutations.
+    pub args_hash: String,
+    /// `"ok"` for handler success; `"err:<code>"` (e.g. `"err:1004"`
+    /// for NOT_LEADER) for failures. Operators can filter on prefix.
+    pub outcome: String,
+}
+
 /// A single run history entry, returned by GetRunHistory.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RunHistoryEntry {
@@ -362,9 +407,19 @@ pub mod error_code {
 // ============================================================
 
 /// A request as it appears on the wire, with a correlation id.
+///
+/// `caller` is informational metadata stamped by the CLI for the
+/// audit log: typically `"<ssh-user>@<host>"` (SSH transport) or
+/// `"<system-user>@local"` (socket dev mode). The daemon does NOT
+/// authenticate this string — SSH already authenticated the user
+/// at the transport layer; `caller` just records what the CLI was
+/// told to call them. `#[serde(default)]` keeps older CLIs (which
+/// don't set this field) compatible.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RequestEnvelope {
     pub id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller: Option<String>,
     #[serde(flatten)]
     pub request: Request,
 }
@@ -470,20 +525,48 @@ mod tests {
     fn ping_request_serializes_predictably() {
         let env = RequestEnvelope {
             id: 1,
+            caller: None,
             request: Request::Ping,
         };
         let json = serde_json::to_string(&env).unwrap();
         assert!(json.contains(r#""method":"ping""#));
         assert!(json.contains(r#""id":1"#));
+        // No caller stamped → field omitted from the wire form.
+        assert!(!json.contains(r#""caller""#));
 
         let parsed: RequestEnvelope = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, env);
     }
 
     #[test]
+    fn caller_round_trips_when_set() {
+        let env = RequestEnvelope {
+            id: 7,
+            caller: Some("alice@prod-1".into()),
+            request: Request::DeleteFeed { name: "nightly".into() },
+        };
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains(r#""caller":"alice@prod-1""#));
+
+        let parsed: RequestEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, env);
+    }
+
+    #[test]
+    fn legacy_envelope_without_caller_still_parses() {
+        // Older CLIs predate the `caller` field. Their envelopes
+        // must still deserialize cleanly via #[serde(default)].
+        let json = r#"{"id":3,"method":"ping"}"#;
+        let parsed: RequestEnvelope = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.id, 3);
+        assert_eq!(parsed.caller, None);
+    }
+
+    #[test]
     fn get_feed_request_carries_params() {
         let env = RequestEnvelope {
             id: 42,
+            caller: None,
             request: Request::GetFeed { name: "nightly".to_string() },
         };
         let json = serde_json::to_string(&env).unwrap();
@@ -527,9 +610,10 @@ mod tests {
     fn ndjson_framing_round_trips_multiple_messages() {
         let mut buf: Vec<u8> = Vec::new();
 
-        let req1 = RequestEnvelope { id: 1, request: Request::Ping };
+        let req1 = RequestEnvelope { id: 1, caller: None, request: Request::Ping };
         let req2 = RequestEnvelope {
             id: 2,
+            caller: None,
             request: Request::GetEndpoint { name: "prod-sftp".into() },
         };
 

@@ -36,6 +36,7 @@ use sftpflow_proto::{
 /// share the same instance behind a single Mutex.
 pub type SharedDaemonState = Arc<Mutex<DaemonState>>;
 
+use crate::audit::{self, AuditDb}; // audit.rs - SQLite mutation audit log
 use crate::cluster_runtime::ClusterContext; // cluster_runtime.rs - runtime cluster bundle
 use crate::handlers; // handlers.rs - RPC method implementations
 use crate::history::RunDb; // history.rs - SQLite run history
@@ -61,6 +62,10 @@ use crate::secrets::SecretStore; // secrets.rs - sealed credential store
 pub struct DaemonPaths {
     pub state_dir:    PathBuf,
     pub runs_db:      PathBuf,
+    /// SQLite mutation-audit log. Co-located with `runs_db` under
+    /// the state dir by default. Backup includes it; restore
+    /// brings it back.
+    pub audit_db:     PathBuf,
     pub secrets_file: PathBuf,
     pub config_yaml:  PathBuf,
 }
@@ -76,6 +81,9 @@ pub struct DaemonState {
     /// SQLite run history database. None if DB failed to open
     /// (runs still execute, just not recorded).
     pub run_db: Option<RunDb>,
+    /// SQLite audit log. None if DB failed to open — mutations
+    /// still apply, just not recorded. Best-effort by design.
+    pub audit_db: Option<AuditDb>,
     /// Sealed credential store. None if no passphrase was configured
     /// at startup — secret RPCs then fail with CONFIG_ERROR and feeds
     /// that use `*_ref` fields will fail to resolve at run time.
@@ -101,11 +109,12 @@ pub struct DaemonState {
 /// startup paths can stash a clone of the Arc into the cluster
 /// forward handler *before* handing the same Arc to `run`.
 pub fn build_shared_state(
-    config:  Config,
-    run_db:  Option<RunDb>,
-    secrets: Option<SecretStore>,
-    cluster: Option<ClusterContext>,
-    paths:   DaemonPaths,
+    config:   Config,
+    run_db:   Option<RunDb>,
+    audit_db: Option<AuditDb>,
+    secrets:  Option<SecretStore>,
+    cluster:  Option<ClusterContext>,
+    paths:    DaemonPaths,
 ) -> SharedDaemonState {
     let dkron_url = config.server.dkron_url.clone();
     Arc::new(Mutex::new(DaemonState {
@@ -113,6 +122,7 @@ pub fn build_shared_state(
         started: Instant::now(),
         dkron_url,
         run_db,
+        audit_db,
         secrets,
         cluster,
         paths,
@@ -315,6 +325,23 @@ pub fn dispatch(env: RequestEnvelope, state: &SharedDaemonState) -> ResponseEnve
 }
 
 pub fn dispatch_local(env: RequestEnvelope, state: &SharedDaemonState) -> ResponseEnvelope {
+    // Snapshot the bits the audit hook needs BEFORE we move `env`
+    // into the match. We only clone the request when the RPC is
+    // mutating — read-only paths skip the clone entirely.
+    let mutating         = is_mutating(&env.request);
+    let caller_for_audit = if mutating { env.caller.clone() } else { None };
+    let request_for_audit = if mutating { Some(env.request.clone()) } else { None };
+
+    let response = dispatch_local_inner(env, state);
+
+    if let Some(req) = request_for_audit {
+        record_audit(state, caller_for_audit.as_deref(), &req, &response);
+    }
+
+    response
+}
+
+fn dispatch_local_inner(env: RequestEnvelope, state: &SharedDaemonState) -> ResponseEnvelope {
     let id = env.id;
 
     match env.request {
@@ -432,6 +459,12 @@ pub fn dispatch_local(env: RequestEnvelope, state: &SharedDaemonState) -> Respon
         Request::GetRunHistory { feed, limit } => {
             let guard = state.lock().unwrap();
             result_to_envelope(id, handlers::get_run_history(&guard, &feed, limit))
+        }
+
+        // ---- audit log (read-only) ----
+        Request::GetAuditLog { limit, since_unix } => {
+            let guard = state.lock().unwrap();
+            result_to_envelope(id, handlers::get_audit_log(&guard, limit, since_unix))
         }
 
         // ---- sealed secrets ----
@@ -733,6 +766,7 @@ fn method_name(req: &Request) -> &'static str {
         Request::RunFeedNow     { .. }      => "run_feed_now",
         Request::SyncSchedules              => "sync_schedules",
         Request::GetRunHistory  { .. }      => "get_run_history",
+        Request::GetAuditLog    { .. }      => "get_audit_log",
         Request::PutSecret      { .. }      => "put_secret",
         Request::DeleteSecret   { .. }      => "delete_secret",
         Request::ListSecrets                => "list_secrets",
@@ -790,5 +824,48 @@ fn result_to_envelope(
     match result {
         Ok(response) => ResponseEnvelope::success(id, response),
         Err(error) => ResponseEnvelope::failure(id, error.code, error.message),
+    }
+}
+
+// ============================================================
+// record_audit - one-shot writer for the SQLite audit log
+// ============================================================
+//
+// Called from `dispatch_local` after every mutating RPC (success
+// AND failure). The hook deliberately runs OUTSIDE the request
+// dispatch arm so a single point covers all variants — adding a
+// new mutating RPC variant only requires marking it in
+// `is_mutating()` for the audit trail to pick it up.
+//
+// We brief-lock the daemon state to grab the AuditDb handle and
+// drop the lock before the actual SQLite INSERT. Audit failures
+// are logged but never propagated; the audit table is a reporting
+// surface, not part of any consistency guarantee.
+
+fn record_audit(
+    state:    &SharedDaemonState,
+    caller:   Option<&str>,
+    request:  &Request,
+    response: &ResponseEnvelope,
+) {
+    // Grab a thread-local handle by cloning under the lock. Brief
+    // critical section: the actual INSERT happens unlocked. We
+    // can't share an AuditDb across threads behind a guard cheaply
+    // (rusqlite::Connection is !Sync), so we just take the lock
+    // for the whole INSERT. WAL mode keeps reads from blocking.
+    let outcome = match &response.outcome {
+        sftpflow_proto::ResponseOutcome::Success { .. } => "ok".to_string(),
+        sftpflow_proto::ResponseOutcome::Failure { error } => format!("err:{}", error.code),
+    };
+    let rpc       = method_name(request);
+    let args_hash = audit::args_hash(request);
+    let (ts_unix, ts_iso) = audit::now_unix_and_iso();
+
+    let guard = match state.lock() {
+        Ok(g)  => g,
+        Err(_) => return, // poisoned mutex; daemon is going down anyway
+    };
+    if let Some(ref db) = guard.audit_db {
+        db.record(ts_unix, &ts_iso, caller, rpc, &args_hash, &outcome);
     }
 }

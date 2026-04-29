@@ -640,6 +640,31 @@ pub fn get_run_history(
 }
 
 // ============================================================
+// Audit log
+// ============================================================
+
+/// Retrieve mutation-audit rows from SQLite, newest first.
+/// Returns INTERNAL_ERROR if the audit database failed to open
+/// at startup — operator should check daemon logs and disk space.
+pub fn get_audit_log(
+    state:      &DaemonState,
+    limit:      Option<u32>,
+    since_unix: Option<i64>,
+) -> Result<Response, ProtoError> {
+    let db = state.audit_db.as_ref().ok_or_else(|| ProtoError {
+        code: error_code::INTERNAL_ERROR,
+        message: "audit log database is not available".to_string(),
+    })?;
+
+    let entries = db.query(limit, since_unix).map_err(|e| ProtoError {
+        code: error_code::INTERNAL_ERROR,
+        message: format!("failed to query audit log: {}", e),
+    })?;
+
+    Ok(Response::AuditLog(entries))
+}
+
+// ============================================================
 // Scheduler
 // ============================================================
 
@@ -944,6 +969,7 @@ pub fn cluster_leave(state: &DaemonState) -> Result<Response, ProtoError> {
     // outcome matters).
     let envelope = sftpflow_proto::RequestEnvelope {
         id: 0,
+        caller: None,
         request: sftpflow_proto::Request::ClusterRemoveNode { node_id: self_id },
     };
     let envelope_bytes = serde_json::to_vec(&envelope).map_err(|e| ProtoError {

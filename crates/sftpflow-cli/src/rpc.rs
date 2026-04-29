@@ -79,7 +79,13 @@ impl From<io::Error> for RpcError {
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct RpcClient {
-    inner: RpcInner,
+    inner:  RpcInner,
+    /// CLI-attributed caller string stamped into every RequestEnvelope
+    /// for the audit log. Format: `<user>@<host>` for SSH transport,
+    /// `<system-user>@local` for socket dev mode. The daemon does not
+    /// authenticate this — SSH already authenticated the user — it
+    /// just records what the CLI claimed.
+    caller: Option<String>,
 }
 
 enum RpcInner {
@@ -144,6 +150,7 @@ impl RpcClient {
                 reader: Box::new(BufReader::new(reader)),
                 writer: Box::new(stream),
             },
+            caller: Some(local_caller_for(addr)),
         })
     }
 
@@ -157,6 +164,7 @@ impl RpcClient {
                 reader: Box::new(BufReader::new(reader)),
                 writer: Box::new(stream),
             },
+            caller: Some(local_caller_for(path)),
         })
     }
 
@@ -188,6 +196,9 @@ impl RpcClient {
                 host:     host.to_string(),
                 port:     server.port,
             },
+            // Stamp `<ssh-user>@<host>` so audit rows attribute every
+            // mutating RPC to the operator who's connected.
+            caller: Some(format!("{}@{}", username, host)),
         })
     }
 
@@ -199,7 +210,11 @@ impl RpcClient {
     /// Returns RpcError::Proto if the daemon returned an error envelope.
     pub fn call(&mut self, request: Request) -> Result<Response, RpcError> {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let envelope = RequestEnvelope { id, request };
+        let envelope = RequestEnvelope {
+            id,
+            caller: self.caller.clone(),
+            request,
+        };
         debug!("rpc: sending id={} {:?}", id, envelope);
 
         let response = match &mut self.inner {
@@ -298,4 +313,28 @@ fn one_shot_ssh_call(
     }
 
     envelope.ok_or(RpcError::UnexpectedEof)
+}
+
+// ============================================================
+// local_caller_for - audit caller string for non-SSH transports
+// ============================================================
+
+/// Build a `<system-user>@local[:<addr>]` caller string for socket
+/// dev mode (TCP loopback or Unix domain socket). The daemon stamps
+/// this onto audit rows so even local development shows a non-empty
+/// caller — easier than chasing down "who was that anonymous mutation
+/// last Tuesday?". Falls back to `unknown@local` when the OS gives
+/// no username.
+fn local_caller_for(addr: &str) -> String {
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "unknown".to_string());
+    // Keep the address suffix short — full Unix paths are noisy in
+    // an audit table. Just include host:port for TCP, drop the path
+    // for Unix sockets (the "@local" already conveys "this box").
+    if addr.starts_with('/') {
+        format!("{}@local", user)
+    } else {
+        format!("{}@local:{}", user, addr)
+    }
 }

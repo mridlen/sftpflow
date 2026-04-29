@@ -52,6 +52,7 @@ use sftpflow_proto::{RequestEnvelope, ResponseEnvelope};
 use sftpflow_cluster::transport::NdjsonForwardHandler;
 
 pub mod dkron;       // dkron.rs - Dkron scheduler reconciliation
+mod audit;           // audit.rs - SQLite mutation audit log
 mod backup;          // backup.rs - hot snapshot + cold restore of node state
 mod handlers;        // handlers.rs - RPC method implementations
 mod health;          // health.rs - HTTP /healthz + /readyz probe endpoints
@@ -532,7 +533,8 @@ fn cmd_init(daemon: DaemonArgs, args: InitArgs) -> Result<(), String> {
         ca_cert_pem,
     };
     let paths = build_daemon_paths(state_dir.clone(), db_path.clone(), secrets_path.clone());
-    let shared = server::build_shared_state(config, run_db, Some(secrets_store), Some(cluster_ctx), paths);
+    let audit_db = open_audit_db(&paths.audit_db);
+    let shared = server::build_shared_state(config, run_db, audit_db, Some(secrets_store), Some(cluster_ctx), paths);
     // Wire the forward handler now that SharedDaemonState exists.
     let _ = dispatch_cell.set(shared.clone());
 
@@ -788,7 +790,8 @@ fn cmd_join(daemon: DaemonArgs, args: JoinArgs) -> Result<(), String> {
         ca_cert_pem,
     };
     let paths = build_daemon_paths(state_dir.clone(), db_path.clone(), secrets_path.clone());
-    let shared = server::build_shared_state(config, run_db, secret_store, Some(cluster_ctx), paths);
+    let audit_db = open_audit_db(&paths.audit_db);
+    let shared = server::build_shared_state(config, run_db, audit_db, secret_store, Some(cluster_ctx), paths);
     let _ = dispatch_cell.set(shared.clone());
 
     maybe_spawn_health(&daemon.health_bind, shared.clone());
@@ -1114,7 +1117,8 @@ fn cmd_run_cluster(
         ca_cert_pem:   ca_cert_for_ctx,
     };
     let paths = build_daemon_paths(state_dir.clone(), db_path.clone(), secrets_path.clone());
-    let shared = server::build_shared_state(config, run_db, secret_store, Some(cluster_ctx), paths);
+    let audit_db = open_audit_db(&paths.audit_db);
+    let shared = server::build_shared_state(config, run_db, audit_db, secret_store, Some(cluster_ctx), paths);
     let _ = dispatch_cell.set(shared.clone());
 
     maybe_spawn_health(&daemon.health_bind, shared.clone());
@@ -1224,7 +1228,8 @@ fn cmd_run_legacy(daemon: DaemonArgs) -> Result<(), String> {
     // No cluster handle: legacy single-node mode runs every RPC
     // unguarded, like pre-M12. M13 deletes this fallback.
     let paths = build_daemon_paths(state_dir, db_path, secrets_path);
-    let shared = server::build_shared_state(config, run_db, secret_store, None, paths);
+    let audit_db = open_audit_db(&paths.audit_db);
+    let shared = server::build_shared_state(config, run_db, audit_db, secret_store, None, paths);
 
     maybe_spawn_health(&daemon.health_bind, shared.clone());
 
@@ -1362,17 +1367,42 @@ fn read_hostname() -> Option<String> {
 /// Build a `DaemonPaths` from already-resolved overrides. Pulls the
 /// config.yaml path from sftpflow_core so the backup module can pack
 /// the YAML alongside cluster state without re-deriving the rules
-/// (env var → home dir → relative fallback) here.
+/// (env var → home dir → relative fallback) here. The audit DB
+/// always sits next to runs.db (same directory, different file)
+/// so the two histories share a backup/restore destiny.
 fn build_daemon_paths(
     state_dir:    PathBuf,
     db_path:      PathBuf,
     secrets_path: PathBuf,
 ) -> server::DaemonPaths {
+    let audit_path = db_path.with_file_name("audit.db");
     server::DaemonPaths {
         state_dir,
         runs_db:      db_path,
+        audit_db:     audit_path,
         secrets_file: secrets_path,
         config_yaml:  sftpflow_core::config_path(),
+    }
+}
+
+/// Open the audit DB at `path`. Returns `None` (with a warning) on
+/// failure — the daemon must NEVER refuse to start because the audit
+/// log is unhappy; mutations still apply, they just don't get
+/// recorded until the operator fixes the underlying issue.
+fn open_audit_db(path: &std::path::Path) -> Option<audit::AuditDb> {
+    match audit::AuditDb::open(path) {
+        Ok(db) => {
+            info!("audit log database ready at '{}'", path.display());
+            Some(db)
+        }
+        Err(e) => {
+            warn!(
+                "could not open audit log database: {} — mutations will not be \
+                 recorded in the audit log",
+                e
+            );
+            None
+        }
     }
 }
 

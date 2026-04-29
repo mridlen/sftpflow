@@ -161,14 +161,17 @@ pub fn run_backup_hot(
     // ---- 2. Stage SQLite via VACUUM INTO ----
     // VACUUM INTO acquires the SHARED lock atomically and writes a
     // transactionally consistent copy of the DB to a new file —
-    // even if writers are concurrently appending run rows.
+    // even if writers are concurrently appending run rows. Same
+    // treatment for the audit DB so the backup carries a consistent
+    // snapshot of the mutation trail.
     let staging = tempfile::tempdir()
         .map_err(|e| format!("creating temp staging dir: {}", e))?;
-    let staged_db = stage_sqlite_snapshot(&paths.runs_db, staging.path())?;
+    let staged_runs  = stage_sqlite_snapshot_named(&paths.runs_db,  staging.path(), "runs.db")?;
+    let staged_audit = stage_sqlite_snapshot_named(&paths.audit_db, staging.path(), "audit.db")?;
 
     // ---- 3. Enumerate files to include ----
     let mut file_specs: Vec<(PathBuf, String)> = Vec::new();
-    collect_backup_files(paths, &staged_db, &mut file_specs)?;
+    collect_backup_files(paths, &staged_runs, &staged_audit, &mut file_specs)?;
 
     // ---- 4. Build the archive ----
     if let Some(parent) = out_path.parent() {
@@ -420,30 +423,33 @@ pub struct RestoreReport {
 // Internals
 // ============================================================
 
-/// Run `VACUUM INTO 'staging/runs.db'` on the live runs database.
+/// Run `VACUUM INTO 'staging/<name>'` on a SQLite database.
 /// Returns the staged path, or `None` if the source DB doesn't
-/// exist (legacy or fresh node — backup just skips it).
-fn stage_sqlite_snapshot(
+/// exist (legacy or fresh node — backup just skips it). Used for
+/// both `runs.db` and `audit.db`; staging filename matches the
+/// archive-internal name expected by `resolve_archive_dest`.
+fn stage_sqlite_snapshot_named(
     src:         &Path,
     staging_dir: &Path,
+    staged_name: &str,
 ) -> Result<Option<PathBuf>, String> {
     if !src.exists() {
         return Ok(None);
     }
-    let dst = staging_dir.join("runs.db");
+    let dst = staging_dir.join(staged_name);
     // Read-only attach + VACUUM INTO. Doesn't lock out writers; the
     // copy is a transactionally consistent point-in-time snapshot.
     let conn = rusqlite::Connection::open_with_flags(
         src,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
     )
-    .map_err(|e| format!("opening runs.db read-only: {}", e))?;
+    .map_err(|e| format!("opening {} read-only: {}", staged_name, e))?;
 
     conn.execute(
         "VACUUM INTO ?1",
         rusqlite::params![dst.to_string_lossy()],
     )
-    .map_err(|e| format!("VACUUM INTO failed: {}", e))?;
+    .map_err(|e| format!("VACUUM INTO {} failed: {}", staged_name, e))?;
     Ok(Some(dst))
 }
 
@@ -451,9 +457,10 @@ fn stage_sqlite_snapshot(
 /// existing one onto `out` as `(source_path, archive_path)` pairs.
 /// Files that don't exist are silently skipped.
 fn collect_backup_files(
-    paths:     &DaemonPaths,
-    staged_db: &Option<PathBuf>,
-    out:       &mut Vec<(PathBuf, String)>,
+    paths:        &DaemonPaths,
+    staged_runs:  &Option<PathBuf>,
+    staged_audit: &Option<PathBuf>,
+    out:          &mut Vec<(PathBuf, String)>,
 ) -> Result<(), String> {
     // node.json + cluster/ certs (cluster/ key files end up here too)
     let node_json = node_state::node_json_path(&paths.state_dir);
@@ -474,9 +481,12 @@ fn collect_backup_files(
         collect_dir_recursive(&raft, "raft", out)?;
     }
 
-    // Vacuumed SQLite copy (or nothing if no DB existed).
-    if let Some(p) = staged_db {
+    // Vacuumed SQLite copies (or nothing if no DB existed).
+    if let Some(p) = staged_runs {
         out.push((p.clone(), "runs.db".to_string()));
+    }
+    if let Some(p) = staged_audit {
+        out.push((p.clone(), "audit.db".to_string()));
     }
 
     // Sealed credential store. Its on-disk filename varies by the
@@ -606,6 +616,7 @@ fn resolve_archive_dest(paths: &DaemonPaths, archive_path: &str) -> PathBuf {
         "cluster/node.crt" => node_state::leaf_cert_path(&paths.state_dir),
         "cluster/node.key" => node_state::leaf_key_path(&paths.state_dir),
         "runs.db"          => paths.runs_db.clone(),
+        "audit.db"         => paths.audit_db.clone(),
         "secrets.age"      => paths.secrets_file.clone(),
         "config.yaml"      => paths.config_yaml.clone(),
         other => {
@@ -699,6 +710,7 @@ mod tests {
         DaemonPaths {
             state_dir:    root.join("state"),
             runs_db:      root.join("state").join("runs.db"),
+            audit_db:     root.join("state").join("audit.db"),
             secrets_file: root.join("state").join("secrets.age"),
             config_yaml:  root.join("home").join(".sftpflow").join("config.yaml"),
         }

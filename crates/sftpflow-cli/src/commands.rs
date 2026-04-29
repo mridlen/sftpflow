@@ -2112,6 +2112,7 @@ pub fn show(args: &[&str], state: &mut ShellState) {
         println!("  feeds              List all feeds");
         println!("  feed <name>        Show feed details");
         println!("  runs <feed> [N]    Show run history for a feed (default: 25)");
+        println!("  audit [N]          Show recent cluster mutations (default: 50)");
         println!("  server             Show server connection settings");
         println!("  version            Show SFTPflow version");
         return;
@@ -2152,6 +2153,10 @@ pub fn show(args: &[&str], state: &mut ShellState) {
             }
             let limit = args.get(2).and_then(|s| s.parse::<u32>().ok());
             show_runs(args[1], limit, state);
+        }
+        "audit"     => {
+            let limit = args.get(1).and_then(|s| s.parse::<u32>().ok());
+            show_audit(limit, state);
         }
         _ => println!("% Unknown show subcommand: '{}'", args[0]),
     }
@@ -2327,6 +2332,87 @@ fn show_runs(feed: &str, limit: Option<u32>, state: &mut ShellState) {
         Err(RpcError::Proto(e)) => println!("% {}", e.message),
         Err(e) => println!("% Error: {}", e),
         _ => {}
+    }
+}
+
+/// Show recent cluster mutation audit rows (fetched from daemon).
+///
+/// The audit log records one row per mutating RPC: timestamp,
+/// CLI-attributed caller, method name, sha256 args fingerprint,
+/// and outcome (`ok` vs `err:<code>`). Read-only RPCs do not
+/// appear here. Failed mutations DO appear so operators can see
+/// rejected attempts (e.g. NOT_LEADER on followers, REFERENCE_IN_USE
+/// when deleting an in-use endpoint).
+fn show_audit(limit: Option<u32>, state: &mut ShellState) {
+    if !has_rpc(state) { return; }
+    let rpc = state.rpc.as_mut().unwrap();
+
+    match rpc.call(Request::GetAuditLog { limit, since_unix: None }) {
+        Ok(Response::AuditLog(entries)) => {
+            if entries.is_empty() {
+                println!("No audit rows yet.");
+                return;
+            }
+            println!("Audit log ({} entries, newest first):", entries.len());
+            // Column widths chosen so a typical entry fits in 100
+            // columns: 4 id, 20 timestamp, 22 caller, 22 rpc, 8
+            // outcome, plus the args_hash truncated to 12 chars.
+            println!(
+                "  {:<5} {:<20} {:<22} {:<22} {:<10} {}",
+                "#", "Timestamp (UTC)", "Caller", "RPC", "Outcome", "Args"
+            );
+            println!("  {}", "-".repeat(96));
+
+            for entry in &entries {
+                let ts    = &entry.ts_iso[..19.min(entry.ts_iso.len())];
+                let caller = entry.caller.as_deref().unwrap_or("-");
+                let outcome = colored_outcome(&entry.outcome);
+                // Hash is 64 hex chars; show the first 12 so the eye
+                // can still spot duplicate-payload retries without
+                // wasting half the line on uniqueness.
+                let hash_short = &entry.args_hash
+                    [..12.min(entry.args_hash.len())];
+                println!(
+                    "  {:<5} {:<20} {:<22} {:<22} {:<19} {}",
+                    entry.id,
+                    ts,
+                    truncate(caller, 22),
+                    truncate(&entry.rpc, 22),
+                    outcome,
+                    hash_short,
+                );
+            }
+        }
+        Err(RpcError::Proto(e)) => println!("% {}", e.message),
+        Err(e) => println!("% Error: {}", e),
+        _ => {}
+    }
+}
+
+/// Color the outcome cell: green for `ok`, red for any error code.
+/// Includes ANSI reset; padded internally so the surrounding
+/// printf width counts the *visible* characters, not the escape
+/// bytes (we use a 19-wide field that already accounts for "\x1b[31m"
+/// + outcome + "\x1b[0m").
+fn colored_outcome(outcome: &str) -> String {
+    if outcome == "ok" {
+        // 7 visible chars; pad to 8 then add escape codes.
+        format!("\x1b[32m{:<8}\x1b[0m", "ok")
+    } else {
+        format!("\x1b[31m{:<8}\x1b[0m", outcome)
+    }
+}
+
+/// Truncate a string to `max` columns, replacing the last char with
+/// '…' when shortened. Avoids wrecking column alignment on long
+/// `<user>@<host>` callers or rare RPC-name additions.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max - 1).collect();
+        out.push('…');
+        out
     }
 }
 

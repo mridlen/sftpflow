@@ -353,10 +353,11 @@ mod tests {
         let paths = DaemonPaths {
             state_dir:    std::path::PathBuf::from("/tmp/sftpflow-health-test/state"),
             runs_db:      std::path::PathBuf::from("/tmp/sftpflow-health-test/runs.db"),
+            audit_db:     std::path::PathBuf::from("/tmp/sftpflow-health-test/audit.db"),
             secrets_file: std::path::PathBuf::from("/tmp/sftpflow-health-test/secrets.sealed"),
             config_yaml:  std::path::PathBuf::from("/tmp/sftpflow-health-test/config.yaml"),
         };
-        server::build_shared_state(Config::default(), None, None, None, paths)
+        server::build_shared_state(Config::default(), None, None, None, None, paths)
     }
 
     /// Bind 127.0.0.1:0 (OS-assigned port), spawn the accept loop
