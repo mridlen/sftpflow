@@ -13,6 +13,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -44,6 +45,26 @@ use crate::secrets::SecretStore; // secrets.rs - sealed credential store
 // Shared daemon state
 // ============================================================
 
+/// On-disk path bundle resolved once at startup and stashed on
+/// `DaemonState` so handlers don't have to re-derive defaults that
+/// might disagree with `--state-dir` / `--db` / `--secrets` overrides.
+///
+/// `state_dir` is the cluster-state base (node.json, cluster/, raft/);
+/// `runs_db` is the SQLite run-history file; `secrets_file` is the
+/// sealed-credentials path; `config_yaml` is the path that
+/// `Config::load`/`Config::save` use (defaults to ~/.sftpflow/config.yaml,
+/// or `$SFTPFLOW_CONFIG`).
+///
+/// Used by the backup/restore module so it can produce a self-contained
+/// archive of every node-local file.
+#[derive(Clone)]
+pub struct DaemonPaths {
+    pub state_dir:    PathBuf,
+    pub runs_db:      PathBuf,
+    pub secrets_file: PathBuf,
+    pub config_yaml:  PathBuf,
+}
+
 /// State shared across all connections. Wrapped in Arc<Mutex<...>>
 /// at the call site so handlers can read/mutate it safely.
 pub struct DaemonState {
@@ -66,6 +87,10 @@ pub struct DaemonState {
     /// new `cluster_*` RPCs use the bundled `cluster_id`,
     /// `self_id`, and (on the bootstrap node) `token_secret`.
     pub cluster: Option<ClusterContext>,
+    /// Resolved on-disk paths the backup handler reads from. Cloned
+    /// each time so the handler doesn't have to hold the daemon
+    /// mutex during the (potentially seconds-long) tar+gz pass.
+    pub paths: DaemonPaths,
 }
 
 // ============================================================
@@ -80,6 +105,7 @@ pub fn build_shared_state(
     run_db:  Option<RunDb>,
     secrets: Option<SecretStore>,
     cluster: Option<ClusterContext>,
+    paths:   DaemonPaths,
 ) -> SharedDaemonState {
     let dkron_url = config.server.dkron_url.clone();
     Arc::new(Mutex::new(DaemonState {
@@ -89,6 +115,7 @@ pub fn build_shared_state(
         run_db,
         secrets,
         cluster,
+        paths,
     }))
 }
 
@@ -474,6 +501,21 @@ pub fn dispatch_local(env: RequestEnvelope, state: &SharedDaemonState) -> Respon
             let guard = state.lock().unwrap();
             result_to_envelope(id, handlers::cluster_get_ca(&guard))
         }
+
+        // ---- cluster (hot backup) ----
+        // Acquires the daemon mutex briefly to clone `paths`, then
+        // releases it BEFORE the tar+gz pass — backup is I/O bound
+        // and takes seconds, so holding the lock would freeze every
+        // other NDJSON connection on this node. Not leader-gated:
+        // every node backs up its own per-node state, so the operator
+        // can take a backup from any reachable member.
+        Request::ClusterBackup { out_path } => {
+            let paths = {
+                let guard = state.lock().unwrap();
+                guard.paths.clone()
+            };
+            result_to_envelope(id, handlers::cluster_backup(paths, &out_path))
+        }
     }
 }
 
@@ -699,6 +741,7 @@ fn method_name(req: &Request) -> &'static str {
         Request::ClusterRemoveNode { .. }   => "cluster_remove_node",
         Request::ClusterLeave               => "cluster_leave",
         Request::ClusterGetCa               => "cluster_get_ca",
+        Request::ClusterBackup  { .. }      => "cluster_backup",
     }
 }
 

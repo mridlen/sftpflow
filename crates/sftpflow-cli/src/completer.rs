@@ -75,7 +75,7 @@ const SHOW_TOKENS: &[&str] = &[
 ];
 
 // Subcommand families.
-const CLUSTER_SUBS:    &[&str] = &["status", "token", "remove", "leave", "join", "bootstrap"];
+const CLUSTER_SUBS:    &[&str] = &["status", "token", "remove", "leave", "join", "bootstrap", "backup"];
 const CONNECTION_SUBS: &[&str] = &["add", "list", "delete"];
 const SECRET_SUBS:     &[&str] = &["add", "list", "delete"];
 const SYNC_SUBS:       &[&str] = &["schedules"];

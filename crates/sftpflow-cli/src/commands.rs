@@ -62,6 +62,7 @@ pub fn help_exec() {
     println!("                               Mint+ship a token, then ssh-drive sftpflowd join");
     println!("  cluster remove <node-id>     Remove a different node from the voter set");
     println!("  cluster leave                Step the connected node out of the cluster");
+    println!("  cluster backup <server-path> Hot backup the connected node to <path>.tar.gz");
     println!();
     println!("  run feed <name>              Manually run a feed (outside of schedule)");
     println!("  sync schedules               Reconcile feed schedules with dkron");
@@ -2549,10 +2550,10 @@ pub fn set_key_contents_ref(args: &[&str], state: &mut ShellState) {
 //   - remove <node-id>  Drop a node from the voter set; the CLI
 //                       double-confirms before sending.
 
-/// Route 'cluster status|token|remove|leave|join|bootstrap ...' in exec mode.
+/// Route 'cluster status|token|remove|leave|join|bootstrap|backup ...' in exec mode.
 pub fn cluster(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
-        println!("% Usage: cluster <status|token|remove|leave|join|bootstrap> [args]");
+        println!("% Usage: cluster <status|token|remove|leave|join|bootstrap|backup> [args]");
         return;
     }
 
@@ -2603,7 +2604,15 @@ pub fn cluster(args: &[&str], state: &mut ShellState) {
             }
             cluster_bootstrap_remote(args[1]);
         }
-        _ => println!("% Unknown cluster subcommand '{}'. Use status, token, remove, leave, join, or bootstrap.", args[0]),
+        "backup" => {
+            if args.len() < 2 {
+                println!("% Usage: cluster backup <server-side absolute path .tar.gz>");
+                println!("  e.g. cluster backup /var/lib/sftpflow/backups/sftpflow-2026-04-29.tar.gz");
+                return;
+            }
+            cluster_backup_remote(state, args[1]);
+        }
+        _ => println!("% Unknown cluster subcommand '{}'. Use status, token, remove, leave, join, bootstrap, or backup.", args[0]),
     }
 }
 
@@ -2797,6 +2806,46 @@ fn cluster_leave(state: &mut ShellState) {
             info!("cluster leave: node_id={} removed", self_id_str);
             println!("Node {} has left the cluster.", self_id_str);
             println!("(daemon is still running — re-join with `cluster join` or stop it manually)");
+        }
+        Err(RpcError::Proto(e)) => println!("% {}", e.message),
+        Err(e) => println!("% Error: {}", e),
+        _ => {}
+    }
+}
+
+/// Send ClusterBackup and pretty-print the resulting BackupReport.
+///
+/// `out_path` is server-side and absolute — the daemon refuses
+/// relative paths because its CWD is unstable (often "/" under
+/// systemd). The archive is left on the server's filesystem in v1;
+/// the operator scps it back themselves. The printed sha256 lets
+/// them verify their copy matches what the daemon wrote.
+fn cluster_backup_remote(state: &mut ShellState, out_path: &str) {
+    if !has_rpc(state) { return; }
+
+    println!("Requesting backup → {}", out_path);
+    println!("(this is the path on the *server*; scp it back when done)");
+
+    let rpc = state.rpc.as_mut().unwrap();
+    match rpc.call(Request::ClusterBackup { out_path: out_path.to_string() }) {
+        Ok(Response::BackupReport(report)) => {
+            println!();
+            println!("Backup written:");
+            println!("  path:        {}", report.archive_path);
+            println!("  size:        {} bytes", report.archive_size);
+            println!("  sha256:      {}", report.archive_sha256);
+            println!("  files:       {}", report.file_count);
+            if let Some(node_id) = report.node_id {
+                println!("  node_id:     {}", node_id);
+            }
+            if let Some(cluster_id) = report.cluster_id.as_ref() {
+                println!("  cluster_id:  {}", cluster_id);
+            }
+            println!();
+            println!("To copy it back from the server:");
+            println!("  scp <user>@<host>:{} ./", report.archive_path);
+            println!("To verify the copy locally:");
+            println!("  sha256sum <local-copy>.tar.gz");
         }
         Err(RpcError::Proto(e)) => println!("% {}", e.message),
         Err(e) => println!("% Error: {}", e),

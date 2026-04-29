@@ -46,6 +46,12 @@ rustls     = { workspace = true }
 # Encode the raw 32-byte token secret for storage in the string-valued
 # sealed-secrets store (key name: __cluster_token_key__).
 base64     = { workspace = true }
-
-[dev-dependencies]
+# Backup/restore archive support — `sftpflowd backup` produces a
+# tar.gz of node state; `sftpflowd restore` extracts it. sha2 hashes
+# each file for the manifest so a corrupted archive fails fast.
+# tempfile stages the SQLite VACUUM INTO snapshot before tar'ing it.
+tar      = { workspace = true }
+flate2   = { workspace = true }
+sha2     = { workspace = true }
 tempfile = { workspace = true }
+

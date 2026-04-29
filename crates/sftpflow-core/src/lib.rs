@@ -582,7 +582,11 @@ impl Config {
 
 /// Return the path to the config file.
 /// Checks SFTPFLOW_CONFIG env var first, then falls back to ~/.sftpflow/config.yaml.
-fn config_path() -> PathBuf {
+///
+/// Public so the daemon's backup/restore module can copy this file
+/// alongside the cluster state — the YAML lives outside `state_dir`
+/// so plumbing the path through is the only way to find it.
+pub fn config_path() -> PathBuf {
     if let Ok(p) = std::env::var("SFTPFLOW_CONFIG") {
         return PathBuf::from(p);
     }

@@ -55,6 +55,11 @@ suppaftp        = { version = "6", default-features = false, features = ["rustls
 rustls          = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 webpki-roots    = "0.26"
 base64          = "0.22"
+# Backup/restore archive (`sftpflowd backup` + `sftpflow cluster backup`).
+# tar + flate2 build a portable .tar.gz; sha2 (defined below in the cluster
+# section) hashes per-file for the manifest.
+tar             = "0.4"
+flate2          = "1"
 
 # ------------------------------------------------------------
 # Cluster / Raft dependencies (M12+)

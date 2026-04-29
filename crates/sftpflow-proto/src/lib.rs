@@ -96,6 +96,14 @@ pub enum Request {
     /// CLI's `cluster join` command to ship the CA to a new host
     /// without an out-of-band scp.
     ClusterGetCa,
+    /// Hot backup: the receiving node tars its own state (cluster
+    /// certs, raft sled DB, vacuumed runs.db, sealed secrets,
+    /// config.yaml) into `out_path` on the *server's* filesystem.
+    /// Not in `is_mutating()` — every node can back up its own
+    /// state regardless of leader status. Operator scps the file
+    /// back from the server in v1; future versions may stream it
+    /// inline. The path must be absolute server-side.
+    ClusterBackup { out_path: String },
 }
 
 // ============================================================
@@ -143,6 +151,10 @@ pub enum Response {
     ClusterToken(ClusterToken),
     /// Reply to ClusterGetCa. PEM-encoded cluster CA cert.
     ClusterCaCert(String),
+    /// Reply to ClusterBackup. Carries the resulting archive's
+    /// server-side path, size, sha256, and source-node identifiers
+    /// so the operator can verify the file post-scp.
+    BackupReport(BackupReport),
 }
 
 /// Server identity and version, returned by GetServerInfo.
@@ -269,6 +281,27 @@ pub struct ClusterMemberInfo {
 pub struct ClusterToken {
     pub token: String,
     pub expires_at_unix: i64,
+}
+
+/// Outcome of a `ClusterBackup` RPC. The archive itself is written
+/// server-side at `archive_path`; this struct just gives the CLI
+/// enough metadata to print a summary and verify a scp'd copy.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BackupReport {
+    /// Absolute path on the server's filesystem where the archive
+    /// was written. The operator scps this back themselves in v1.
+    pub archive_path: String,
+    /// Compressed (.tar.gz) size in bytes.
+    pub archive_size: u64,
+    /// Lowercase hex sha256 of the archive bytes. Lets the operator
+    /// verify their scp'd copy matches what the daemon produced.
+    pub archive_sha256: String,
+    /// Number of source files included (excludes manifest.json).
+    pub file_count: usize,
+    /// Source node's cluster UUID, when it is a cluster member.
+    pub cluster_id: Option<String>,
+    /// Source node's u64 ID, when present.
+    pub node_id: Option<u64>,
 }
 
 /// A single run history entry, returned by GetRunHistory.

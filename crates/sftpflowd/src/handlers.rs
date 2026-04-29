@@ -36,9 +36,10 @@ use sftpflow_proto::{
     SyncReport,
 };
 
+use crate::backup; // backup.rs - hot snapshot + cold restore
 use crate::dkron::DkronClient; // dkron.rs
 use crate::secrets::SecretStore; // secrets.rs
-use crate::server::DaemonState;
+use crate::server::{DaemonPaths, DaemonState};
 
 // ============================================================
 // Helpers
@@ -988,4 +989,63 @@ pub fn cluster_leave(state: &DaemonState) -> Result<Response, ProtoError> {
         }
         sftpflow_proto::ResponseOutcome::Failure { error } => Err(error),
     }
+}
+
+// ============================================================
+// cluster_backup - hot tar.gz snapshot of node state
+// ============================================================
+//
+// Takes the resolved DaemonPaths by value (cloned in the dispatch
+// arm BEFORE the daemon mutex is acquired) so the tar+gz pass — up
+// to a few seconds for a typical node — does not block other NDJSON
+// connections.
+//
+// Not leader-gated: every node can back up its own state. The result
+// path is server-side; the operator scps it back themselves in v1.
+//
+// Preconditions enforced here:
+//   - out_path is non-empty
+//   - out_path is absolute (avoids "where am I writing?" surprises;
+//     daemon CWD is whatever started it, often "/" under systemd)
+
+pub fn cluster_backup(
+    paths:    DaemonPaths,
+    out_path: &str,
+) -> Result<Response, ProtoError> {
+    if out_path.is_empty() {
+        return Err(ProtoError {
+            code: error_code::INVALID_PARAMS,
+            message: "out_path must not be empty".to_string(),
+        });
+    }
+    let out = std::path::PathBuf::from(out_path);
+    if !out.is_absolute() {
+        return Err(ProtoError {
+            code: error_code::INVALID_PARAMS,
+            message: format!(
+                "out_path '{}' must be absolute (server-side path); \
+                 the daemon's working directory is not a stable reference",
+                out_path,
+            ),
+        });
+    }
+
+    info!("cluster_backup: writing archive to {}", out.display());
+    let report = backup::run_backup_hot(&paths, &out).map_err(|e| ProtoError {
+        code: error_code::INTERNAL_ERROR,
+        message: format!("backup failed: {}", e),
+    })?;
+    info!(
+        "cluster_backup: ok ({} files, {} bytes, sha256={})",
+        report.file_count, report.archive_size, report.archive_sha256,
+    );
+
+    Ok(Response::BackupReport(sftpflow_proto::BackupReport {
+        archive_path:   report.archive_path,
+        archive_size:   report.archive_size,
+        archive_sha256: report.archive_sha256,
+        file_count:     report.file_count,
+        cluster_id:     report.cluster_id,
+        node_id:        report.node_id,
+    }))
 }

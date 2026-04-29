@@ -52,6 +52,7 @@ use sftpflow_proto::{RequestEnvelope, ResponseEnvelope};
 use sftpflow_cluster::transport::NdjsonForwardHandler;
 
 pub mod dkron;       // dkron.rs - Dkron scheduler reconciliation
+mod backup;          // backup.rs - hot snapshot + cold restore of node state
 mod handlers;        // handlers.rs - RPC method implementations
 mod history;         // history.rs - SQLite run history persistence
 mod secrets;         // secrets.rs - sealed credential store (age-encrypted)
@@ -160,6 +161,14 @@ enum Command {
     /// given. Comes up as a cluster member if node.json exists;
     /// otherwise falls back to legacy single-node mode.
     Run(RunArgs),
+
+    /// Cold restore from a `.tar.gz` archive produced by the
+    /// `cluster backup` RPC. Refuses to run unless every target
+    /// path (state_dir contents, runs.db, sealed secrets file,
+    /// config.yaml) is empty — a pre-existing node must be wiped
+    /// first to avoid silently overwriting state. After a successful
+    /// restore, run `sftpflowd run` to bring the node back up.
+    Restore(RestoreArgs),
 }
 
 // ============================================================
@@ -211,6 +220,21 @@ struct InitArgs {
     /// (e.g. "west-coast replica").
     #[arg(long, value_name = "TEXT")]
     label: Option<String>,
+}
+
+// ============================================================
+// RestoreArgs
+// ============================================================
+
+#[derive(Args, Clone, Debug)]
+struct RestoreArgs {
+    /// Path to a `.tar.gz` archive produced by the `cluster backup`
+    /// RPC (or any sftpflowd-compatible v1 archive). Restore aborts
+    /// before touching the live filesystem if the archive's
+    /// manifest is missing, the schema version is newer than this
+    /// daemon understands, or any per-file sha256 fails to match.
+    #[arg(value_name = "ARCHIVE")]
+    archive: PathBuf,
 }
 
 // ============================================================
@@ -300,6 +324,16 @@ fn main() {
                 process::exit(1);
             }
         }
+
+        // ---- Cold restore from a backup archive. Refuses to clobber
+        //       any existing state files; operator wipes first.
+        Some(Command::Restore(args)) => {
+            if let Err(e) = cmd_restore(cli.daemon, args) {
+                error!("restore failed: {}", e);
+                process::exit(1);
+            }
+        }
+
         None => {
             if let Err(e) = cmd_run(cli.daemon, RunArgs::default()) {
                 error!("{}", e);
@@ -487,7 +521,8 @@ fn cmd_init(daemon: DaemonArgs, args: InitArgs) -> Result<(), String> {
         leaf_key_pem,
         ca_cert_pem,
     };
-    let shared = server::build_shared_state(config, run_db, Some(secrets_store), Some(cluster_ctx));
+    let paths = build_daemon_paths(state_dir.clone(), db_path.clone(), secrets_path.clone());
+    let shared = server::build_shared_state(config, run_db, Some(secrets_store), Some(cluster_ctx), paths);
     // Wire the forward handler now that SharedDaemonState exists.
     let _ = dispatch_cell.set(shared.clone());
 
@@ -740,7 +775,8 @@ fn cmd_join(daemon: DaemonArgs, args: JoinArgs) -> Result<(), String> {
         leaf_key_pem,
         ca_cert_pem,
     };
-    let shared = server::build_shared_state(config, run_db, secret_store, Some(cluster_ctx));
+    let paths = build_daemon_paths(state_dir.clone(), db_path.clone(), secrets_path.clone());
+    let shared = server::build_shared_state(config, run_db, secret_store, Some(cluster_ctx), paths);
     let _ = dispatch_cell.set(shared.clone());
 
     let serve_result = server::run(&ndjson_addr, shared)
@@ -761,6 +797,60 @@ fn cmd_join(daemon: DaemonArgs, args: JoinArgs) -> Result<(), String> {
 /// the seed-supplied CA matches the operator-supplied one.
 fn normalize_pem(pem: &str) -> String {
     pem.chars().filter(|c| !c.is_ascii_whitespace()).collect()
+}
+
+// ============================================================
+// cmd_restore - cold restore from a backup archive
+// ============================================================
+//
+// Mirrors the safety posture of `init`/`join`: every target path
+// must be empty before restore proceeds. The backup module also
+// verifies per-file sha256 hashes during extraction, so a corrupted
+// archive aborts the restore before anything is written to disk.
+
+fn cmd_restore(daemon: DaemonArgs, args: RestoreArgs) -> Result<(), String> {
+    if !args.archive.exists() {
+        return Err(format!("archive '{}' does not exist", args.archive.display()));
+    }
+
+    let state_dir   = daemon.state_dir.clone().unwrap_or_else(default_state_dir);
+    let db_path     = daemon.db.clone().unwrap_or_else(default_db_path);
+    let secrets_path = daemon.secrets.clone().unwrap_or_else(secrets::default_secrets_path);
+    let paths = build_daemon_paths(state_dir, db_path, secrets_path);
+
+    info!(
+        "restore: archive={} state_dir={} runs_db={} secrets_file={} config_yaml={}",
+        args.archive.display(),
+        paths.state_dir.display(),
+        paths.runs_db.display(),
+        paths.secrets_file.display(),
+        paths.config_yaml.display(),
+    );
+
+    let report = backup::run_restore_cold(&paths, &args.archive)?;
+
+    info!(
+        "restore: ok ({} files restored from sftpflow {} backup)",
+        report.files_restored, report.sftpflow_version,
+    );
+    if let (Some(cluster), Some(node)) = (report.cluster_id.as_ref(), report.node_id) {
+        info!("restore: archive identified node_id={} cluster_id={}", node, cluster);
+    }
+
+    println!(
+        "Restored {} file(s) from {}",
+        report.files_restored,
+        args.archive.display(),
+    );
+    if let (Some(cluster), Some(node)) = (report.cluster_id.as_ref(), report.node_id) {
+        println!("  cluster_id: {}", cluster);
+        println!("  node_id:    {}", node);
+    }
+    println!("  source sftpflow version: {}", report.sftpflow_version);
+    println!();
+    println!("Run `sftpflowd run` to bring this node back up.");
+
+    Ok(())
 }
 
 // ============================================================
@@ -1009,7 +1099,8 @@ fn cmd_run_cluster(
         leaf_key_pem:  leaf_key_for_ctx,
         ca_cert_pem:   ca_cert_for_ctx,
     };
-    let shared = server::build_shared_state(config, run_db, secret_store, Some(cluster_ctx));
+    let paths = build_daemon_paths(state_dir.clone(), db_path.clone(), secrets_path.clone());
+    let shared = server::build_shared_state(config, run_db, secret_store, Some(cluster_ctx), paths);
     let _ = dispatch_cell.set(shared.clone());
 
     let serve_result = server::run(&socket_addr, shared)
@@ -1033,6 +1124,7 @@ fn cmd_run_cluster(
 // cmd_run_cluster.
 
 fn cmd_run_legacy(daemon: DaemonArgs) -> Result<(), String> {
+    let state_dir   = daemon.state_dir.clone().unwrap_or_else(default_state_dir);
     let socket_addr = daemon.socket.unwrap_or_else(default_socket_addr);
     let db_path     = daemon.db.unwrap_or_else(default_db_path);
     let secrets_path = daemon.secrets.unwrap_or_else(secrets::default_secrets_path);
@@ -1115,7 +1207,8 @@ fn cmd_run_legacy(daemon: DaemonArgs) -> Result<(), String> {
     // server::run() - server.rs
     // No cluster handle: legacy single-node mode runs every RPC
     // unguarded, like pre-M12. M13 deletes this fallback.
-    let shared = server::build_shared_state(config, run_db, secret_store, None);
+    let paths = build_daemon_paths(state_dir, db_path, secrets_path);
+    let shared = server::build_shared_state(config, run_db, secret_store, None, paths);
     server::run(&socket_addr, shared)
         .map_err(|e| format!("server error: {}", e))
 }
@@ -1226,6 +1319,23 @@ fn read_hostname() -> Option<String> {
     #[cfg(not(unix))]
     {
         std::env::var("COMPUTERNAME").ok().filter(|s| !s.is_empty())
+    }
+}
+
+/// Build a `DaemonPaths` from already-resolved overrides. Pulls the
+/// config.yaml path from sftpflow_core so the backup module can pack
+/// the YAML alongside cluster state without re-deriving the rules
+/// (env var → home dir → relative fallback) here.
+fn build_daemon_paths(
+    state_dir:    PathBuf,
+    db_path:      PathBuf,
+    secrets_path: PathBuf,
+) -> server::DaemonPaths {
+    server::DaemonPaths {
+        state_dir,
+        runs_db:      db_path,
+        secrets_file: secrets_path,
+        config_yaml:  sftpflow_core::config_path(),
     }
 }
 
