@@ -188,8 +188,9 @@ pub fn help_exec(state: &mut ShellState) {
     println!();
     println!("  cluster status               Show cluster leader / members");
     println!("  cluster token [ttl]          Mint a join token (bootstrap node only)");
-    println!("  cluster bootstrap <user@host[:port]>");
+    println!("  cluster bootstrap [user@host[:port]]");
     println!("                               ssh-drive sftpflowd init on a fresh host");
+    println!("                               (run with no args to enter the interactive wizard)");
     println!("  cluster join <user@host[:port]>");
     println!("                               Mint+ship a token, then ssh-drive sftpflowd join");
     println!("  cluster remove [--dry-run] <node-id>");
@@ -3420,11 +3421,20 @@ pub fn cluster(args: &[&str], state: &mut ShellState) {
         }
         "bootstrap" => {
             if args.len() < 2 {
-                state.out.error_coded("USAGE", "Usage: cluster bootstrap <user@host[:port]>");
-                state.exit_code = 2;
+                // No SSH target — drop into the interactive wizard.
+                // The wizard itself bails out with USAGE if we're in
+                // JSON mode or stdin isn't a TTY.
+                cluster_bootstrap_wizard(state);
                 return;
             }
-            cluster_bootstrap_remote(state, args[1]);
+            // Arg-driven path: acquire passphrase (env or single
+            // prompt) here so cluster_bootstrap_remote stays purely
+            // mechanical.
+            let passphrase = match acquire_bootstrap_passphrase(state, false) {
+                Some(p) => p,
+                None    => return,  // already error-reported + exit_code set
+            };
+            cluster_bootstrap_remote(state, args[1], None, None, &passphrase);
         }
         "backup" => {
             if args.len() < 2 {
@@ -4028,19 +4038,32 @@ fn ssh_drive_remote_join(
 ///
 /// Steps:
 ///   1. Parse user@host[:port].
-///   2. Read passphrase (env or prompt). The remote daemon needs
-///      it to seal its secrets store; the operator must persist
-///      it on the remote (e.g. /etc/environment) for restarts.
-///   3. SSH in, pipe passphrase on stdin, run `sftpflowd init`
-///      (one-shot), then launch `sftpflowd run` via nohup so it
-///      survives our SSH session ending.
-///   4. Print a connection hint pointing at the new node.
+///   2. SSH in, pipe passphrase + (optional) label + (optional)
+///      advertise on stdin, run `sftpflowd init` (one-shot), then
+///      launch `sftpflowd run` via nohup so it survives our SSH
+///      session ending.
+///   3. Print a connection hint pointing at the new node.
+///
+/// `passphrase` is acquired by the caller (either env var, single
+/// prompt, or wizard with confirm) so this function stays agnostic
+/// of how the operator supplied it.
+///
+/// `label` and `advertise`, when supplied, must already have passed
+/// `validate_bootstrap_label` / `validate_bootstrap_advertise` —
+/// they are forwarded raw into a "$VAR" double-quoted slot in the
+/// remote shell script.
 ///
 /// Preconditions on the remote host:
 ///   - sftpflowd binary in PATH
 ///   - writable state-dir (default /var/lib/sftpflow)
 ///   - sshd accepting the operator's key
-fn cluster_bootstrap_remote(state: &mut ShellState, target: &str) {
+fn cluster_bootstrap_remote(
+    state:      &mut ShellState,
+    target:     &str,
+    label:      Option<&str>,
+    advertise:  Option<&str>,
+    passphrase: &str,
+) {
     let out = state.out;
     // ---- 1. Parse user@host[:port] -----------------------------
     let (user, host, port) = match parse_ssh_target(target) {
@@ -4052,34 +4075,14 @@ fn cluster_bootstrap_remote(state: &mut ShellState, target: &str) {
         }
     };
 
-    // ---- 2. Read passphrase from env or prompt -----------------
-    // Sent inline via SSH stdin so the remote daemon can seal its
-    // new secrets store on first init. The operator is responsible
-    // for making it available to the remote daemon on subsequent
-    // restarts (systemd EnvironmentFile, /etc/environment, etc.) —
-    // we only supply it for *this* invocation.
-    let passphrase = match std::env::var("SFTPFLOW_PASSPHRASE") {
-        Ok(p) if !p.is_empty() => p,
-        _ => {
-            match rpassword::prompt_password("Cluster passphrase (also needed on the remote host): ") {
-                Ok(p) if !p.is_empty() => p,
-                _ => {
-                    out.error("No passphrase supplied — aborting.");
-                    state.exit_code = 1;
-                    return;
-                }
-            }
-        }
-    };
-
     info!(
-        "cluster bootstrap: target={}@{} port={}",
-        user, host, port.unwrap_or(22),
+        "cluster bootstrap: target={}@{} port={} label={:?} advertise={:?}",
+        user, host, port.unwrap_or(22), label, advertise,
     );
     out.info(format!("Bootstrapping new cluster on {}@{}...", user, host));
 
-    // ---- 3. SSH + drive remote sftpflowd init + run ------------
-    if let Err(msg) = ssh_drive_remote_bootstrap(user, host, port, &passphrase) {
+    // ---- 2. SSH + drive remote sftpflowd init + run ------------
+    if let Err(msg) = ssh_drive_remote_bootstrap(user, host, port, passphrase, label, advertise) {
         out.error_coded("REMOTE_BOOTSTRAP", format!("Remote bootstrap failed: {}", msg));
         state.exit_code = 1;
         return;
@@ -4109,12 +4112,14 @@ fn cluster_bootstrap_remote(state: &mut ShellState, target: &str) {
             "port":      port,
             "username":  user,
             "raft_port": 7900,
+            "label":     label,
+            "advertise": advertise,
         }),
     );
 }
 
-/// Spawn ssh, pipe just the passphrase on stdin, and drive
-/// `sftpflowd init` followed by a detached `sftpflowd run`.
+/// Spawn ssh, pipe passphrase + optional label/advertise on stdin,
+/// and drive `sftpflowd init` followed by a detached `sftpflowd run`.
 ///
 /// Two-phase script:
 ///   1. `sftpflowd init` runs to completion (one-shot). On
@@ -4129,24 +4134,54 @@ fn ssh_drive_remote_bootstrap(
     host:       &str,
     port:       Option<u16>,
     passphrase: &str,
+    label:      Option<&str>,
+    advertise:  Option<&str>,
 ) -> Result<(), String> {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
+    // Defence in depth: even though the wizard / dispatch path
+    // validates these strings before calling us, a future caller
+    // might forget. Refuse anything containing characters that
+    // could break out of "$VAR" in the remote script.
+    if let Some(s) = label {
+        validate_bootstrap_label(s).map_err(|e| format!("invalid label: {}", e))?;
+    }
+    if let Some(s) = advertise {
+        validate_bootstrap_advertise(s).map_err(|e| format!("invalid advertise: {}", e))?;
+    }
+
     // POSIX-sh script (no bashisms) — matches the join helper's style.
+    // Values flow in through stdin (passphrase + optional label +
+    // optional advertise, three lines), so the script body itself
+    // contains no operator-supplied substrings — there's nothing for
+    // a malicious value to break out of even if validation slipped.
     // Single-quoted Rust raw string so { and } in shell ${} don't
-    // collide with format!'s placeholders. There are no placeholders
-    // in this script (passphrase comes via stdin), so no .format()
-    // call is needed.
+    // collide with format!'s placeholders.
     let remote_script = r#"
         set -e
         IFS= read -r SFTPFLOW_PASSPHRASE
         export SFTPFLOW_PASSPHRASE
+        IFS= read -r SFTPFLOW_LABEL || SFTPFLOW_LABEL=""
+        IFS= read -r SFTPFLOW_ADVERTISE || SFTPFLOW_ADVERTISE=""
 
         # ---- Phase 1: sftpflowd init (one-shot) ----
+        # Function so set -e applies inside; the `if ! ... ; then`
+        # caller still catches the exit so we can tail the log.
         INIT_LOG=/tmp/sftpflowd-bootstrap-init.log
         : > "$INIT_LOG"
-        if ! sftpflowd init > "$INIT_LOG" 2>&1; then
+        do_init() {
+            if [ -n "$SFTPFLOW_LABEL" ] && [ -n "$SFTPFLOW_ADVERTISE" ]; then
+                sftpflowd init --label "$SFTPFLOW_LABEL" --advertise "$SFTPFLOW_ADVERTISE"
+            elif [ -n "$SFTPFLOW_LABEL" ]; then
+                sftpflowd init --label "$SFTPFLOW_LABEL"
+            elif [ -n "$SFTPFLOW_ADVERTISE" ]; then
+                sftpflowd init --advertise "$SFTPFLOW_ADVERTISE"
+            else
+                sftpflowd init
+            fi
+        }
+        if ! do_init > "$INIT_LOG" 2>&1; then
             echo "sftpflowd init failed; tail of $INIT_LOG:" >&2
             tail -20 "$INIT_LOG" >&2
             exit 1
@@ -4199,8 +4234,15 @@ fn ssh_drive_remote_bootstrap(
     {
         let mut stdin = child.stdin.take()
             .ok_or_else(|| "ssh stdin not piped".to_string())?;
+        // Three stdin lines, in order: passphrase, label, advertise.
+        // Empty string for absent label/advertise — the script's
+        // `[ -n "$VAR" ]` checks treat empty as "skip".
         writeln!(stdin, "{}", passphrase)
             .map_err(|e| format!("writing passphrase: {}", e))?;
+        writeln!(stdin, "{}", label.unwrap_or(""))
+            .map_err(|e| format!("writing label: {}", e))?;
+        writeln!(stdin, "{}", advertise.unwrap_or(""))
+            .map_err(|e| format!("writing advertise: {}", e))?;
         // Drop closes stdin → remote shell sees EOF after `read`.
     }
 
@@ -4208,6 +4250,298 @@ fn ssh_drive_remote_bootstrap(
         .map_err(|e| format!("ssh wait failed: {}", e))?;
     if !status.success() {
         return Err(format!("ssh exited with status {}", status.code().unwrap_or(-1)));
+    }
+    Ok(())
+}
+
+// ============================================================
+// cluster bootstrap — interactive wizard (no-arg invocation)
+// ============================================================
+//
+// When `cluster bootstrap` is invoked with no SSH target the CLI
+// drops into this wizard instead of failing on missing args. It's
+// the friendliest entry point for first-time operators who don't
+// remember the exact `user@host[:port]` shape, the optional flags,
+// or that the daemon needs a passphrase.
+//
+// The wizard is human-mode + TTY only. JSON / piped-stdin callers
+// see the original USAGE error so non-interactive scripts (Ansible,
+// CI) keep their previous behaviour.
+
+/// Run the interactive `cluster bootstrap` wizard. Refuses (with a
+/// USAGE error) if the caller is in JSON mode or stdin isn't a TTY,
+/// since prompts only make sense for a human at a terminal.
+fn cluster_bootstrap_wizard(state: &mut ShellState) {
+    use std::io::IsTerminal;
+
+    let out = state.out;
+
+    // ---- Refuse in JSON / non-TTY mode -------------------------
+    // JSON callers want machine-readable output, not prompts.
+    // Non-TTY stdin (cron, piped sh) would block forever on the
+    // first read_line.
+    if out.is_json() {
+        out.error_coded(
+            "USAGE",
+            "Usage: cluster bootstrap <user@host[:port]>  \
+             (interactive wizard is human mode only)",
+        );
+        state.exit_code = 2;
+        return;
+    }
+    if !std::io::stdin().is_terminal() {
+        out.error_coded(
+            "USAGE",
+            "Usage: cluster bootstrap <user@host[:port]>  \
+             (interactive wizard requires a TTY)",
+        );
+        state.exit_code = 2;
+        return;
+    }
+
+    // ---- Banner ------------------------------------------------
+    println!("cluster bootstrap — interactive setup");
+    println!("Press Enter on optional fields to accept the default.");
+    println!();
+
+    // ---- Prompt 1: SSH target (required) -----------------------
+    let ssh_target = match prompt_required(
+        "SSH target (user@host[:port]): ",
+        |s| parse_ssh_target(s).map(|_| ()),
+    ) {
+        Some(s) => s,
+        None => {
+            out.error("Aborted.");
+            state.exit_code = 1;
+            return;
+        }
+    };
+
+    // ---- Prompt 2: Node label (optional) -----------------------
+    // Maps to `sftpflowd init --label`. Shown in `cluster status`.
+    let label = prompt_optional(
+        "Node label (e.g. west-coast-1) [skip]: ",
+        validate_bootstrap_label,
+    );
+
+    // ---- Prompt 3: Advertise host:port (optional) --------------
+    // Maps to `sftpflowd init --advertise`. Default = remote
+    // auto-detects `<hostname>:7900`.
+    let advertise = prompt_optional(
+        "Advertise host:port [auto-detect on remote]: ",
+        validate_bootstrap_advertise,
+    );
+
+    // ---- Prompt 4: Passphrase (with confirm) -------------------
+    // First-init passphrases are unrecoverable — confirm so a
+    // typo doesn't silently lock the new cluster's secrets store.
+    let passphrase = match acquire_bootstrap_passphrase(state, true) {
+        Some(p) => p,
+        None    => return,  // helper already reported + bumped exit_code
+    };
+
+    // ---- Recap ------------------------------------------------
+    println!();
+    println!("Ready to bootstrap:");
+    println!("  ssh target:  {}", ssh_target);
+    println!("  label:       {}", label.as_deref().unwrap_or("<none>"));
+    println!("  advertise:   {}", advertise.as_deref().unwrap_or("<auto-detect on remote>"));
+    println!();
+
+    cluster_bootstrap_remote(
+        state,
+        &ssh_target,
+        label.as_deref(),
+        advertise.as_deref(),
+        &passphrase,
+    );
+}
+
+/// Acquire the bootstrap passphrase from the env var or prompt the
+/// operator. With `confirm=true`, asks twice and rejects mismatches
+/// — used by the wizard, where this is the operator's first time
+/// typing this passphrase and a typo locks the cluster store.
+///
+/// Returns `None` (after error-reporting via `state.out` and bumping
+/// `state.exit_code`) on EOF, mismatch, or empty input.
+fn acquire_bootstrap_passphrase(state: &mut ShellState, confirm: bool) -> Option<String> {
+    // Env var path: skip the prompt entirely. Useful for cron /
+    // Ansible runs that pre-stage the passphrase out-of-band.
+    if let Ok(p) = std::env::var("SFTPFLOW_PASSPHRASE") {
+        if !p.is_empty() {
+            return Some(p);
+        }
+    }
+    let p1 = match rpassword::prompt_password(
+        "Cluster passphrase (also needed on the remote host): ",
+    ) {
+        Ok(p) if !p.is_empty() => p,
+        Ok(_) => {
+            state.out.error("No passphrase supplied — aborting.");
+            state.exit_code = 1;
+            return None;
+        }
+        Err(e) => {
+            state.out.error(format!("Could not read passphrase: {}", e));
+            state.exit_code = 1;
+            return None;
+        }
+    };
+    if confirm {
+        let p2 = match rpassword::prompt_password("Confirm passphrase: ") {
+            Ok(p) => p,
+            Err(e) => {
+                state.out.error(format!("Could not read confirmation: {}", e));
+                state.exit_code = 1;
+                return None;
+            }
+        };
+        if p1 != p2 {
+            state.out.error("Passphrases did not match — aborting.");
+            state.exit_code = 1;
+            return None;
+        }
+    }
+    Some(p1)
+}
+
+/// Prompt the user with a one-line question; re-prompt on empty
+/// input or validation failure. Returns `None` only on stdin
+/// EOF / read error (operator hit Ctrl-D, terminal lost).
+fn prompt_required<F>(prompt: &str, validate: F) -> Option<String>
+where
+    F: Fn(&str) -> Result<(), String>,
+{
+    use std::io::Write;
+    loop {
+        print!("{}", prompt);
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_err() {
+            return None;
+        }
+        if line.is_empty() {
+            // True EOF — read_line returned 0 bytes.
+            return None;
+        }
+        let s = line.trim();
+        if s.is_empty() {
+            eprintln!("  (this field is required)");
+            continue;
+        }
+        match validate(s) {
+            Ok(_)    => return Some(s.to_string()),
+            Err(msg) => {
+                eprintln!("  invalid: {}", msg);
+                continue;
+            }
+        }
+    }
+}
+
+/// Prompt the user with a one-line question; empty input means
+/// "skip / accept the default" and returns `None`. A non-empty
+/// answer is validated and re-prompted on failure.
+fn prompt_optional<F>(prompt: &str, validate: F) -> Option<String>
+where
+    F: Fn(&str) -> Result<(), String>,
+{
+    use std::io::Write;
+    loop {
+        print!("{}", prompt);
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_err() {
+            return None;
+        }
+        if line.is_empty() {
+            return None;  // EOF — treat as skip
+        }
+        let s = line.trim();
+        if s.is_empty() {
+            return None;  // user pressed Enter to accept default
+        }
+        match validate(s) {
+            Ok(_)    => return Some(s.to_string()),
+            Err(msg) => {
+                eprintln!("  invalid: {}", msg);
+                continue;
+            }
+        }
+    }
+}
+
+// ============================================================
+// Validators for wizard-collected fields
+// ============================================================
+//
+// These run BEFORE values are written into the SSH stdin stream
+// that drives the remote `sftpflowd init`. The script wraps them
+// in "$VAR" double quotes, so the strict allowlists here are the
+// load-bearing line of defence: anything that survives validation
+// is safe to embed in that double-quoted slot.
+
+/// Allow human-readable labels (alphanumerics, plus a handful of
+/// punctuation and ASCII space) up to 64 chars. Rejects shell
+/// metacharacters, quotes, control chars, and empty input.
+fn validate_bootstrap_label(s: &str) -> Result<(), String> {
+    if s.is_empty() {
+        return Err("label cannot be empty (omit instead)".into());
+    }
+    if s.len() > 64 {
+        return Err(format!(
+            "label is too long ({} chars; max 64)",
+            s.len(),
+        ));
+    }
+    for ch in s.chars() {
+        let ok = ch.is_ascii_alphanumeric()
+            || ch == ' '
+            || ch == '.'
+            || ch == '-'
+            || ch == '_'
+            || ch == '/';
+        if !ok {
+            return Err(format!(
+                "label contains disallowed character {:?} \
+                 (allowed: A-Z, a-z, 0-9, space, '.', '-', '_', '/')",
+                ch,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate `host:port` for the `--advertise` flag. Host is a DNS
+/// label or IP literal (alphanumerics + `.` `-` `_`), port is a
+/// non-zero u16. IPv6 literals (`[::1]:7900`) are not supported —
+/// matches `parse_ssh_target`'s constraint.
+fn validate_bootstrap_advertise(s: &str) -> Result<(), String> {
+    let (host, port) = s.rsplit_once(':')
+        .ok_or_else(|| format!("'{}' must be host:port", s))?;
+    if host.is_empty() {
+        return Err(format!("'{}' has empty host", s));
+    }
+    if host.len() > 253 {
+        return Err(format!("host '{}' is too long (max 253 chars)", host));
+    }
+    for ch in host.chars() {
+        let ok = ch.is_ascii_alphanumeric()
+            || ch == '.'
+            || ch == '-'
+            || ch == '_';
+        if !ok {
+            return Err(format!(
+                "host '{}' contains disallowed character {:?} \
+                 (allowed: A-Z, a-z, 0-9, '.', '-', '_')",
+                host, ch,
+            ));
+        }
+    }
+    let port_n: u16 = port.parse()
+        .map_err(|_| format!("'{}' is not a valid port number (1..=65535)", port))?;
+    if port_n == 0 {
+        return Err("port cannot be 0".into());
     }
     Ok(())
 }
@@ -4220,4 +4554,116 @@ fn unix_now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+// ============================================================
+// Tests — wizard validators
+// ============================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- validate_bootstrap_label ------------------------------
+
+    #[test]
+    fn label_accepts_typical_values() {
+        assert!(validate_bootstrap_label("prod-1").is_ok());
+        assert!(validate_bootstrap_label("west coast replica").is_ok());
+        assert!(validate_bootstrap_label("us-east-2/zone-a").is_ok());
+        assert!(validate_bootstrap_label("node_42").is_ok());
+        assert!(validate_bootstrap_label("a.b.c").is_ok());
+    }
+
+    #[test]
+    fn label_rejects_empty() {
+        assert!(validate_bootstrap_label("").is_err());
+    }
+
+    #[test]
+    fn label_rejects_overlong() {
+        let long = "a".repeat(65);
+        assert!(validate_bootstrap_label(&long).is_err());
+        let max = "a".repeat(64);
+        assert!(validate_bootstrap_label(&max).is_ok());
+    }
+
+    #[test]
+    fn label_rejects_shell_metacharacters() {
+        for bad in &[
+            "evil\"label",
+            "evil`whoami`",
+            "evil$VAR",
+            "evil\\backslash",
+            "evil;rm",
+            "evil|cat",
+            "evil&bg",
+            "evil>file",
+            "evil<file",
+            "evil(sub)",
+            "evil'q",
+        ] {
+            assert!(
+                validate_bootstrap_label(bad).is_err(),
+                "expected '{}' to be rejected",
+                bad,
+            );
+        }
+    }
+
+    #[test]
+    fn label_rejects_control_chars_and_newlines() {
+        assert!(validate_bootstrap_label("line1\nline2").is_err());
+        assert!(validate_bootstrap_label("tab\there").is_err());
+        assert!(validate_bootstrap_label("nul\0byte").is_err());
+    }
+
+    // ---- validate_bootstrap_advertise --------------------------
+
+    #[test]
+    fn advertise_accepts_typical_values() {
+        assert!(validate_bootstrap_advertise("host.example.com:7900").is_ok());
+        assert!(validate_bootstrap_advertise("10.0.0.1:7900").is_ok());
+        assert!(validate_bootstrap_advertise("sftpflow-1:7900").is_ok());
+        assert!(validate_bootstrap_advertise("a:1").is_ok());
+        assert!(validate_bootstrap_advertise("host_underscore:65535").is_ok());
+    }
+
+    #[test]
+    fn advertise_rejects_missing_port() {
+        assert!(validate_bootstrap_advertise("host.example.com").is_err());
+        assert!(validate_bootstrap_advertise("").is_err());
+    }
+
+    #[test]
+    fn advertise_rejects_bad_port() {
+        assert!(validate_bootstrap_advertise("host:0").is_err());
+        assert!(validate_bootstrap_advertise("host:65536").is_err());
+        assert!(validate_bootstrap_advertise("host:abc").is_err());
+        assert!(validate_bootstrap_advertise("host:").is_err());
+    }
+
+    #[test]
+    fn advertise_rejects_empty_host() {
+        assert!(validate_bootstrap_advertise(":7900").is_err());
+    }
+
+    #[test]
+    fn advertise_rejects_shell_metacharacters() {
+        for bad in &[
+            "evil`cmd`:7900",
+            "evil$VAR:7900",
+            "evil\"host:7900",
+            "evil;rm:7900",
+            "evil host:7900",   // space
+            "[::1]:7900",       // IPv6 literal not supported
+            "host:7900;rm",
+        ] {
+            assert!(
+                validate_bootstrap_advertise(bad).is_err(),
+                "expected '{}' to be rejected",
+                bad,
+            );
+        }
+    }
 }
