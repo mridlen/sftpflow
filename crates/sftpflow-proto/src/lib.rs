@@ -418,10 +418,75 @@ pub struct RunHistoryEntry {
 // ============================================================
 
 /// Error payload carried by a failed ResponseEnvelope.
+///
+/// The standard error shape (Phase D #17) has four parts:
+///   - `code`    — machine-readable error code (see `error_code`).
+///   - `message` — one-line summary of *what* failed.
+///   - `hint`    — *next action* the operator should take, if any
+///                 (e.g. "use 'show feeds' to list valid names").
+///   - `details` — *where to look* for more info: log path, docs
+///                 reference, or a short paragraph of context.
+///
+/// `hint` and `details` are optional and `#[serde(default)]`, so an
+/// older daemon that never sets them still produces a wire-compatible
+/// envelope and an older CLI that ignores them keeps working.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProtoError {
     pub code: i32,
     pub message: String,
+    /// Operator-facing next-action hint (a single short sentence).
+    /// Rendered on its own line in human mode and surfaced as
+    /// `error.hint` in JSON mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+    /// Where-to-look: log path, docs section, or a short paragraph of
+    /// extra context. Suppressed entirely when None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
+}
+
+impl ProtoError {
+    /// Bare error: just code + one-line message. Equivalent to the
+    /// pre-#17 shape; existing call sites keep using this.
+    pub fn new(code: i32, message: impl Into<String>) -> Self {
+        ProtoError {
+            code,
+            message: message.into(),
+            hint: None,
+            details: None,
+        }
+    }
+
+    /// Error with a next-action hint. Use when there's a clear single
+    /// command or knob the operator can turn to make the failure go
+    /// away (e.g. "run 'connect' first" or "use --absolute-path").
+    pub fn with_hint(
+        code: i32,
+        message: impl Into<String>,
+        hint: impl Into<String>,
+    ) -> Self {
+        ProtoError {
+            code,
+            message: message.into(),
+            hint: Some(hint.into()),
+            details: None,
+        }
+    }
+
+    /// Error with both a hint and a where-to-look detail line.
+    pub fn full(
+        code: i32,
+        message: impl Into<String>,
+        hint: impl Into<String>,
+        details: impl Into<String>,
+    ) -> Self {
+        ProtoError {
+            code,
+            message: message.into(),
+            hint: Some(hint.into()),
+            details: Some(details.into()),
+        }
+    }
 }
 
 /// Error code constants. The -326xx range mirrors JSON-RPC 2.0 for
@@ -515,13 +580,26 @@ impl ResponseEnvelope {
         }
     }
 
-    /// Convenience: build an error envelope.
+    /// Convenience: build an error envelope (no hint / details).
+    /// Existing call sites use this; richer errors should use
+    /// `failure_with` to ship a full `ProtoError`.
     pub fn failure(id: u64, code: i32, message: impl Into<String>) -> Self {
         ResponseEnvelope {
             id,
             outcome: ResponseOutcome::Failure {
-                error: ProtoError { code, message: message.into() },
+                error: ProtoError::new(code, message),
             },
+        }
+    }
+
+    /// Build an error envelope from a fully-populated `ProtoError`,
+    /// preserving any `hint` / `details` set on it. Used when a
+    /// handler wants to attach a next-action hint or a where-to-look
+    /// detail to the failure.
+    pub fn failure_with(id: u64, error: ProtoError) -> Self {
+        ResponseEnvelope {
+            id,
+            outcome: ResponseOutcome::Failure { error },
         }
     }
 }
@@ -704,9 +782,66 @@ mod tests {
         );
         let json = serde_json::to_string(&env).unwrap();
         assert!(json.contains(r#""code":1000"#));
+        // Bare error has neither hint nor details on the wire.
+        assert!(!json.contains(r#""hint""#));
+        assert!(!json.contains(r#""details""#));
 
         let parsed: ResponseEnvelope = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, env);
+    }
+
+    #[test]
+    fn error_with_hint_round_trips() {
+        let err = ProtoError::with_hint(
+            error_code::NOT_FOUND,
+            "feed 'missing' does not exist",
+            "use 'show feeds' to list valid feed names",
+        );
+        let env = ResponseEnvelope::failure_with(11, err);
+
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains(r#""hint""#));
+        // No details set → the field stays out of the wire form.
+        assert!(!json.contains(r#""details""#));
+
+        let parsed: ResponseEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, env);
+    }
+
+    #[test]
+    fn error_with_full_round_trips() {
+        let err = ProtoError::full(
+            error_code::CONFIG_ERROR,
+            "sealed secrets store is not open",
+            "start sftpflowd with --passphrase-file or set SFTPFLOW_PASSPHRASE",
+            "see docs/secrets.md",
+        );
+        let env = ResponseEnvelope::failure_with(13, err);
+
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains(r#""hint""#));
+        assert!(json.contains(r#""details""#));
+
+        let parsed: ResponseEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, env);
+    }
+
+    #[test]
+    fn legacy_error_without_hint_still_parses() {
+        // An older daemon that predates the #17 hint/details fields
+        // ships an envelope with just `code` + `message`. Today's CLI
+        // must still parse that cleanly via #[serde(default)].
+        let json = r#"{"id":3,"error":{"code":1000,"message":"feed 'x' not found"}}"#;
+        let parsed: ResponseEnvelope = serde_json::from_str(json).unwrap();
+        match parsed.outcome {
+            ResponseOutcome::Failure { error } => {
+                assert_eq!(error.code, error_code::NOT_FOUND);
+                assert_eq!(error.message, "feed 'x' not found");
+                assert_eq!(error.hint, None);
+                assert_eq!(error.details, None);
+            }
+            _ => panic!("expected failure outcome"),
+        }
     }
 
     // ---- framing round-trip over a buffer ----

@@ -10,7 +10,7 @@
 use log::info;
 use serde_json::json;
 
-use sftpflow_proto::{Request, Response}; // lib.rs (sftpflow-proto)
+use sftpflow_proto::{ProtoError, Request, Response}; // lib.rs (sftpflow-proto)
 
 use crate::cli::{Mode, ShellState};
 use crate::feed::{Endpoint, Feed, FeedPath, FtpsMode, KeyType, NextStep, NextStepAction, PgpKey, ProcessStep, Protocol, TriggerCondition}; // feed.rs
@@ -28,9 +28,12 @@ fn has_rpc(state: &mut ShellState) -> bool {
     if state.rpc.is_some() {
         true
     } else {
-        state.out.error_coded(
+        state.out.error_full(
             "NOT_CONNECTED",
-            "Not connected to daemon. Use 'config' to set server settings, then 'connect'.",
+            "Not connected to daemon.",
+            Some("run 'connection list' to see saved connections, then 'connect <name>'; \
+                  or 'config' to (re)configure the active server"),
+            Some("CLI config: ~/.sftpflow/config.yaml"),
         );
         state.exit_code = 1;
         false
@@ -46,25 +49,43 @@ fn has_rpc(state: &mut ShellState) -> bool {
 // stamp `state.exit_code = 1` so non-interactive invocations exit
 // non-zero on RPC failure.
 
-/// Render an `RpcError::Proto` (a daemon-side ProtoError) and bump
-/// the exit code. Pass the error through error_coded so JSON
-/// consumers see the structured code (e.g. NOT_LEADER, NOT_FOUND).
-fn report_proto_err(out: Output, code: i32, msg: &str, exit_code: &mut i32) {
-    out.error_coded(format!("E{}", code), msg);
+/// Render a daemon-side `ProtoError` and bump the exit code.
+/// Plumbs `hint` and `details` through `error_full` so the operator
+/// sees the daemon's next-action suggestion and where-to-look line
+/// (when present) without losing them at the wire boundary.
+fn report_proto_err(out: Output, err: &ProtoError, exit_code: &mut i32) {
+    out.error_full(
+        format!("E{}", err.code),
+        &err.message,
+        err.hint.as_deref(),
+        err.details.as_deref(),
+    );
     *exit_code = 1;
 }
 
 /// Render any RpcError that's not a ProtoError (I/O, EOF, missing
 /// config). These don't carry a structured code, so we tag them
-/// with a CLI-side label.
+/// with a CLI-side label and add a per-variant hint when one helps.
 fn report_rpc_err(out: Output, err: &RpcError, exit_code: &mut i32) {
-    let code = match err {
-        RpcError::Io(_)                       => "RPC_IO",
-        RpcError::UnexpectedEof               => "RPC_EOF",
-        RpcError::ConnectionNotConfigured(_)  => "NOT_CONFIGURED",
-        RpcError::Proto(_)                    => "RPC_PROTO", // shouldn't be reached
+    let (code, hint, details): (&str, Option<&str>, Option<&str>) = match err {
+        RpcError::Io(_) => (
+            "RPC_IO",
+            Some("check the daemon's network reachability and that sftpflowd is running"),
+            Some("daemon log: $state_dir/log/sftpflowd.log on the server"),
+        ),
+        RpcError::UnexpectedEof => (
+            "RPC_EOF",
+            Some("the daemon closed the connection mid-reply; retry the command, then check the server log"),
+            Some("daemon log: $state_dir/log/sftpflowd.log on the server"),
+        ),
+        RpcError::ConnectionNotConfigured(_) => (
+            "NOT_CONFIGURED",
+            Some("set host/username with 'config' (or 'connection add <name> user@host')"),
+            Some("CLI config: ~/.sftpflow/config.yaml"),
+        ),
+        RpcError::Proto(_) => ("RPC_PROTO", None, None), // shouldn't be reached
     };
-    out.error_coded(code, format!("{}", err));
+    out.error_full(code, format!("{}", err), hint, details);
     *exit_code = 1;
 }
 
@@ -73,7 +94,7 @@ fn report_rpc_err(out: Output, err: &RpcError, exit_code: &mut i32) {
 /// original code repeated 50+ times.
 fn report_err(out: Output, err: &RpcError, exit_code: &mut i32) {
     match err {
-        RpcError::Proto(p)  => report_proto_err(out, p.code, &p.message, exit_code),
+        RpcError::Proto(p)  => report_proto_err(out, p, exit_code),
         other               => report_rpc_err(out, other, exit_code),
     }
 }

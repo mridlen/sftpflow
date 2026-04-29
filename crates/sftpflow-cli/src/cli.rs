@@ -321,6 +321,29 @@ fn dispatch_invalidates_names(line: &str, mode: &Mode) -> bool {
     }
 }
 
+// ============================================================
+// Unknown-command rendering
+// ============================================================
+//
+// Every dispatch_* helper below emits the same shape of error when
+// it doesn't recognize the typed command. Sharing the renderer keeps
+// the hint and exit-code identical across the six modes; the
+// per-mode label is just a cosmetic affordance ("in exec mode" /
+// "in feed-edit mode" / ...).
+
+fn unknown_command(state: &mut ShellState, mode_label: &str, cmd: &str) {
+    state.out.error_full(
+        "USAGE",
+        format!("Unknown command: '{}'", cmd),
+        Some(&format!(
+            "type 'help' (or '?') for the list of commands available in {}",
+            mode_label,
+        )),
+        None,
+    );
+    state.exit_code = 2;
+}
+
 // ---- Command dispatch ----
 
 /// Parse the input line and route to the appropriate command handler.
@@ -361,13 +384,7 @@ fn dispatch_exec(cmd: &str, args: &[&str], state: &mut ShellState) {
         "config"           => commands::enter_config(state),
         "exit" | "quit"    => commands::exit_shell(state),
         "version"          => commands::version(state),
-        _ => {
-            state.out.error_coded(
-                "USAGE",
-                format!("Unknown command: '{}'. Type 'help' for available commands.", cmd),
-            );
-            state.exit_code = 2;
-        }
+        _ => unknown_command(state, "exec mode", cmd),
     }
 }
 
@@ -391,13 +408,7 @@ fn dispatch_endpoint_edit(cmd: &str, args: &[&str], state: &mut ShellState) {
         "commit"           => commands::commit_endpoint(state),
         "abort"            => commands::abort_endpoint(state),
         "exit" | "end"     => commands::exit_endpoint_edit(state),
-        _ => {
-            state.out.error_coded(
-                "USAGE",
-                format!("Unknown command: '{}'. Type 'help' for available commands.", cmd),
-            );
-            state.exit_code = 2;
-        }
+        _ => unknown_command(state, "endpoint-edit mode", cmd),
     }
 }
 
@@ -414,13 +425,7 @@ fn dispatch_key_edit(cmd: &str, args: &[&str], state: &mut ShellState) {
         "commit"           => commands::commit_key(state),
         "abort"            => commands::abort_key(state),
         "exit" | "end"     => commands::exit_key_edit(state),
-        _ => {
-            state.out.error_coded(
-                "USAGE",
-                format!("Unknown command: '{}'. Type 'help' for available commands.", cmd),
-            );
-            state.exit_code = 2;
-        }
+        _ => unknown_command(state, "key-edit mode", cmd),
     }
 }
 
@@ -440,13 +445,7 @@ fn dispatch_feed_edit(cmd: &str, args: &[&str], state: &mut ShellState) {
         "commit"           => commands::commit_feed(state),
         "abort"            => commands::abort_feed(state),
         "exit" | "end"     => commands::exit_feed_edit(state),
-        _ => {
-            state.out.error_coded(
-                "USAGE",
-                format!("Unknown command: '{}'. Type 'help' for available commands.", cmd),
-            );
-            state.exit_code = 2;
-        }
+        _ => unknown_command(state, "feed-edit mode", cmd),
     }
 }
 
@@ -461,13 +460,7 @@ fn dispatch_nextstep_edit(cmd: &str, args: &[&str], state: &mut ShellState) {
         "show"             => commands::show_pending_nextstep(state),
         "done"             => commands::done_nextstep(state),
         "abort"            => commands::abort_nextstep(state),
-        _ => {
-            state.out.error_coded(
-                "USAGE",
-                format!("Unknown command: '{}'. Type 'help' for available commands.", cmd),
-            );
-            state.exit_code = 2;
-        }
+        _ => unknown_command(state, "nextstep-edit mode", cmd),
     }
 }
 
@@ -484,13 +477,7 @@ fn dispatch_config_edit(cmd: &str, args: &[&str], state: &mut ShellState) {
         "commit"           => commands::commit_server(state),
         "abort"            => commands::abort_server(state),
         "exit" | "end"     => commands::exit_config_edit(state),
-        _ => {
-            state.out.error_coded(
-                "USAGE",
-                format!("Unknown command: '{}'. Type 'help' for available commands.", cmd),
-            );
-            state.exit_code = 2;
-        }
+        _ => unknown_command(state, "config-edit (server) mode", cmd),
     }
 }
 

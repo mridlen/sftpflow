@@ -705,12 +705,15 @@ fn forward_if_follower(
     let (leader_id, leader_addr) = match snapshot {
         Some(s) => s,
         None => {
-            return Some(ResponseEnvelope::failure(
+            return Some(ResponseEnvelope::failure_with(
                 env.id,
-                error_code::NOT_LEADER,
-                "this node is not the cluster leader and no current leader is known \
-                 (election in progress or quorum unavailable); retry shortly"
-                    .to_string(),
+                sftpflow_proto::ProtoError::with_hint(
+                    error_code::NOT_LEADER,
+                    "this node is not the cluster leader, and no current leader is known \
+                     (election in progress or quorum unavailable)",
+                    "retry the command in a few seconds; if it persists, run 'cluster status' \
+                     to see which voters are reachable",
+                ),
             ));
         }
     };
@@ -768,13 +771,20 @@ fn forward_if_follower(
                 "forwarding id={} to leader node_id={} at {} failed: {}",
                 env.id, leader_id, leader_addr, e,
             );
-            return Some(ResponseEnvelope::failure(
+            return Some(ResponseEnvelope::failure_with(
                 env.id,
-                error_code::NOT_LEADER,
-                format!(
-                    "this node is not the cluster leader; failed to forward to current \
-                     leader (node_id={}) at {}: {}",
-                    leader_id, leader_addr, e,
+                sftpflow_proto::ProtoError::with_hint(
+                    error_code::NOT_LEADER,
+                    format!(
+                        "this node is not the cluster leader; failed to forward to current \
+                         leader (node_id={}) at {}: {}",
+                        leader_id, leader_addr, e,
+                    ),
+                    format!(
+                        "verify network reachability to {} (the leader's advertise address); \
+                         retry, or connect directly to the leader and re-run the command",
+                        leader_addr,
+                    ),
                 ),
             ));
         }
@@ -884,15 +894,26 @@ fn enforce_leader(id: u64, state: &DaemonState) -> Option<ResponseEnvelope> {
         .current_leader()
         .and_then(|leader_id| handle.members().get(&leader_id).map(|m| m.advertise_addr.clone()));
 
-    let msg = match leader_advertise {
-        Some(addr) => format!(
-            "this node is not the cluster leader; current leader is reachable at {}",
-            addr,
+    let err = match leader_advertise {
+        Some(addr) => sftpflow_proto::ProtoError::with_hint(
+            error_code::NOT_LEADER,
+            format!(
+                "this node is not the cluster leader; current leader is reachable at {}",
+                addr,
+            ),
+            format!(
+                "the CLI normally auto-forwards mutating RPCs to the leader \
+                 (newer CLIs only); to retry by hand, connect to {}",
+                addr,
+            ),
         ),
-        None => "this node is not the cluster leader; election in progress or quorum unavailable"
-            .to_string(),
+        None => sftpflow_proto::ProtoError::with_hint(
+            error_code::NOT_LEADER,
+            "this node is not the cluster leader; election in progress or quorum unavailable",
+            "retry shortly; run 'cluster status' to confirm a leader has been elected",
+        ),
     };
-    Some(ResponseEnvelope::failure(id, error_code::NOT_LEADER, msg))
+    Some(ResponseEnvelope::failure_with(id, err))
 }
 
 /// Convert a handler `Result<Response, ProtoError>` into the wire

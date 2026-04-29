@@ -117,14 +117,64 @@ impl Output {
     //
     // For RPC errors carrying ProtoError.code, plus a few CLI-side
     // codes ("USAGE", "PARSE", "NOT_CONNECTED", ...). The human
-    // render only shows the message; JSON includes both.
+    // render only shows the message; JSON includes both. Thin wrapper
+    // around `error_full` with no hint / details.
     pub fn error_coded(&self, code: impl AsRef<str>, msg: impl AsRef<str>) {
+        self.error_full(code, msg, None, None);
+    }
+
+    // --------------------------------------------------------------
+    // error_full — error with optional next-action hint and details
+    // --------------------------------------------------------------
+    //
+    // Standard error shape (Phase D #17):
+    //   - `code`    machine-readable token (E1004, USAGE, PARSE, ...)
+    //   - `msg`     one-line summary of what failed
+    //   - `hint`    next-action the operator should take
+    //   - `details` where to look (log path, docs reference, ...)
+    //
+    // Human render (stderr):
+    //
+    //     % <message>
+    //       hint: <hint>            (only when present)
+    //       see:  <details>         (only when present)
+    //
+    // JSON render (stdout):
+    //
+    //     {"error":{"code":"E1004","message":"...","hint":"...","details":"..."}}
+    //
+    // hint/details fields are only emitted when present, mirroring the
+    // wire shape of `ProtoError`.
+    pub fn error_full(
+        &self,
+        code:    impl AsRef<str>,
+        msg:     impl AsRef<str>,
+        hint:    Option<&str>,
+        details: Option<&str>,
+    ) {
         let c = code.as_ref();
         let m = msg.as_ref();
         match self.mode {
-            OutputMode::Human => eprintln!("% {}", m),
+            OutputMode::Human => {
+                eprintln!("% {}", m);
+                if let Some(h) = hint {
+                    eprintln!("  hint: {}", h);
+                }
+                if let Some(d) = details {
+                    eprintln!("  see:  {}", d);
+                }
+            }
             OutputMode::Json => {
-                let v = json!({"error": {"code": c, "message": m}});
+                let mut obj = serde_json::Map::new();
+                obj.insert("code".to_string(), Value::String(c.to_string()));
+                obj.insert("message".to_string(), Value::String(m.to_string()));
+                if let Some(h) = hint {
+                    obj.insert("hint".to_string(), Value::String(h.to_string()));
+                }
+                if let Some(d) = details {
+                    obj.insert("details".to_string(), Value::String(d.to_string()));
+                }
+                let v = json!({ "error": Value::Object(obj) });
                 println!("{}", v);
             }
         }

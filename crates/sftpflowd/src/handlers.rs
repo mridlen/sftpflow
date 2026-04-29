@@ -47,26 +47,53 @@ use crate::server::{DaemonPaths, DaemonState};
 // ============================================================
 
 /// Persist the current config and wrap any save error as a CONFIG_ERROR
-/// protocol error. All mutating handlers funnel through this.
+/// protocol error. All mutating handlers funnel through this. Adds a
+/// where-to-look detail pointing at the daemon log so the operator
+/// knows the exact failure (permission denied, disk full, etc.) is
+/// captured server-side.
 fn save(config: &Config) -> Result<(), ProtoError> {
-    config.save().map_err(|e| ProtoError {
-        code: error_code::CONFIG_ERROR,
-        message: format!("could not save config: {}", e),
-    })
+    config.save().map_err(|e| ProtoError::full(
+        error_code::CONFIG_ERROR,
+        format!("could not save config: {}", e),
+        "check the daemon's state directory permissions and disk space, then retry",
+        "daemon log on the server has the underlying I/O error",
+    ))
+}
+
+/// Pluralized noun for `kind` used in the next-action hint
+/// ("use 'show <plural>' to list valid names"). Matches the
+/// `show <plural>` form the CLI already accepts.
+fn list_command_for(kind: &str) -> &'static str {
+    match kind {
+        "endpoint" => "show endpoints",
+        "key"      => "show keys",
+        "feed"     => "show feeds",
+        "secret"   => "secret list",
+        _          => "show feeds",
+    }
 }
 
 fn not_found(kind: &str, name: &str) -> ProtoError {
-    ProtoError {
-        code: error_code::NOT_FOUND,
-        message: format!("{} '{}' does not exist", kind, name),
-    }
+    ProtoError::with_hint(
+        error_code::NOT_FOUND,
+        format!("{} '{}' does not exist", kind, name),
+        format!(
+            "use '{}' to list valid {} names; check spelling and case",
+            list_command_for(kind),
+            kind,
+        ),
+    )
 }
 
 fn already_exists(kind: &str, name: &str) -> ProtoError {
-    ProtoError {
-        code: error_code::ALREADY_EXISTS,
-        message: format!("{} '{}' already exists", kind, name),
-    }
+    ProtoError::with_hint(
+        error_code::ALREADY_EXISTS,
+        format!("{} '{}' already exists", kind, name),
+        format!(
+            "to modify it, run 'edit {} {}'; otherwise pick a different name or 'delete' the existing one first",
+            kind, name,
+        ),
+    )
 }
 
 /// Best-effort hostname for `ServerInfo`. Used in the non-mutating
@@ -405,10 +432,11 @@ pub fn run_feed_now(
     // resolve_refs() - below
     if let Err(msg) = resolve_refs(&mut endpoints, &mut keys, state.secrets.as_ref()) {
         warn!("run_feed_now '{}': secret resolution failed: {}", name, msg);
-        return Err(ProtoError {
-            code: error_code::CONFIG_ERROR,
-            message: msg,
-        });
+        return Err(ProtoError::with_hint(
+            error_code::CONFIG_ERROR,
+            msg,
+            "add the missing secret with 'secret add <name>', or update the *_ref to point at an existing one ('secret list')",
+        ));
     }
 
     let feed_name = name.to_string();
@@ -423,10 +451,10 @@ pub fn run_feed_now(
     // clean and self-contained.
     let rt = tokio::runtime::Runtime::new().map_err(|e| {
         error!("run_feed_now '{}': failed to create tokio runtime: {}", feed_name, e);
-        ProtoError {
-            code: error_code::INTERNAL_ERROR,
-            message: format!("failed to create async runtime: {}", e),
-        }
+        ProtoError::new(
+            error_code::INTERNAL_ERROR,
+            format!("failed to create async runtime: {}", e),
+        )
     })?;
 
     // run_feed() in sftpflow-transport (lib.rs)
@@ -566,21 +594,24 @@ fn lookup_secret(
 
 /// Require an open secret store; otherwise return CONFIG_ERROR.
 fn require_secrets<'a>(state: &'a DaemonState) -> Result<&'a SecretStore, ProtoError> {
-    state.secrets.as_ref().ok_or_else(|| ProtoError {
-        code: error_code::CONFIG_ERROR,
-        message: "sealed secrets store is not open — start sftpflowd with \
-                  --passphrase-file or SFTPFLOW_PASSPHRASE"
-            .to_string(),
-    })
+    state.secrets.as_ref().ok_or_else(secret_store_closed_error)
 }
 
 fn require_secrets_mut<'a>(state: &'a mut DaemonState) -> Result<&'a mut SecretStore, ProtoError> {
-    state.secrets.as_mut().ok_or_else(|| ProtoError {
-        code: error_code::CONFIG_ERROR,
-        message: "sealed secrets store is not open — start sftpflowd with \
-                  --passphrase-file or SFTPFLOW_PASSPHRASE"
-            .to_string(),
-    })
+    state.secrets.as_mut().ok_or_else(secret_store_closed_error)
+}
+
+/// Shared error for "sealed store isn't open" — every secret-touching
+/// handler funnels through here so the operator sees a uniform
+/// message + hint.
+fn secret_store_closed_error() -> ProtoError {
+    ProtoError::full(
+        error_code::CONFIG_ERROR,
+        "sealed secrets store is not open",
+        "restart sftpflowd with --passphrase-file <path> (or set SFTPFLOW_PASSPHRASE) \
+         so the daemon can unseal the store",
+        "see docs/secrets.md for the passphrase setup",
+    )
 }
 
 /// Upsert a sealed secret. `value` never touches disk in plaintext.
@@ -590,10 +621,11 @@ pub fn put_secret(
     value: String,
 ) -> Result<Response, ProtoError> {
     let store = require_secrets_mut(state)?;
-    store.put(name.clone(), value).map_err(|e| ProtoError {
-        code: error_code::INTERNAL_ERROR,
-        message: format!("could not persist secret '{}': {}", name, e),
-    })?;
+    store.put(name.clone(), value).map_err(|e| ProtoError::with_hint(
+        error_code::INTERNAL_ERROR,
+        format!("could not persist secret '{}': {}", name, e),
+        "check the daemon's state directory permissions and disk space, then retry",
+    ))?;
     Ok(Response::Ok)
 }
 
@@ -603,10 +635,11 @@ pub fn delete_secret(
     name: &str,
 ) -> Result<Response, ProtoError> {
     let store = require_secrets_mut(state)?;
-    store.delete(name).map_err(|e| ProtoError {
-        code: error_code::INTERNAL_ERROR,
-        message: format!("could not persist secret deletion '{}': {}", name, e),
-    })?;
+    store.delete(name).map_err(|e| ProtoError::with_hint(
+        error_code::INTERNAL_ERROR,
+        format!("could not persist secret deletion '{}': {}", name, e),
+        "check the daemon's state directory permissions and disk space, then retry",
+    ))?;
     Ok(Response::Ok)
 }
 
@@ -627,15 +660,17 @@ pub fn get_run_history(
     feed: &str,
     limit: Option<u32>,
 ) -> Result<Response, ProtoError> {
-    let db = state.run_db.as_ref().ok_or_else(|| ProtoError {
-        code: error_code::INTERNAL_ERROR,
-        message: "run history database is not available".to_string(),
-    })?;
+    let db = state.run_db.as_ref().ok_or_else(|| ProtoError::with_hint(
+        error_code::INTERNAL_ERROR,
+        "run history database is not available",
+        "check daemon logs — the SQLite history DB failed to open at startup; \
+         disk space and permissions on the daemon's state directory are the usual cause",
+    ))?;
 
-    let entries = db.get_runs(feed, limit).map_err(|e| ProtoError {
-        code: error_code::INTERNAL_ERROR,
-        message: format!("failed to query run history: {}", e),
-    })?;
+    let entries = db.get_runs(feed, limit).map_err(|e| ProtoError::new(
+        error_code::INTERNAL_ERROR,
+        format!("failed to query run history: {}", e),
+    ))?;
 
     Ok(Response::RunHistory(entries))
 }
@@ -652,15 +687,17 @@ pub fn get_audit_log(
     limit:      Option<u32>,
     since_unix: Option<i64>,
 ) -> Result<Response, ProtoError> {
-    let db = state.audit_db.as_ref().ok_or_else(|| ProtoError {
-        code: error_code::INTERNAL_ERROR,
-        message: "audit log database is not available".to_string(),
-    })?;
+    let db = state.audit_db.as_ref().ok_or_else(|| ProtoError::with_hint(
+        error_code::INTERNAL_ERROR,
+        "audit log database is not available",
+        "check daemon logs — the audit SQLite DB failed to open at startup; \
+         disk space and permissions on the daemon's state directory are the usual cause",
+    ))?;
 
-    let entries = db.query(limit, since_unix).map_err(|e| ProtoError {
-        code: error_code::INTERNAL_ERROR,
-        message: format!("failed to query audit log: {}", e),
-    })?;
+    let entries = db.query(limit, since_unix).map_err(|e| ProtoError::new(
+        error_code::INTERNAL_ERROR,
+        format!("failed to query audit log: {}", e),
+    ))?;
 
     Ok(Response::AuditLog(entries))
 }
@@ -702,12 +739,13 @@ pub fn sync_schedules(state: &DaemonState) -> Response {
 fn require_cluster<'a>(
     state: &'a DaemonState,
 ) -> Result<&'a crate::cluster_runtime::ClusterContext, ProtoError> {
-    state.cluster.as_ref().ok_or_else(|| ProtoError {
-        code: error_code::CONFIG_ERROR,
-        message: "this daemon is running in legacy single-node mode (no node.json) — \
-                  cluster RPCs are only available on Raft members"
-            .to_string(),
-    })
+    state.cluster.as_ref().ok_or_else(|| ProtoError::full(
+        error_code::CONFIG_ERROR,
+        "this daemon is running in legacy single-node mode — cluster RPCs are only available on Raft members",
+        "to enable cluster mode, restart sftpflowd via 'sftpflowd init' (bootstrap node) \
+         or 'sftpflowd join' (additional node) so a node.json is created",
+        "see docs/cluster.md for the bootstrap / join flow",
+    ))
 }
 
 /// `cluster status`: snapshot of leader, voters, learners.
@@ -814,10 +852,12 @@ pub fn cluster_mint_token(
     let ttl = ttl_seconds.unwrap_or(DEFAULT_TTL).min(MAX_TTL);
 
     let ctx = require_cluster(state)?;
-    let (token, expires_at_unix) = ctx.mint_token(ttl).map_err(|msg| ProtoError {
-        code: error_code::CONFIG_ERROR,
-        message: msg,
-    })?;
+    let (token, expires_at_unix) = ctx.mint_token(ttl).map_err(|msg| ProtoError::with_hint(
+        error_code::CONFIG_ERROR,
+        msg,
+        "join tokens are minted by the bootstrap node (the original 'sftpflowd init'); \
+         connect there or use 'cluster status' to find it",
+    ))?;
     info!(
         "cluster_mint_token: minted token (ttl={}s, expires_at_unix={})",
         ttl, expires_at_unix,
@@ -841,10 +881,11 @@ pub fn cluster_get_ca(state: &DaemonState) -> Result<Response, ProtoError> {
     // M13 will plumb state_dir through DaemonState explicitly.
     let state_dir = default_state_dir();
     let pem = std::fs::read_to_string(crate::node_state::ca_cert_path(&state_dir))
-        .map_err(|e| ProtoError {
-            code: error_code::CONFIG_ERROR,
-            message: format!("could not read cluster CA cert: {}", e),
-        })?;
+        .map_err(|e| ProtoError::with_hint(
+            error_code::CONFIG_ERROR,
+            format!("could not read cluster CA cert: {}", e),
+            "verify $state_dir/cluster/ca.crt exists and is readable by the daemon",
+        ))?;
     Ok(Response::ClusterCaCert(pem))
 }
 
@@ -880,22 +921,23 @@ pub fn cluster_remove_node(
     // (not the leader) and drives the membership change with
     // explicit confirmation.
     if node_id == ctx.self_id {
-        return Err(ProtoError {
-            code: error_code::CONFIG_ERROR,
-            message: format!(
-                "refusing to remove the responding node (node_id={}) from the voter set; \
-                 use `cluster leave` to drain this node, or run `cluster remove` against a \
-                 different node",
+        return Err(ProtoError::with_hint(
+            error_code::CONFIG_ERROR,
+            format!(
+                "refusing to remove the responding node (node_id={}) via 'cluster remove'",
                 node_id,
             ),
-        });
+            "use 'cluster leave' to drain THIS node, or send 'cluster remove' to a different node id",
+        ));
     }
 
     info!("cluster_remove_node: removing node_id={}", node_id);
-    ctx.remove_node_blocking(node_id).map_err(|msg| ProtoError {
-        code: error_code::CONFIG_ERROR,
-        message: msg,
-    })?;
+    ctx.remove_node_blocking(node_id).map_err(|msg| ProtoError::with_hint(
+        error_code::CONFIG_ERROR,
+        msg,
+        "use 'cluster status' to confirm the node id and current voter set; \
+         removing the last voter or the leader can fail until quorum recovers",
+    ))?;
     info!("cluster_remove_node: node_id={} removed", node_id);
     Ok(Response::Ok)
 }
@@ -935,10 +977,12 @@ pub fn cluster_leave(state: &DaemonState) -> Result<Response, ProtoError> {
              stepping down via change_membership",
             self_id,
         );
-        ctx.leader_self_remove_blocking().map_err(|msg| ProtoError {
-            code: error_code::CONFIG_ERROR,
-            message: msg,
-        })?;
+        ctx.leader_self_remove_blocking().map_err(|msg| ProtoError::with_hint(
+            error_code::CONFIG_ERROR,
+            msg,
+            "removing the leader requires a healthy quorum of remaining voters; \
+             use 'cluster status' to confirm peers are reachable, then retry",
+        ))?;
         info!(
             "cluster_leave: node_id={} removed from voter set; \
              leader has stepped down",
@@ -948,16 +992,16 @@ pub fn cluster_leave(state: &DaemonState) -> Result<Response, ProtoError> {
     }
 
     // ---- Follower / learner path: forward to current leader ----
-    let leader_id = ctx.current_leader().ok_or_else(|| ProtoError {
-        code: error_code::NOT_LEADER,
-        message: "no current leader is known (election in progress or quorum unavailable); \
-                  retry `cluster leave` shortly".to_string(),
-    })?;
+    let leader_id = ctx.current_leader().ok_or_else(|| ProtoError::with_hint(
+        error_code::NOT_LEADER,
+        "no current leader is known (election in progress or quorum unavailable)",
+        "retry 'cluster leave' shortly; run 'cluster status' to confirm a leader has been elected",
+    ))?;
     let leader_addr = ctx.members().get(&leader_id).map(|m| m.advertise_addr.clone())
-        .ok_or_else(|| ProtoError {
-            code: error_code::INTERNAL_ERROR,
-            message: format!("leader node_id={} has no advertise address in membership map", leader_id),
-        })?;
+        .ok_or_else(|| ProtoError::new(
+            error_code::INTERNAL_ERROR,
+            format!("leader node_id={} has no advertise address in membership map", leader_id),
+        ))?;
 
     info!(
         "cluster_leave: this node (node_id={}) is a follower/learner; \
@@ -974,10 +1018,10 @@ pub fn cluster_leave(state: &DaemonState) -> Result<Response, ProtoError> {
         dry_run: false,
         request: sftpflow_proto::Request::ClusterRemoveNode { node_id: self_id },
     };
-    let envelope_bytes = serde_json::to_vec(&envelope).map_err(|e| ProtoError {
-        code: error_code::INTERNAL_ERROR,
-        message: format!("could not serialize ClusterRemoveNode envelope: {}", e),
-    })?;
+    let envelope_bytes = serde_json::to_vec(&envelope).map_err(|e| ProtoError::new(
+        error_code::INTERNAL_ERROR,
+        format!("could not serialize ClusterRemoveNode envelope: {}", e),
+    ))?;
 
     let leaf_cert = ctx.leaf_cert_pem.clone();
     let leaf_key  = ctx.leaf_key_pem.clone();
@@ -991,22 +1035,24 @@ pub fn cluster_leave(state: &DaemonState) -> Result<Response, ProtoError> {
             &ca_cert,
             envelope_bytes,
         ).await
-    }).map_err(|e| ProtoError {
-        code: error_code::NOT_LEADER,
-        message: format!(
+    }).map_err(|e| ProtoError::with_hint(
+        error_code::NOT_LEADER,
+        format!(
             "failed to forward ClusterRemoveNode for self (node_id={}) to leader (node_id={}): {}",
             self_id, leader_id, e,
         ),
-    })?;
+        "verify network reachability between this node and the leader's advertise address; \
+         retry, or connect directly to the leader and run 'cluster remove <self_id>' there",
+    ))?;
 
     // Unwrap the leader's reply. Surface its error verbatim so the
     // operator sees exactly why the leader refused (e.g. quorum
     // would be lost, no such member, etc.).
     let response: sftpflow_proto::ResponseEnvelope = serde_json::from_slice(&response_bytes)
-        .map_err(|e| ProtoError {
-            code: error_code::INTERNAL_ERROR,
-            message: format!("malformed response envelope from leader: {}", e),
-        })?;
+        .map_err(|e| ProtoError::new(
+            error_code::INTERNAL_ERROR,
+            format!("malformed response envelope from leader: {}", e),
+        ))?;
     match response.outcome {
         sftpflow_proto::ResponseOutcome::Success { result } => {
             info!(
@@ -1041,28 +1087,31 @@ pub fn cluster_backup(
     out_path: &str,
 ) -> Result<Response, ProtoError> {
     if out_path.is_empty() {
-        return Err(ProtoError {
-            code: error_code::INVALID_PARAMS,
-            message: "out_path must not be empty".to_string(),
-        });
+        return Err(ProtoError::with_hint(
+            error_code::INVALID_PARAMS,
+            "out_path must not be empty",
+            "pass an absolute server-side path, e.g. /var/lib/sftpflow/backups/<name>.tar.gz",
+        ));
     }
     let out = std::path::PathBuf::from(out_path);
     if !out.is_absolute() {
-        return Err(ProtoError {
-            code: error_code::INVALID_PARAMS,
-            message: format!(
-                "out_path '{}' must be absolute (server-side path); \
-                 the daemon's working directory is not a stable reference",
+        return Err(ProtoError::with_hint(
+            error_code::INVALID_PARAMS,
+            format!(
+                "out_path '{}' must be absolute — the daemon's working directory is not a stable reference",
                 out_path,
             ),
-        });
+            "use a fully-qualified path on the server, e.g. /var/lib/sftpflow/backups/<name>.tar.gz",
+        ));
     }
 
     info!("cluster_backup: writing archive to {}", out.display());
-    let report = backup::run_backup_hot(&paths, &out).map_err(|e| ProtoError {
-        code: error_code::INTERNAL_ERROR,
-        message: format!("backup failed: {}", e),
-    })?;
+    let report = backup::run_backup_hot(&paths, &out).map_err(|e| ProtoError::with_hint(
+        error_code::INTERNAL_ERROR,
+        format!("backup failed: {}", e),
+        "check disk space at the destination and that the daemon can write the path; \
+         daemon log has the underlying I/O / archive error",
+    ))?;
     info!(
         "cluster_backup: ok ({} files, {} bytes, sha256={})",
         report.file_count, report.archive_size, report.archive_sha256,
@@ -1360,22 +1409,24 @@ pub fn cluster_remove_node_dry_run(
     let ctx = require_cluster(state)?;
 
     if node_id == ctx.self_id {
-        return Err(ProtoError {
-            code: error_code::CONFIG_ERROR,
-            message: format!(
-                "refusing to preview removal of the responding node (node_id={}); \
-                 use `cluster leave --dry-run` to preview self-removal instead",
+        return Err(ProtoError::with_hint(
+            error_code::CONFIG_ERROR,
+            format!(
+                "refusing to preview removal of the responding node (node_id={})",
                 node_id,
             ),
-        });
+            "use 'cluster leave --dry-run' to preview self-removal, or run \
+             'cluster remove --dry-run <id>' against a different node id",
+        ));
     }
 
     let members = ctx.members_with_voter_flag();
     if !members.contains_key(&node_id) {
-        return Err(ProtoError {
-            code: error_code::CONFIG_ERROR,
-            message: format!("no member with node_id={} exists", node_id),
-        });
+        return Err(ProtoError::with_hint(
+            error_code::CONFIG_ERROR,
+            format!("no member with node_id={} exists", node_id),
+            "run 'cluster status' to see the current member list",
+        ));
     }
 
     // Current voter set (sorted) and the would-be set after removal.
@@ -1628,6 +1679,22 @@ mod tests {
         let state = make_state(fixture_config());
         let err = delete_endpoint_dry_run(&state, "ghost").unwrap_err();
         assert_eq!(err.code, error_code::NOT_FOUND);
+        // Phase D #17: NOT_FOUND carries a next-action hint pointing
+        // the operator at the listing command for that kind.
+        let hint = err.hint.as_ref().expect("not_found should carry a hint");
+        assert!(hint.contains("show endpoints"), "hint was: {}", hint);
+    }
+
+    #[test]
+    fn already_exists_carries_edit_hint() {
+        // Phase D #17: ALREADY_EXISTS hint should suggest the in-place
+        // edit path so the operator doesn't have to guess. We hit it
+        // through rename_endpoint_dry_run — same helper underneath.
+        let state = make_state(fixture_config());
+        let err = rename_endpoint_dry_run(&state, "prod", "stage").unwrap_err();
+        assert_eq!(err.code, error_code::ALREADY_EXISTS);
+        let hint = err.hint.as_ref().expect("already_exists should carry a hint");
+        assert!(hint.contains("edit endpoint"), "hint was: {}", hint);
     }
 
     // ---- delete_key_dry_run / delete_feed_dry_run ----
