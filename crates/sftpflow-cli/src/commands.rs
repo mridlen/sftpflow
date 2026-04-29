@@ -8,26 +8,73 @@
 // Server connection settings are CLI-local (not managed by daemon).
 
 use log::info;
+use serde_json::json;
 
 use sftpflow_proto::{Request, Response}; // lib.rs (sftpflow-proto)
 
 use crate::cli::{Mode, ShellState};
 use crate::feed::{Endpoint, Feed, FeedPath, FtpsMode, KeyType, NextStep, NextStepAction, PgpKey, ProcessStep, Protocol, TriggerCondition}; // feed.rs
+use crate::output::Output; // output.rs
 use crate::rpc::RpcError; // rpc.rs
 
 // ============================================================
 // RPC helper
 // ============================================================
 
-/// Print a standard "not connected" message. Returns true if
-/// an RPC connection is available, false if not. Callers should
-/// return early on false.
-fn has_rpc(state: &ShellState) -> bool {
+/// Emit a standard "not connected" error and mark the shell's exit
+/// code. Returns true if an RPC connection is available, false if
+/// not. Callers should return early on false.
+fn has_rpc(state: &mut ShellState) -> bool {
     if state.rpc.is_some() {
         true
     } else {
-        println!("% Not connected to daemon. Use 'config' to set server settings, then 'connect'.");
+        state.out.error_coded(
+            "NOT_CONNECTED",
+            "Not connected to daemon. Use 'config' to set server settings, then 'connect'.",
+        );
+        state.exit_code = 1;
         false
+    }
+}
+
+// ============================================================
+// RPC error rendering
+// ============================================================
+//
+// All command handlers funnel RpcError reporting through these two
+// helpers so the human/JSON branching stays consistent. Both also
+// stamp `state.exit_code = 1` so non-interactive invocations exit
+// non-zero on RPC failure.
+
+/// Render an `RpcError::Proto` (a daemon-side ProtoError) and bump
+/// the exit code. Pass the error through error_coded so JSON
+/// consumers see the structured code (e.g. NOT_LEADER, NOT_FOUND).
+fn report_proto_err(out: Output, code: i32, msg: &str, exit_code: &mut i32) {
+    out.error_coded(format!("E{}", code), msg);
+    *exit_code = 1;
+}
+
+/// Render any RpcError that's not a ProtoError (I/O, EOF, missing
+/// config). These don't carry a structured code, so we tag them
+/// with a CLI-side label.
+fn report_rpc_err(out: Output, err: &RpcError, exit_code: &mut i32) {
+    let code = match err {
+        RpcError::Io(_)                       => "RPC_IO",
+        RpcError::UnexpectedEof               => "RPC_EOF",
+        RpcError::ConnectionNotConfigured(_)  => "NOT_CONFIGURED",
+        RpcError::Proto(_)                    => "RPC_PROTO", // shouldn't be reached
+    };
+    out.error_coded(code, format!("{}", err));
+    *exit_code = 1;
+}
+
+/// Convenience wrapper that funnels any RpcError variant to the
+/// right reporter. Same shape as the inline `match` blocks the
+/// original code repeated 50+ times.
+fn report_err(out: Output, err: &RpcError, exit_code: &mut i32) {
+    match err {
+        RpcError::Proto(p)  => report_proto_err(out, p.code, &p.message, exit_code),
+        other               => report_rpc_err(out, other, exit_code),
     }
 }
 
@@ -61,8 +108,7 @@ fn take_dry_run_flag<'a>(args: &[&'a str]) -> (bool, Vec<&'a str>) {
     (dry_run, remaining)
 }
 
-/// Render a daemon-side `DryRunReport` to stdout. Used by every
-/// destructive CLI command that supports `--dry-run`. Format:
+/// Render a daemon-side `DryRunReport`. In human mode formats as:
 ///
 ///   DRY RUN: <summary>
 ///   Effects:
@@ -71,28 +117,38 @@ fn take_dry_run_flag<'a>(args: &[&'a str]) -> (bool, Vec<&'a str>) {
 ///     - <warning>
 ///   (no changes were made)
 ///
-/// Sections with empty bodies print "(none)" so the operator
-/// always sees the structure and never has to wonder whether the
-/// preview was incomplete.
-fn print_dry_run_report(report: &sftpflow_proto::DryRunReport) {
-    println!("DRY RUN: {}", report.summary);
-    println!("Effects:");
-    if report.effects.is_empty() {
-        println!("  (none)");
-    } else {
-        for effect in &report.effects {
-            println!("  - {}", effect);
-        }
-    }
-    println!("Warnings:");
-    if report.warnings.is_empty() {
-        println!("  (none)");
-    } else {
-        for warning in &report.warnings {
-            println!("  ! {}", warning);
-        }
-    }
-    println!("(no changes were made)");
+/// In JSON mode emits the report directly with a `dry_run: true`
+/// envelope marker so consumers can distinguish a preview from a
+/// real mutation result.
+fn render_dry_run_report(out: Output, report: &sftpflow_proto::DryRunReport) {
+    out.result(
+        || {
+            println!("DRY RUN: {}", report.summary);
+            println!("Effects:");
+            if report.effects.is_empty() {
+                println!("  (none)");
+            } else {
+                for effect in &report.effects {
+                    println!("  - {}", effect);
+                }
+            }
+            println!("Warnings:");
+            if report.warnings.is_empty() {
+                println!("  (none)");
+            } else {
+                for warning in &report.warnings {
+                    println!("  ! {}", warning);
+                }
+            }
+            println!("(no changes were made)");
+        },
+        || json!({
+            "dry_run": true,
+            "summary":  report.summary,
+            "effects":  report.effects,
+            "warnings": report.warnings,
+        }),
+    );
 }
 
 // ============================================================
@@ -100,7 +156,15 @@ fn print_dry_run_report(report: &sftpflow_proto::DryRunReport) {
 // ============================================================
 
 /// Print help for exec mode.
-pub fn help_exec() {
+pub fn help_exec(state: &mut ShellState) {
+    let out = state.out;
+    if out.is_json() {
+        // Help is an interactive aid; in JSON mode we emit a sentinel
+        // so consumers see one line of output rather than nothing.
+        out.json(&json!({"help": "exec", "interactive": true}));
+        return;
+    }
+    if !out.is_human() { return; }
     println!("Object types: endpoint, key, feed");
     println!();
     println!("  create <type> <name>         Create a new object");
@@ -162,6 +226,9 @@ pub fn connect(args: &[&str], state: &mut ShellState) {
         }
     }
     state.try_connect(); // cli.rs - ShellState::try_connect()
+    if state.rpc.is_none() {
+        state.exit_code = 1;
+    }
 }
 
 // ---- connection <subcommand> ----
@@ -169,10 +236,15 @@ pub fn connect(args: &[&str], state: &mut ShellState) {
 /// Route 'connection add|list|delete ...'.
 pub fn connection(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
-        println!("% Usage: connection <add|list|delete> [args]");
-        println!("  connection add NAME user@host[:port] [dkron URL]");
-        println!("  connection list");
-        println!("  connection delete NAME");
+        let out = state.out;
+        out.human(|| {
+            println!("% Usage: connection <add|list|delete> [args]");
+            println!("  connection add NAME user@host[:port] [dkron URL]");
+            println!("  connection list");
+            println!("  connection delete NAME");
+        });
+        out.json(&json!({"error": {"code": "USAGE", "message": "connection requires a subcommand"}}));
+        state.exit_code = 2;
         return;
     }
 
@@ -180,7 +252,13 @@ pub fn connection(args: &[&str], state: &mut ShellState) {
         "add"    => connection_add(&args[1..], state),
         "list"   => connection_list(state),
         "delete" => connection_delete(&args[1..], state),
-        _ => println!("% Unknown connection subcommand '{}'. Use add, list, or delete.", args[0]),
+        other => {
+            state.out.error_coded(
+                "USAGE",
+                format!("Unknown connection subcommand '{}'. Use add, list, or delete.", other),
+            );
+            state.exit_code = 2;
+        }
     }
 }
 
@@ -237,20 +315,27 @@ fn parse_user_at_host(target: &str) -> Result<(String, String, Option<u16>), Str
 /// entry the operator has added), the new entry also becomes the
 /// active one and gets copied into `state.config.server`.
 fn connection_add(args: &[&str], state: &mut ShellState) {
+    let out = state.out;
     if args.len() < 2 {
-        println!("% Usage: connection add NAME user@host[:port] [dkron URL]");
+        out.error_coded("USAGE", "Usage: connection add NAME user@host[:port] [dkron URL]");
+        state.exit_code = 2;
         return;
     }
 
     let name = args[0];
     if let Err(e) = validate_connection_name(name) {
-        println!("% {}", e);
+        out.error_coded("VALIDATION", e);
+        state.exit_code = 2;
         return;
     }
 
     let (user, host, port) = match parse_user_at_host(args[1]) {
         Ok(t) => t,
-        Err(msg) => { println!("% {}", msg); return; }
+        Err(msg) => {
+            out.error_coded("PARSE", msg);
+            state.exit_code = 2;
+            return;
+        }
     };
 
     // Optional `dkron URL` trailing pair. Strict pairing keeps the
@@ -261,21 +346,30 @@ fn connection_add(args: &[&str], state: &mut ShellState) {
         match args[i] {
             "dkron" => {
                 if i + 1 >= args.len() {
-                    println!("% 'dkron' requires a URL argument");
+                    out.error_coded("USAGE", "'dkron' requires a URL argument");
+                    state.exit_code = 2;
                     return;
                 }
                 dkron_url = Some(args[i + 1].to_string());
                 i += 2;
             }
             other => {
-                println!("% Unexpected argument '{}'. Expected 'dkron URL'.", other);
+                out.error_coded(
+                    "USAGE",
+                    format!("Unexpected argument '{}'. Expected 'dkron URL'.", other),
+                );
+                state.exit_code = 2;
                 return;
             }
         }
     }
 
     if state.config.connections.contains_key(name) {
-        println!("% Connection '{}' already exists. Use 'connection delete {}' first.", name, name);
+        out.error_coded(
+            "ALREADY_EXISTS",
+            format!("Connection '{}' already exists. Use 'connection delete {}' first.", name, name),
+        );
+        state.exit_code = 1;
         return;
     }
 
@@ -300,29 +394,58 @@ fn connection_add(args: &[&str], state: &mut ShellState) {
     };
 
     if let Err(e) = state.config.save() {
-        eprintln!("% Error saving config: {}", e);
+        out.error_coded("CONFIG_SAVE", format!("Error saving config: {}", e));
+        state.exit_code = 1;
         return;
     }
 
-    println!("Added connection '{}': {}@{}{}",
-        name, user, host,
-        port.map_or(String::new(), |p| format!(":{}", p)));
-    if activated {
-        println!("This is the first connection — set as active.");
-        println!("Run 'connect' to dial the daemon.");
-    }
+    out.ok_with(
+        || {
+            println!("Added connection '{}': {}@{}{}",
+                name, user, host,
+                port.map_or(String::new(), |p| format!(":{}", p)));
+            if activated {
+                println!("This is the first connection — set as active.");
+                println!("Run 'connect' to dial the daemon.");
+            }
+        },
+        &json!({
+            "name":      name,
+            "user":      user,
+            "host":      host,
+            "port":      port,
+            "activated": activated,
+        }),
+    );
 }
 
 /// `connection list` — show all registered connections, marking
 /// the active one with a leading '*'.
 fn connection_list(state: &mut ShellState) {
+    let out = state.out;
+    let active = state.config.active_connection.as_deref();
+
+    if out.is_json() {
+        let entries: Vec<_> = state.config.connections.iter().map(|(name, conn)| {
+            json!({
+                "name":      name,
+                "active":    active == Some(name.as_str()),
+                "host":      conn.host,
+                "port":      conn.port,
+                "username":  conn.username,
+                "dkron_url": conn.dkron_url,
+            })
+        }).collect();
+        out.json(&entries);
+        return;
+    }
+
     if state.config.connections.is_empty() {
         println!("No connections configured.");
         println!("Use 'connection add NAME user@host[:port]' to add one.");
         return;
     }
 
-    let active = state.config.active_connection.as_deref();
     println!("Configured connections:");
     println!("    {:<16} {:<32} {}", "NAME", "TARGET", "DKRON");
     println!("    {:-<16} {:-<32} {:-<32}", "", "", "");
@@ -340,14 +463,17 @@ fn connection_list(state: &mut ShellState) {
 /// `connection delete NAME` — remove a registry entry. Clears
 /// `active_connection` if it was the active entry.
 fn connection_delete(args: &[&str], state: &mut ShellState) {
+    let out = state.out;
     if args.is_empty() {
-        println!("% Usage: connection delete NAME");
+        out.error_coded("USAGE", "Usage: connection delete NAME");
+        state.exit_code = 2;
         return;
     }
     let name = args[0];
 
     if state.config.connections.remove(name).is_none() {
-        println!("% Connection '{}' does not exist.", name);
+        out.error_coded("NOT_FOUND", format!("Connection '{}' does not exist.", name));
+        state.exit_code = 1;
         return;
     }
 
@@ -357,25 +483,36 @@ fn connection_delete(args: &[&str], state: &mut ShellState) {
     }
 
     if let Err(e) = state.config.save() {
-        eprintln!("% Error saving config: {}", e);
+        out.error_coded("CONFIG_SAVE", format!("Error saving config: {}", e));
+        state.exit_code = 1;
         return;
     }
 
     info!("Deleted connection '{}'", name);
-    println!("Connection '{}' deleted.", name);
-    if was_active {
-        println!("(Was the active connection — `server` settings retained but no entry is now active.)");
-    }
+    out.ok_with(
+        || {
+            println!("Connection '{}' deleted.", name);
+            if was_active {
+                println!("(Was the active connection — `server` settings retained but no entry is now active.)");
+            }
+        },
+        &json!({"name": name, "deleted": true, "was_active": was_active}),
+    );
 }
 
 /// Switch the active connection to a named registry entry.
 /// Copies the entry into `state.config.server`, persists, and
 /// returns whether the switch happened. Used by `connect NAME`.
 fn switch_active_connection(name: &str, state: &mut ShellState) -> bool {
+    let out = state.out;
     let entry = match state.config.connections.get(name) {
         Some(e) => e.clone(),
         None => {
-            println!("% Connection '{}' does not exist. Use 'connection list' to see registered names.", name);
+            out.error_coded(
+                "NOT_FOUND",
+                format!("Connection '{}' does not exist. Use 'connection list' to see registered names.", name),
+            );
+            state.exit_code = 1;
             return false;
         }
     };
@@ -385,11 +522,12 @@ fn switch_active_connection(name: &str, state: &mut ShellState) -> bool {
     state.config.active_connection = Some(name.to_string());
 
     if let Err(e) = state.config.save() {
-        eprintln!("% Error saving config: {}", e);
+        out.error_coded("CONFIG_SAVE", format!("Error saving config: {}", e));
+        state.exit_code = 1;
         return false;
     }
 
-    println!("Active connection: {}", name);
+    out.info(format!("Active connection: {}", name));
     true
 }
 
@@ -398,7 +536,8 @@ fn switch_active_connection(name: &str, state: &mut ShellState) -> bool {
 /// Route 'create endpoint|key|feed <name>'.
 pub fn create(args: &[&str], state: &mut ShellState) {
     if args.len() < 2 {
-        println!("% Usage: create <endpoint|key|feed> <name>");
+        state.out.error_coded("USAGE", "Usage: create <endpoint|key|feed> <name>");
+        state.exit_code = 2;
         return;
     }
 
@@ -406,77 +545,98 @@ pub fn create(args: &[&str], state: &mut ShellState) {
         "endpoint" => create_endpoint(args[1], state),
         "key"      => create_key(args[1], state),
         "feed"     => create_feed(args[1], state),
-        _ => println!("% Unknown type '{}'. Use 'endpoint', 'key', or 'feed'.", args[0]),
+        other => {
+            state.out.error_coded(
+                "USAGE",
+                format!("Unknown type '{}'. Use 'endpoint', 'key', or 'feed'.", other),
+            );
+            state.exit_code = 2;
+        }
     }
 }
 
 fn create_endpoint(name: &str, state: &mut ShellState) {
     if !has_rpc(state) { return; }
+    let out = state.out;
 
     {
         let rpc = state.rpc.as_mut().unwrap();
         match rpc.call(Request::GetEndpoint { name: name.to_string() }) {
             Ok(Response::Endpoint(Some(_))) => {
-                println!("% Endpoint '{}' already exists. Use 'edit endpoint {}' to modify it.", name, name);
+                out.error_coded(
+                    "ALREADY_EXISTS",
+                    format!("Endpoint '{}' already exists. Use 'edit endpoint {}' to modify it.", name, name),
+                );
+                state.exit_code = 1;
                 return;
             }
             Ok(Response::Endpoint(None)) => {}
-            Err(e) => { println!("% Error: {}", e); return; }
+            Err(e) => { report_err(out, &e, &mut state.exit_code); return; }
             _ => return,
         }
     }
 
     info!("Creating new endpoint '{}'", name);
-    println!("Creating new endpoint '{}'.", name);
+    out.info(format!("Creating new endpoint '{}'.", name));
     state.pending_endpoint = Some(Endpoint::new());
     state.mode = Mode::EndpointEdit(name.to_string());
-    println!("Enter configuration commands. Type 'help' for options, 'commit' to save.");
+    out.info("Enter configuration commands. Type 'help' for options, 'commit' to save.");
 }
 
 fn create_key(name: &str, state: &mut ShellState) {
     if !has_rpc(state) { return; }
+    let out = state.out;
 
     {
         let rpc = state.rpc.as_mut().unwrap();
         match rpc.call(Request::GetKey { name: name.to_string() }) {
             Ok(Response::Key(Some(_))) => {
-                println!("% Key '{}' already exists. Use 'edit key {}' to modify it.", name, name);
+                out.error_coded(
+                    "ALREADY_EXISTS",
+                    format!("Key '{}' already exists. Use 'edit key {}' to modify it.", name, name),
+                );
+                state.exit_code = 1;
                 return;
             }
             Ok(Response::Key(None)) => {}
-            Err(e) => { println!("% Error: {}", e); return; }
+            Err(e) => { report_err(out, &e, &mut state.exit_code); return; }
             _ => return,
         }
     }
 
     info!("Creating new key '{}'", name);
-    println!("Creating new key '{}'.", name);
+    out.info(format!("Creating new key '{}'.", name));
     state.pending_key = Some(PgpKey::new());
     state.mode = Mode::KeyEdit(name.to_string());
-    println!("Enter configuration commands. Type 'help' for options, 'commit' to save.");
+    out.info("Enter configuration commands. Type 'help' for options, 'commit' to save.");
 }
 
 fn create_feed(name: &str, state: &mut ShellState) {
     if !has_rpc(state) { return; }
+    let out = state.out;
 
     {
         let rpc = state.rpc.as_mut().unwrap();
         match rpc.call(Request::GetFeed { name: name.to_string() }) {
             Ok(Response::Feed(Some(_))) => {
-                println!("% Feed '{}' already exists. Use 'edit feed {}' to modify it.", name, name);
+                out.error_coded(
+                    "ALREADY_EXISTS",
+                    format!("Feed '{}' already exists. Use 'edit feed {}' to modify it.", name, name),
+                );
+                state.exit_code = 1;
                 return;
             }
             Ok(Response::Feed(None)) => {}
-            Err(e) => { println!("% Error: {}", e); return; }
+            Err(e) => { report_err(out, &e, &mut state.exit_code); return; }
             _ => return,
         }
     }
 
     info!("Creating new feed '{}'", name);
-    println!("Creating new feed '{}'.", name);
+    out.info(format!("Creating new feed '{}'.", name));
     state.pending_feed = Some(Feed::new());
     state.mode = Mode::FeedEdit(name.to_string());
-    println!("Enter configuration commands. Type 'help' for options, 'commit' to save.");
+    out.info("Enter configuration commands. Type 'help' for options, 'commit' to save.");
 }
 
 // ---- edit <type> <name> ----
@@ -484,7 +644,8 @@ fn create_feed(name: &str, state: &mut ShellState) {
 /// Route 'edit endpoint|key|feed <name>'.
 pub fn edit(args: &[&str], state: &mut ShellState) {
     if args.len() < 2 {
-        println!("% Usage: edit <endpoint|key|feed> <name>");
+        state.out.error_coded("USAGE", "Usage: edit <endpoint|key|feed> <name>");
+        state.exit_code = 2;
         return;
     }
 
@@ -492,77 +653,98 @@ pub fn edit(args: &[&str], state: &mut ShellState) {
         "endpoint" => edit_endpoint(args[1], state),
         "key"      => edit_key(args[1], state),
         "feed"     => edit_feed(args[1], state),
-        _ => println!("% Unknown type '{}'. Use 'endpoint', 'key', or 'feed'.", args[0]),
+        other => {
+            state.out.error_coded(
+                "USAGE",
+                format!("Unknown type '{}'. Use 'endpoint', 'key', or 'feed'.", other),
+            );
+            state.exit_code = 2;
+        }
     }
 }
 
 fn edit_endpoint(name: &str, state: &mut ShellState) {
     if !has_rpc(state) { return; }
+    let out = state.out;
 
     let endpoint = {
         let rpc = state.rpc.as_mut().unwrap();
         match rpc.call(Request::GetEndpoint { name: name.to_string() }) {
             Ok(Response::Endpoint(Some(ep))) => ep,
             Ok(Response::Endpoint(None)) => {
-                println!("% Endpoint '{}' does not exist. Use 'create endpoint {}' to create it.", name, name);
+                out.error_coded(
+                    "NOT_FOUND",
+                    format!("Endpoint '{}' does not exist. Use 'create endpoint {}' to create it.", name, name),
+                );
+                state.exit_code = 1;
                 return;
             }
-            Err(e) => { println!("% Error: {}", e); return; }
+            Err(e) => { report_err(out, &e, &mut state.exit_code); return; }
             _ => return,
         }
     };
 
     info!("Editing endpoint '{}'", name);
-    println!("Editing endpoint '{}'.", name);
+    out.info(format!("Editing endpoint '{}'.", name));
     state.pending_endpoint = Some(endpoint);
     state.mode = Mode::EndpointEdit(name.to_string());
-    println!("Enter configuration commands. Type 'help' for options, 'commit' to save.");
+    out.info("Enter configuration commands. Type 'help' for options, 'commit' to save.");
 }
 
 fn edit_key(name: &str, state: &mut ShellState) {
     if !has_rpc(state) { return; }
+    let out = state.out;
 
     let key = {
         let rpc = state.rpc.as_mut().unwrap();
         match rpc.call(Request::GetKey { name: name.to_string() }) {
             Ok(Response::Key(Some(k))) => k,
             Ok(Response::Key(None)) => {
-                println!("% Key '{}' does not exist. Use 'create key {}' to create it.", name, name);
+                out.error_coded(
+                    "NOT_FOUND",
+                    format!("Key '{}' does not exist. Use 'create key {}' to create it.", name, name),
+                );
+                state.exit_code = 1;
                 return;
             }
-            Err(e) => { println!("% Error: {}", e); return; }
+            Err(e) => { report_err(out, &e, &mut state.exit_code); return; }
             _ => return,
         }
     };
 
     info!("Editing key '{}'", name);
-    println!("Editing key '{}'.", name);
+    out.info(format!("Editing key '{}'.", name));
     state.pending_key = Some(key);
     state.mode = Mode::KeyEdit(name.to_string());
-    println!("Enter configuration commands. Type 'help' for options, 'commit' to save.");
+    out.info("Enter configuration commands. Type 'help' for options, 'commit' to save.");
 }
 
 fn edit_feed(name: &str, state: &mut ShellState) {
     if !has_rpc(state) { return; }
+    let out = state.out;
 
     let feed = {
         let rpc = state.rpc.as_mut().unwrap();
         match rpc.call(Request::GetFeed { name: name.to_string() }) {
             Ok(Response::Feed(Some(f))) => f,
             Ok(Response::Feed(None)) => {
-                println!("% Feed '{}' does not exist. Use 'create feed {}' to create it.", name, name);
+                out.error_coded(
+                    "NOT_FOUND",
+                    format!("Feed '{}' does not exist. Use 'create feed {}' to create it.", name, name),
+                );
+                state.exit_code = 1;
                 return;
             }
-            Err(e) => { println!("% Error: {}", e); return; }
+            Err(e) => { report_err(out, &e, &mut state.exit_code); return; }
             _ => return,
         }
     };
 
     info!("Editing feed '{}'", name);
-    println!("Editing feed '{}'.", name);
+    out.info(format!("Editing feed '{}'.", name));
     state.pending_feed = Some(feed);
     state.mode = Mode::FeedEdit(name.to_string());
-    println!("Enter configuration commands. Type 'help' for options, 'commit' to save.");
+    out.info("Enter configuration commands. Type 'help' for options, 'commit' to save.");
 }
 
 // ---- delete <type> <name> ----
@@ -571,7 +753,8 @@ fn edit_feed(name: &str, state: &mut ShellState) {
 pub fn delete(args: &[&str], state: &mut ShellState) {
     let (dry_run, args) = take_dry_run_flag(args);
     if args.len() < 2 {
-        println!("% Usage: delete [--dry-run] <endpoint|key|feed> <name>");
+        state.out.error_coded("USAGE", "Usage: delete [--dry-run] <endpoint|key|feed> <name>");
+        state.exit_code = 2;
         return;
     }
 
@@ -579,20 +762,26 @@ pub fn delete(args: &[&str], state: &mut ShellState) {
         "endpoint" => delete_endpoint(args[1], dry_run, state),
         "key"      => delete_key(args[1], dry_run, state),
         "feed"     => delete_feed(args[1], dry_run, state),
-        _ => println!("% Unknown type '{}'. Use 'endpoint', 'key', or 'feed'.", args[0]),
+        other => {
+            state.out.error_coded(
+                "USAGE",
+                format!("Unknown type '{}'. Use 'endpoint', 'key', or 'feed'.", other),
+            );
+            state.exit_code = 2;
+        }
     }
 }
 
 fn delete_endpoint(name: &str, dry_run: bool, state: &mut ShellState) {
     if !has_rpc(state) { return; }
+    let out = state.out;
     let rpc = state.rpc.as_mut().unwrap();
     let req = Request::DeleteEndpoint { name: name.to_string() };
 
     if dry_run {
         match rpc.call_dry_run(req) {
-            Ok(Response::DryRunReport(r)) => print_dry_run_report(&r),
-            Err(RpcError::Proto(e)) => println!("% {}", e.message),
-            Err(e) => println!("% Error: {}", e),
+            Ok(Response::DryRunReport(r)) => render_dry_run_report(out, &r),
+            Err(e) => report_err(out, &e, &mut state.exit_code),
             _ => {}
         }
         return;
@@ -601,24 +790,23 @@ fn delete_endpoint(name: &str, dry_run: bool, state: &mut ShellState) {
     match rpc.call(req) {
         Ok(Response::Ok) => {
             info!("Deleted endpoint '{}'", name);
-            println!("Endpoint '{}' deleted.", name);
+            out.ok(format!("Endpoint '{}' deleted.", name));
         }
-        Err(RpcError::Proto(e)) => println!("% {}", e.message),
-        Err(e) => println!("% Error: {}", e),
+        Err(e) => report_err(out, &e, &mut state.exit_code),
         _ => {}
     }
 }
 
 fn delete_key(name: &str, dry_run: bool, state: &mut ShellState) {
     if !has_rpc(state) { return; }
+    let out = state.out;
     let rpc = state.rpc.as_mut().unwrap();
     let req = Request::DeleteKey { name: name.to_string() };
 
     if dry_run {
         match rpc.call_dry_run(req) {
-            Ok(Response::DryRunReport(r)) => print_dry_run_report(&r),
-            Err(RpcError::Proto(e)) => println!("% {}", e.message),
-            Err(e) => println!("% Error: {}", e),
+            Ok(Response::DryRunReport(r)) => render_dry_run_report(out, &r),
+            Err(e) => report_err(out, &e, &mut state.exit_code),
             _ => {}
         }
         return;
@@ -627,10 +815,9 @@ fn delete_key(name: &str, dry_run: bool, state: &mut ShellState) {
     match rpc.call(req) {
         Ok(Response::Ok) => {
             info!("Deleted key '{}'", name);
-            println!("Key '{}' deleted.", name);
+            out.ok(format!("Key '{}' deleted.", name));
         }
-        Err(RpcError::Proto(e)) => println!("% {}", e.message),
-        Err(e) => println!("% Error: {}", e),
+        Err(e) => report_err(out, &e, &mut state.exit_code),
         _ => {}
     }
 }
@@ -638,14 +825,14 @@ fn delete_key(name: &str, dry_run: bool, state: &mut ShellState) {
 fn delete_feed(name: &str, dry_run: bool, state: &mut ShellState) {
     // Dkron cleanup is handled daemon-side after DeleteFeed.
     if !has_rpc(state) { return; }
+    let out = state.out;
     let rpc = state.rpc.as_mut().unwrap();
     let req = Request::DeleteFeed { name: name.to_string() };
 
     if dry_run {
         match rpc.call_dry_run(req) {
-            Ok(Response::DryRunReport(r)) => print_dry_run_report(&r),
-            Err(RpcError::Proto(e)) => println!("% {}", e.message),
-            Err(e) => println!("% Error: {}", e),
+            Ok(Response::DryRunReport(r)) => render_dry_run_report(out, &r),
+            Err(e) => report_err(out, &e, &mut state.exit_code),
             _ => {}
         }
         return;
@@ -654,10 +841,9 @@ fn delete_feed(name: &str, dry_run: bool, state: &mut ShellState) {
     match rpc.call(req) {
         Ok(Response::Ok) => {
             info!("Deleted feed '{}'", name);
-            println!("Feed '{}' deleted.", name);
+            out.ok(format!("Feed '{}' deleted.", name));
         }
-        Err(RpcError::Proto(e)) => println!("% {}", e.message),
-        Err(e) => println!("% Error: {}", e),
+        Err(e) => report_err(out, &e, &mut state.exit_code),
         _ => {}
     }
 }
@@ -668,7 +854,8 @@ fn delete_feed(name: &str, dry_run: bool, state: &mut ShellState) {
 pub fn rename(args: &[&str], state: &mut ShellState) {
     let (dry_run, args) = take_dry_run_flag(args);
     if args.len() < 3 {
-        println!("% Usage: rename [--dry-run] <endpoint|key|feed> <oldname> <newname>");
+        state.out.error_coded("USAGE", "Usage: rename [--dry-run] <endpoint|key|feed> <oldname> <newname>");
+        state.exit_code = 2;
         return;
     }
 
@@ -676,20 +863,26 @@ pub fn rename(args: &[&str], state: &mut ShellState) {
         "endpoint" => rename_endpoint(args[1], args[2], dry_run, state),
         "key"      => rename_key(args[1], args[2], dry_run, state),
         "feed"     => rename_feed(args[1], args[2], dry_run, state),
-        _ => println!("% Unknown type '{}'. Use 'endpoint', 'key', or 'feed'.", args[0]),
+        other => {
+            state.out.error_coded(
+                "USAGE",
+                format!("Unknown type '{}'. Use 'endpoint', 'key', or 'feed'.", other),
+            );
+            state.exit_code = 2;
+        }
     }
 }
 
 fn rename_endpoint(old_name: &str, new_name: &str, dry_run: bool, state: &mut ShellState) {
     if !has_rpc(state) { return; }
+    let out = state.out;
     let rpc = state.rpc.as_mut().unwrap();
     let req = Request::RenameEndpoint { from: old_name.to_string(), to: new_name.to_string() };
 
     if dry_run {
         match rpc.call_dry_run(req) {
-            Ok(Response::DryRunReport(r)) => print_dry_run_report(&r),
-            Err(RpcError::Proto(e)) => println!("% {}", e.message),
-            Err(e) => println!("% Error: {}", e),
+            Ok(Response::DryRunReport(r)) => render_dry_run_report(out, &r),
+            Err(e) => report_err(out, &e, &mut state.exit_code),
             _ => {}
         }
         return;
@@ -698,24 +891,23 @@ fn rename_endpoint(old_name: &str, new_name: &str, dry_run: bool, state: &mut Sh
     match rpc.call(req) {
         Ok(Response::Ok) => {
             info!("Renamed endpoint '{}' → '{}'", old_name, new_name);
-            println!("Endpoint '{}' renamed to '{}'.", old_name, new_name);
+            out.ok(format!("Endpoint '{}' renamed to '{}'.", old_name, new_name));
         }
-        Err(RpcError::Proto(e)) => println!("% {}", e.message),
-        Err(e) => println!("% Error: {}", e),
+        Err(e) => report_err(out, &e, &mut state.exit_code),
         _ => {}
     }
 }
 
 fn rename_key(old_name: &str, new_name: &str, dry_run: bool, state: &mut ShellState) {
     if !has_rpc(state) { return; }
+    let out = state.out;
     let rpc = state.rpc.as_mut().unwrap();
     let req = Request::RenameKey { from: old_name.to_string(), to: new_name.to_string() };
 
     if dry_run {
         match rpc.call_dry_run(req) {
-            Ok(Response::DryRunReport(r)) => print_dry_run_report(&r),
-            Err(RpcError::Proto(e)) => println!("% {}", e.message),
-            Err(e) => println!("% Error: {}", e),
+            Ok(Response::DryRunReport(r)) => render_dry_run_report(out, &r),
+            Err(e) => report_err(out, &e, &mut state.exit_code),
             _ => {}
         }
         return;
@@ -724,24 +916,23 @@ fn rename_key(old_name: &str, new_name: &str, dry_run: bool, state: &mut ShellSt
     match rpc.call(req) {
         Ok(Response::Ok) => {
             info!("Renamed key '{}' → '{}'", old_name, new_name);
-            println!("Key '{}' renamed to '{}'.", old_name, new_name);
+            out.ok(format!("Key '{}' renamed to '{}'.", old_name, new_name));
         }
-        Err(RpcError::Proto(e)) => println!("% {}", e.message),
-        Err(e) => println!("% Error: {}", e),
+        Err(e) => report_err(out, &e, &mut state.exit_code),
         _ => {}
     }
 }
 
 fn rename_feed(old_name: &str, new_name: &str, dry_run: bool, state: &mut ShellState) {
     if !has_rpc(state) { return; }
+    let out = state.out;
     let rpc = state.rpc.as_mut().unwrap();
     let req = Request::RenameFeed { from: old_name.to_string(), to: new_name.to_string() };
 
     if dry_run {
         match rpc.call_dry_run(req) {
-            Ok(Response::DryRunReport(r)) => print_dry_run_report(&r),
-            Err(RpcError::Proto(e)) => println!("% {}", e.message),
-            Err(e) => println!("% Error: {}", e),
+            Ok(Response::DryRunReport(r)) => render_dry_run_report(out, &r),
+            Err(e) => report_err(out, &e, &mut state.exit_code),
             _ => {}
         }
         return;
@@ -750,22 +941,25 @@ fn rename_feed(old_name: &str, new_name: &str, dry_run: bool, state: &mut ShellS
     match rpc.call(req) {
         Ok(Response::Ok) => {
             info!("Renamed feed '{}' → '{}'", old_name, new_name);
-            println!("Feed '{}' renamed to '{}'.", old_name, new_name);
+            out.ok(format!("Feed '{}' renamed to '{}'.", old_name, new_name));
         }
-        Err(RpcError::Proto(e)) => println!("% {}", e.message),
-        Err(e) => println!("% Error: {}", e),
+        Err(e) => report_err(out, &e, &mut state.exit_code),
         _ => {}
     }
 }
 
 /// Print version info.
-pub fn version() {
-    println!("SFTPflow v{}", env!("CARGO_PKG_VERSION"));
+pub fn version(state: &mut ShellState) {
+    let out = state.out;
+    out.result(
+        || println!("SFTPflow v{}", env!("CARGO_PKG_VERSION")),
+        || json!({"version": env!("CARGO_PKG_VERSION")}),
+    );
 }
 
 /// Exit the shell entirely.
 pub fn exit_shell(state: &mut ShellState) {
-    println!("Goodbye.");
+    state.out.info("Goodbye.");
     state.running = false;
 }
 
@@ -774,23 +968,42 @@ pub fn exit_shell(state: &mut ShellState) {
 /// Route 'run feed <name>'.
 pub fn run(args: &[&str], state: &mut ShellState) {
     if args.len() < 2 {
-        println!("% Usage: run feed <name>");
+        state.out.error_coded("USAGE", "Usage: run feed <name>");
+        state.exit_code = 2;
         return;
     }
 
     match args[0] {
         "feed" => run_feed(args[1], state),
-        _ => println!("% Unknown run target '{}'. Usage: run feed <name>", args[0]),
+        other => {
+            state.out.error_coded(
+                "USAGE",
+                format!("Unknown run target '{}'. Usage: run feed <name>", other),
+            );
+            state.exit_code = 2;
+        }
     }
 }
 
 fn run_feed(name: &str, state: &mut ShellState) {
     if !has_rpc(state) { return; }
+    let out = state.out;
     let rpc = state.rpc.as_mut().unwrap();
 
     match rpc.call(Request::RunFeedNow { name: name.to_string() }) {
         Ok(Response::RunResult(result)) => {
             info!("Run result for '{}': {:?}", name, result.status);
+            // RunStatus::Failed escalates to a non-zero exit code for
+            // non-interactive (cron / Ansible) callers. Success and
+            // Noaction stay at 0 — Noaction means "feed ran cleanly,
+            // there was just nothing to transfer".
+            if matches!(result.status, sftpflow_proto::RunStatus::Failed) {
+                state.exit_code = 1;
+            }
+            if out.is_json() {
+                out.json(&result);
+                return;
+            }
             println!("Feed '{}': {:?}", name, result.status);
             if let Some(msg) = result.message {
                 println!("  {}", msg);
@@ -799,8 +1012,7 @@ fn run_feed(name: &str, state: &mut ShellState) {
                 println!("  {} file(s) transferred.", result.files_transferred);
             }
         }
-        Err(RpcError::Proto(e)) => println!("% {}", e.message),
-        Err(e) => println!("% Error: {}", e),
+        Err(e) => report_err(out, &e, &mut state.exit_code),
         _ => {}
     }
 }
@@ -812,19 +1024,27 @@ fn run_feed(name: &str, state: &mut ShellState) {
 /// Handle `sync <target>` in exec mode.
 pub fn sync(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
-        println!("% Usage: sync schedules");
+        state.out.error_coded("USAGE", "Usage: sync schedules");
+        state.exit_code = 2;
         return;
     }
 
     match args[0] {
         "schedules" => sync_schedules(state),
-        _ => println!("% Unknown sync target '{}'. Usage: sync schedules", args[0]),
+        other => {
+            state.out.error_coded(
+                "USAGE",
+                format!("Unknown sync target '{}'. Usage: sync schedules", other),
+            );
+            state.exit_code = 2;
+        }
     }
 }
 
 /// Send SyncSchedules RPC and print the report.
 fn sync_schedules(state: &mut ShellState) {
     if !has_rpc(state) { return; }
+    let out = state.out;
     let rpc = state.rpc.as_mut().unwrap();
 
     match rpc.call(Request::SyncSchedules) {
@@ -833,6 +1053,15 @@ fn sync_schedules(state: &mut ShellState) {
                 "sync schedules: created={}, updated={}, deleted={}, errors={}",
                 report.created, report.updated, report.deleted, report.errors.len()
             );
+            // Any per-feed errors bump the exit code so cron/Ansible
+            // callers don't silently skip past partial-failure runs.
+            if !report.errors.is_empty() {
+                state.exit_code = 1;
+            }
+            if out.is_json() {
+                out.json(&report);
+                return;
+            }
             println!("Schedule sync complete:");
             println!("  Created: {}", report.created);
             println!("  Updated: {}", report.updated);
@@ -844,8 +1073,7 @@ fn sync_schedules(state: &mut ShellState) {
                 }
             }
         }
-        Err(RpcError::Proto(e)) => println!("% {}", e.message),
-        Err(e) => println!("% Error: {}", e),
+        Err(e) => report_err(out, &e, &mut state.exit_code),
         _ => {}
     }
 }
@@ -861,11 +1089,14 @@ fn sync_schedules(state: &mut ShellState) {
 pub fn enter_config(state: &mut ShellState) {
     state.pending_server = Some(state.config.server.clone());
     state.mode = Mode::ConfigEdit;
-    println!("Editing server connection settings. Type 'help' for options.");
+    state.out.info("Editing server connection settings. Type 'help' for options.");
 }
 
 /// Print help for config-edit mode.
-pub fn help_config_edit() {
+pub fn help_config_edit(state: &mut ShellState) {
+    let out = state.out;
+    if out.is_json() { out.json(&json!({"help": "config-edit", "interactive": true})); return; }
+    if !out.is_human() { return; }
     println!("Server connection configuration:");
     println!("  host <address>           Set the server hostname or IP");
     println!("  port <number>            Set the SSH port (default: 22)");
@@ -882,83 +1113,107 @@ pub fn help_config_edit() {
 /// Set the server host.
 pub fn set_server_host(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
-        println!("% Usage: host <address>");
+        state.out.error_coded("USAGE", "Usage: host <address>");
+        state.exit_code = 2;
         return;
     }
+    let out = state.out;
     if let Some(ref mut server) = state.pending_server {
         info!("Set server host = {}", args[0]);
         server.host = Some(args[0].to_string());
-        println!("  host → {}", args[0]);
+        out.info(format!("  host → {}", args[0]));
     }
 }
 
 /// Set the server port.
 pub fn set_server_port(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
-        println!("% Usage: port <number>");
+        state.out.error_coded("USAGE", "Usage: port <number>");
+        state.exit_code = 2;
         return;
     }
+    let out = state.out;
     match args[0].parse::<u16>() {
         Ok(p) => {
             if let Some(ref mut server) = state.pending_server {
                 info!("Set server port = {}", p);
                 server.port = Some(p);
-                println!("  port → {}", p);
+                out.info(format!("  port → {}", p));
             }
         }
-        Err(_) => println!("% Invalid port number: '{}'", args[0]),
+        Err(_) => {
+            out.error_coded("PARSE", format!("Invalid port number: '{}'", args[0]));
+            state.exit_code = 2;
+        }
     }
 }
 
 /// Set the server username.
 pub fn set_server_username(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
-        println!("% Usage: username <user>");
+        state.out.error_coded("USAGE", "Usage: username <user>");
+        state.exit_code = 2;
         return;
     }
+    let out = state.out;
     if let Some(ref mut server) = state.pending_server {
         info!("Set server username = {}", args[0]);
         server.username = Some(args[0].to_string());
-        println!("  username → {}", args[0]);
+        out.info(format!("  username → {}", args[0]));
     }
 }
 
 /// Set the dkron scheduler API URL.
 pub fn set_dkron_url(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
-        println!("% Usage: dkron <url>  (e.g. http://dkron-server:8080)");
+        state.out.error_coded("USAGE", "Usage: dkron <url>  (e.g. http://dkron-server:8080)");
+        state.exit_code = 2;
         return;
     }
+    let out = state.out;
     if let Some(ref mut server) = state.pending_server {
         info!("Set dkron_url = {}", args[0]);
         server.dkron_url = Some(args[0].to_string());
-        println!("  dkron → {}", args[0]);
+        out.info(format!("  dkron → {}", args[0]));
     }
 }
 
 /// Handle 'no <property>' in config-edit mode.
 pub fn no_server_command(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
-        println!("% Usage: no <host|port|username|dkron>");
+        state.out.error_coded("USAGE", "Usage: no <host|port|username|dkron>");
+        state.exit_code = 2;
         return;
     }
-
+    let out = state.out;
     if let Some(ref mut server) = state.pending_server {
         match args[0] {
-            "host"     => { server.host = None;      println!("  host cleared."); }
-            "port"     => { server.port = None;      println!("  port cleared."); }
-            "username" => { server.username = None;  println!("  username cleared."); }
-            "dkron"    => { server.dkron_url = None; println!("  dkron cleared."); }
-            _ => println!("% Unknown property: '{}'", args[0]),
+            "host"     => { server.host = None;      out.info("  host cleared."); }
+            "port"     => { server.port = None;      out.info("  port cleared."); }
+            "username" => { server.username = None;  out.info("  username cleared."); }
+            "dkron"    => { server.dkron_url = None; out.info("  dkron cleared."); }
+            other => {
+                out.error_coded("USAGE", format!("Unknown property: '{}'", other));
+                state.exit_code = 2;
+            }
         }
     }
 }
 
 /// Show the pending server connection settings.
 pub fn show_pending_server(state: &ShellState) {
+    let out = state.out;
     match &state.pending_server {
-        Some(server) => server.display(),
-        None => println!("% No pending configuration."),
+        Some(server) => out.result(
+            || server.display(),
+            || json!({
+                "host":      server.host,
+                "port":      server.port,
+                "username":  server.username,
+                "dkron_url": server.dkron_url,
+            }),
+        ),
+        None => out.error("No pending configuration."),
     }
 }
 
@@ -968,6 +1223,7 @@ pub fn show_pending_server(state: &ShellState) {
 /// into `connections[active]` so the registry entry stays in sync
 /// with edits made via `config` mode.
 pub fn commit_server(state: &mut ShellState) {
+    let out = state.out;
     if let Some(server) = state.pending_server.take() {
         state.config.server = server.clone();
         if let Some(name) = state.config.active_connection.clone() {
@@ -976,10 +1232,11 @@ pub fn commit_server(state: &mut ShellState) {
         match state.config.save() {
             Ok(()) => {
                 info!("Committed server connection settings");
-                println!("Server connection settings committed.");
+                out.ok("Server connection settings committed.");
             }
             Err(e) => {
-                eprintln!("% Error saving config: {}", e);
+                out.error_coded("CONFIG_SAVE", format!("Error saving config: {}", e));
+                state.exit_code = 1;
                 return;
             }
         }
@@ -990,7 +1247,7 @@ pub fn commit_server(state: &mut ShellState) {
 /// Abort server config editing, discard pending changes.
 pub fn abort_server(state: &mut ShellState) {
     info!("Aborted server config edit, discarding changes");
-    println!("Changes discarded.");
+    state.out.info("Changes discarded.");
     state.pending_server = None;
     state.mode = Mode::Exec;
 }
@@ -998,7 +1255,8 @@ pub fn abort_server(state: &mut ShellState) {
 /// Exit config-edit mode (warns if uncommitted changes).
 pub fn exit_config_edit(state: &mut ShellState) {
     if state.pending_server.is_some() {
-        println!("% You have uncommitted changes. Use 'commit' to save or 'abort' to discard.");
+        state.out.error("You have uncommitted changes. Use 'commit' to save or 'abort' to discard.");
+        state.exit_code = 1;
         return;
     }
     state.mode = Mode::Exec;
@@ -1009,7 +1267,10 @@ pub fn exit_config_edit(state: &mut ShellState) {
 // ============================================================
 
 /// Print help for endpoint-edit mode.
-pub fn help_endpoint_edit() {
+pub fn help_endpoint_edit(state: &mut ShellState) {
+    let out = state.out;
+    if out.is_json() { out.json(&json!({"help": "endpoint-edit", "interactive": true})); return; }
+    if !out.is_human() { return; }
     println!("Endpoint configuration commands:");
     println!("  protocol <proto>         Set protocol: sftp (default), ftp, ftps, http, https");
     println!("  host <address>           Set the hostname or IP address");
@@ -1033,9 +1294,11 @@ pub fn help_endpoint_edit() {
 /// Set the protocol on the pending endpoint.
 pub fn set_protocol(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
-        println!("% Usage: protocol <sftp|ftp|http|https>");
+        state.out.error_coded("USAGE", "Usage: protocol <sftp|ftp|http|https>");
+        state.exit_code = 2;
         return;
     }
+    let out = state.out;
 
     let proto = match args[0].to_lowercase().as_str() {
         "sftp"  => Protocol::Sftp,
@@ -1044,7 +1307,11 @@ pub fn set_protocol(args: &[&str], state: &mut ShellState) {
         "http"  => Protocol::Http,
         "https" => Protocol::Https,
         _ => {
-            println!("% Unknown protocol '{}'. Available: sftp, ftp, ftps, http, https", args[0]);
+            out.error_coded(
+                "USAGE",
+                format!("Unknown protocol '{}'. Available: sftp, ftp, ftps, http, https", args[0]),
+            );
+            state.exit_code = 2;
             return;
         }
     };
@@ -1052,36 +1319,39 @@ pub fn set_protocol(args: &[&str], state: &mut ShellState) {
     if let Some(ref mut ep) = state.pending_endpoint {
         info!("Set protocol = {}", proto);
         ep.protocol = proto.clone();
-        println!("  protocol → {}", proto);
+        out.info(format!("  protocol → {}", proto));
     }
 }
 
 /// Set the host on the pending endpoint.
 pub fn set_host(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
-        println!("% Usage: host <address>");
+        state.out.error_coded("USAGE", "Usage: host <address>");
+        state.exit_code = 2;
         return;
     }
-
+    let out = state.out;
     let value = args[0].to_string();
     if let Some(ref mut ep) = state.pending_endpoint {
         ep.host = Some(value.clone());
         info!("Set host to '{}'", value);
-        println!("  host → {}", value);
+        out.info(format!("  host → {}", value));
     }
 }
 
 /// Set the port on the pending endpoint.
 pub fn set_port(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
-        println!("% Usage: port <number>");
+        state.out.error_coded("USAGE", "Usage: port <number>");
+        state.exit_code = 2;
         return;
     }
-
+    let out = state.out;
     let value: u16 = match args[0].parse() {
         Ok(v) => v,
         Err(_) => {
-            println!("% Invalid port number: '{}'", args[0]);
+            out.error_coded("PARSE", format!("Invalid port number: '{}'", args[0]));
+            state.exit_code = 2;
             return;
         }
     };
@@ -1089,52 +1359,55 @@ pub fn set_port(args: &[&str], state: &mut ShellState) {
     if let Some(ref mut ep) = state.pending_endpoint {
         ep.port = Some(value);
         info!("Set port to {}", value);
-        println!("  port → {}", value);
+        out.info(format!("  port → {}", value));
     }
 }
 
 /// Set the username on the pending endpoint.
 pub fn set_username(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
-        println!("% Usage: username <user>");
+        state.out.error_coded("USAGE", "Usage: username <user>");
+        state.exit_code = 2;
         return;
     }
-
+    let out = state.out;
     let value = args[0].to_string();
     if let Some(ref mut ep) = state.pending_endpoint {
         ep.username = Some(value.clone());
         info!("Set username to '{}'", value);
-        println!("  username → {}", value);
+        out.info(format!("  username → {}", value));
     }
 }
 
 /// Set the password on the pending endpoint.
 pub fn set_password(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
-        println!("% Usage: password <pass>");
+        state.out.error_coded("USAGE", "Usage: password <pass>");
+        state.exit_code = 2;
         return;
     }
-
+    let out = state.out;
     let value = args.join(" ");
     if let Some(ref mut ep) = state.pending_endpoint {
         ep.password = Some(value);
         info!("Set password");
-        println!("  password → ********");
+        out.info("  password → ********");
     }
 }
 
 /// Set the SSH key path on the pending endpoint.
 pub fn set_ssh_key(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
-        println!("% Usage: ssh_key <path>");
+        state.out.error_coded("USAGE", "Usage: ssh_key <path>");
+        state.exit_code = 2;
         return;
     }
-
+    let out = state.out;
     let value = args.join(" ");
     if let Some(ref mut ep) = state.pending_endpoint {
         ep.ssh_key = Some(value.clone());
         info!("Set ssh_key to '{}'", value);
-        println!("  ssh_key → {}", value);
+        out.info(format!("  ssh_key → {}", value));
     }
 }
 
@@ -1145,20 +1418,26 @@ pub fn set_ssh_key(args: &[&str], state: &mut ShellState) {
 /// here; the field is harmless on other protocols.
 pub fn set_ftps_mode(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
-        println!("% Usage: ftps_mode <explicit|implicit>");
+        state.out.error_coded("USAGE", "Usage: ftps_mode <explicit|implicit>");
+        state.exit_code = 2;
         return;
     }
+    let out = state.out;
     let mode = match args[0].to_lowercase().as_str() {
         "explicit" => FtpsMode::Explicit,
         "implicit" => FtpsMode::Implicit,
         _ => {
-            println!("% Unknown ftps_mode '{}'. Available: explicit, implicit", args[0]);
+            out.error_coded(
+                "USAGE",
+                format!("Unknown ftps_mode '{}'. Available: explicit, implicit", args[0]),
+            );
+            state.exit_code = 2;
             return;
         }
     };
     if let Some(ref mut ep) = state.pending_endpoint {
         info!("Set ftps_mode = {}", mode);
-        println!("  ftps_mode → {}", mode);
+        out.info(format!("  ftps_mode → {}", mode));
         ep.ftps_mode = Some(mode);
     }
 }
@@ -1166,35 +1445,41 @@ pub fn set_ftps_mode(args: &[&str], state: &mut ShellState) {
 /// Set passive (true) or active (false) FTP mode.
 pub fn set_passive(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
-        println!("% Usage: passive <yes|no>  (yes=PASV, no=active mode)");
+        state.out.error_coded("USAGE", "Usage: passive <yes|no>  (yes=PASV, no=active mode)");
+        state.exit_code = 2;
         return;
     }
+    let out = state.out;
     let value = match args[0].to_lowercase().as_str() {
         "yes" | "true"  | "on"  => true,
         "no"  | "false" | "off" => false,
         _ => {
-            println!("% Expected yes/no, got '{}'", args[0]);
+            out.error_coded("PARSE", format!("Expected yes/no, got '{}'", args[0]));
+            state.exit_code = 2;
             return;
         }
     };
     if let Some(ref mut ep) = state.pending_endpoint {
         ep.passive = Some(value);
         info!("Set passive = {}", value);
-        println!("  passive → {} ({} mode)", value, if value { "passive" } else { "active" });
+        out.info(format!("  passive → {} ({} mode)", value, if value { "passive" } else { "active" }));
     }
 }
 
 /// Set whether FTPS server certificates are validated.
 pub fn set_verify_tls(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
-        println!("% Usage: verify_tls <yes|no>");
+        state.out.error_coded("USAGE", "Usage: verify_tls <yes|no>");
+        state.exit_code = 2;
         return;
     }
+    let out = state.out;
     let value = match args[0].to_lowercase().as_str() {
         "yes" | "true"  | "on"  => true,
         "no"  | "false" | "off" => false,
         _ => {
-            println!("% Expected yes/no, got '{}'", args[0]);
+            out.error_coded("PARSE", format!("Expected yes/no, got '{}'", args[0]));
+            state.exit_code = 2;
             return;
         }
     };
@@ -1202,9 +1487,9 @@ pub fn set_verify_tls(args: &[&str], state: &mut ShellState) {
         ep.verify_tls = Some(value);
         info!("Set verify_tls = {}", value);
         if !value {
-            println!("  verify_tls → no  (WARNING: server cert will not be validated)");
+            out.info("  verify_tls → no  (WARNING: server cert will not be validated)");
         } else {
-            println!("  verify_tls → yes");
+            out.info("  verify_tls → yes");
         }
     }
 }
@@ -1212,38 +1497,50 @@ pub fn set_verify_tls(args: &[&str], state: &mut ShellState) {
 /// Handle 'no <property>' in endpoint-edit mode.
 pub fn no_endpoint_command(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
-        println!("% Usage: no <protocol|host|port|username|password|password_ref|ssh_key|ssh_key_ref|ftps_mode|passive|verify_tls>");
+        state.out.error_coded(
+            "USAGE",
+            "Usage: no <protocol|host|port|username|password|password_ref|ssh_key|ssh_key_ref|ftps_mode|passive|verify_tls>",
+        );
+        state.exit_code = 2;
         return;
     }
+    let out = state.out;
 
     if let Some(ref mut ep) = state.pending_endpoint {
         match args[0] {
-            "protocol"     => { ep.protocol = Protocol::Sftp; println!("  protocol reset to sftp (default)."); }
-            "host"         => { ep.host = None;         println!("  host cleared."); }
-            "port"         => { ep.port = None;         println!("  port cleared."); }
-            "username"     => { ep.username = None;     println!("  username cleared."); }
-            "password"     => { ep.password = None;     println!("  password cleared."); }
-            "password_ref" => { ep.password_ref = None; println!("  password_ref cleared."); }
-            "ssh_key"      => { ep.ssh_key = None;      println!("  ssh_key cleared."); }
-            "ssh_key_ref"  => { ep.ssh_key_ref = None;  println!("  ssh_key_ref cleared."); }
-            "ftps_mode"    => { ep.ftps_mode = None;    println!("  ftps_mode reset to default (explicit)."); }
-            "passive"      => { ep.passive = None;      println!("  passive reset to default (yes)."); }
-            "verify_tls"   => { ep.verify_tls = None;   println!("  verify_tls reset to default (yes)."); }
-            _ => println!("% Unknown property: '{}'", args[0]),
+            "protocol"     => { ep.protocol = Protocol::Sftp; out.info("  protocol reset to sftp (default)."); }
+            "host"         => { ep.host = None;         out.info("  host cleared."); }
+            "port"         => { ep.port = None;         out.info("  port cleared."); }
+            "username"     => { ep.username = None;     out.info("  username cleared."); }
+            "password"     => { ep.password = None;     out.info("  password cleared."); }
+            "password_ref" => { ep.password_ref = None; out.info("  password_ref cleared."); }
+            "ssh_key"      => { ep.ssh_key = None;      out.info("  ssh_key cleared."); }
+            "ssh_key_ref"  => { ep.ssh_key_ref = None;  out.info("  ssh_key_ref cleared."); }
+            "ftps_mode"    => { ep.ftps_mode = None;    out.info("  ftps_mode reset to default (explicit)."); }
+            "passive"      => { ep.passive = None;      out.info("  passive reset to default (yes)."); }
+            "verify_tls"   => { ep.verify_tls = None;   out.info("  verify_tls reset to default (yes)."); }
+            other => {
+                out.error_coded("USAGE", format!("Unknown property: '{}'", other));
+                state.exit_code = 2;
+            }
         }
     }
 }
 
 /// Show the pending endpoint configuration.
 pub fn show_pending_endpoint(state: &ShellState) {
+    let out = state.out;
     let ep_name = match &state.mode {
         Mode::EndpointEdit(name) => name.clone(),
         _ => return,
     };
 
     match &state.pending_endpoint {
-        Some(ep) => ep.display(&ep_name),
-        None => println!("% No pending configuration."),
+        Some(ep) => out.result(
+            || ep.display(&ep_name),
+            || json!({"name": ep_name, "endpoint": ep}),
+        ),
+        None => out.error("No pending configuration."),
     }
 }
 
@@ -1259,12 +1556,13 @@ pub fn commit_endpoint(state: &mut ShellState) {
         None => return,
     };
 
+    if !has_rpc(state) { return; }
+    let out = state.out;
     let success = {
-        if !has_rpc(state) { return; }
         let rpc = state.rpc.as_mut().unwrap();
         match rpc.call(Request::PutEndpoint { name: ep_name.clone(), endpoint: ep }) {
             Ok(Response::Ok) => true,
-            Err(e) => { eprintln!("% Error: {}", e); false }
+            Err(e) => { report_err(out, &e, &mut state.exit_code); false }
             _ => false,
         }
     };
@@ -1272,7 +1570,7 @@ pub fn commit_endpoint(state: &mut ShellState) {
     if success {
         state.pending_endpoint = None;
         info!("Committed endpoint '{}'", ep_name);
-        println!("Endpoint '{}' committed.", ep_name);
+        out.ok(format!("Endpoint '{}' committed.", ep_name));
         state.mode = Mode::Exec;
     }
 }
@@ -1280,7 +1578,7 @@ pub fn commit_endpoint(state: &mut ShellState) {
 /// Abort endpoint editing, discard pending changes.
 pub fn abort_endpoint(state: &mut ShellState) {
     info!("Aborted endpoint edit, discarding changes");
-    println!("Changes discarded.");
+    state.out.info("Changes discarded.");
     state.pending_endpoint = None;
     state.mode = Mode::Exec;
 }
@@ -1288,7 +1586,8 @@ pub fn abort_endpoint(state: &mut ShellState) {
 /// Exit endpoint-edit mode (warns if uncommitted changes).
 pub fn exit_endpoint_edit(state: &mut ShellState) {
     if state.pending_endpoint.is_some() {
-        println!("% You have uncommitted changes. Use 'commit' to save or 'abort' to discard.");
+        state.out.error("You have uncommitted changes. Use 'commit' to save or 'abort' to discard.");
+        state.exit_code = 1;
         return;
     }
     state.mode = Mode::Exec;
@@ -1299,7 +1598,10 @@ pub fn exit_endpoint_edit(state: &mut ShellState) {
 // ============================================================
 
 /// Print help for key-edit mode.
-pub fn help_key_edit() {
+pub fn help_key_edit(state: &mut ShellState) {
+    let out = state.out;
+    if out.is_json() { out.json(&json!({"help": "key-edit", "interactive": true})); return; }
+    if !out.is_human() { return; }
     println!("Key configuration commands:");
     println!("  type <public|private>    Set the key type");
     println!("  contents                 Enter multi-line paste mode (end with '.' on its own line)");
@@ -1316,22 +1618,25 @@ pub fn help_key_edit() {
 /// Set the key type (public or private).
 pub fn set_key_type(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
-        println!("% Usage: type <public|private>");
+        state.out.error_coded("USAGE", "Usage: type <public|private>");
+        state.exit_code = 2;
         return;
     }
+    let out = state.out;
 
     let key_type = match args[0].to_lowercase().as_str() {
         "public"  => KeyType::Public,
         "private" => KeyType::Private,
         _ => {
-            println!("% Invalid key type '{}'. Use 'public' or 'private'.", args[0]);
+            out.error_coded("USAGE", format!("Invalid key type '{}'. Use 'public' or 'private'.", args[0]));
+            state.exit_code = 2;
             return;
         }
     };
 
     if let Some(ref mut k) = state.pending_key {
         info!("Set key type to '{}'", key_type);
-        println!("  type → {}", key_type);
+        out.info(format!("  type → {}", key_type));
         k.key_type = Some(key_type);
     }
 }
@@ -1342,8 +1647,8 @@ pub fn set_key_contents(_args: &[&str], state: &mut ShellState) {
     if state.pending_key.is_none() {
         return;
     }
-
-    println!("Paste key contents below. Enter a single '.' on its own line to finish:");
+    let out = state.out;
+    out.info("Paste key contents below. Enter a single '.' on its own line to finish:");
 
     let mut lines: Vec<String> = Vec::new();
     let stdin = std::io::stdin();
@@ -1359,14 +1664,16 @@ pub fn set_key_contents(_args: &[&str], state: &mut ShellState) {
                 lines.push(trimmed.to_string());
             }
             Err(e) => {
-                eprintln!("% Read error: {}", e);
+                out.error(format!("Read error: {}", e));
+                state.exit_code = 1;
                 return;
             }
         }
     }
 
     if lines.is_empty() {
-        println!("% No content entered.");
+        out.error("No content entered.");
+        state.exit_code = 1;
         return;
     }
 
@@ -1376,22 +1683,25 @@ pub fn set_key_contents(_args: &[&str], state: &mut ShellState) {
     if let Some(ref mut k) = state.pending_key {
         k.contents = Some(value);
         info!("Set key contents ({} lines)", line_count);
-        println!("  contents set ({} lines)", line_count);
+        out.info(format!("  contents set ({} lines)", line_count));
     }
 }
 
 /// Load key contents from a file on disk.
 pub fn load_key_file(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
-        println!("% Usage: load <filepath>");
+        state.out.error_coded("USAGE", "Usage: load <filepath>");
+        state.exit_code = 2;
         return;
     }
+    let out = state.out;
 
     let filepath = args.join(" ");
     let contents = match std::fs::read_to_string(&filepath) {
         Ok(c) => c,
         Err(e) => {
-            println!("% Could not read file '{}': {}", filepath, e);
+            out.error_coded("FILE_READ", format!("Could not read file '{}': {}", filepath, e));
+            state.exit_code = 1;
             return;
         }
     };
@@ -1400,37 +1710,46 @@ pub fn load_key_file(args: &[&str], state: &mut ShellState) {
         let line_count = contents.lines().count();
         k.contents = Some(contents);
         info!("Loaded key contents from '{}' ({} lines)", filepath, line_count);
-        println!("  contents loaded from '{}' ({} lines)", filepath, line_count);
+        out.info(format!("  contents loaded from '{}' ({} lines)", filepath, line_count));
     }
 }
 
 /// Handle 'no <property>' in key-edit mode.
 pub fn no_key_command(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
-        println!("% Usage: no <type|contents|contents_ref>");
+        state.out.error_coded("USAGE", "Usage: no <type|contents|contents_ref>");
+        state.exit_code = 2;
         return;
     }
+    let out = state.out;
 
     if let Some(ref mut k) = state.pending_key {
         match args[0] {
-            "type"         => { k.key_type = None;     println!("  type cleared."); }
-            "contents"     => { k.contents = None;     println!("  contents cleared."); }
-            "contents_ref" => { k.contents_ref = None; println!("  contents_ref cleared."); }
-            _ => println!("% Unknown property: '{}'", args[0]),
+            "type"         => { k.key_type = None;     out.info("  type cleared."); }
+            "contents"     => { k.contents = None;     out.info("  contents cleared."); }
+            "contents_ref" => { k.contents_ref = None; out.info("  contents_ref cleared."); }
+            other => {
+                out.error_coded("USAGE", format!("Unknown property: '{}'", other));
+                state.exit_code = 2;
+            }
         }
     }
 }
 
 /// Show the pending key configuration.
 pub fn show_pending_key(state: &ShellState) {
+    let out = state.out;
     let key_name = match &state.mode {
         Mode::KeyEdit(name) => name.clone(),
         _ => return,
     };
 
     match &state.pending_key {
-        Some(k) => k.display(&key_name),
-        None => println!("% No pending configuration."),
+        Some(k) => out.result(
+            || k.display(&key_name),
+            || json!({"name": key_name, "key": k}),
+        ),
+        None => out.error("No pending configuration."),
     }
 }
 
@@ -1446,12 +1765,13 @@ pub fn commit_key(state: &mut ShellState) {
         None => return,
     };
 
+    if !has_rpc(state) { return; }
+    let out = state.out;
     let success = {
-        if !has_rpc(state) { return; }
         let rpc = state.rpc.as_mut().unwrap();
         match rpc.call(Request::PutKey { name: key_name.clone(), key: k }) {
             Ok(Response::Ok) => true,
-            Err(e) => { eprintln!("% Error: {}", e); false }
+            Err(e) => { report_err(out, &e, &mut state.exit_code); false }
             _ => false,
         }
     };
@@ -1459,7 +1779,7 @@ pub fn commit_key(state: &mut ShellState) {
     if success {
         state.pending_key = None;
         info!("Committed key '{}'", key_name);
-        println!("Key '{}' committed.", key_name);
+        out.ok(format!("Key '{}' committed.", key_name));
         state.mode = Mode::Exec;
     }
 }
@@ -1467,7 +1787,7 @@ pub fn commit_key(state: &mut ShellState) {
 /// Abort key editing, discard pending changes.
 pub fn abort_key(state: &mut ShellState) {
     info!("Aborted key edit, discarding changes");
-    println!("Changes discarded.");
+    state.out.info("Changes discarded.");
     state.pending_key = None;
     state.mode = Mode::Exec;
 }
@@ -1475,7 +1795,8 @@ pub fn abort_key(state: &mut ShellState) {
 /// Exit key-edit mode (warns if uncommitted changes).
 pub fn exit_key_edit(state: &mut ShellState) {
     if state.pending_key.is_some() {
-        println!("% You have uncommitted changes. Use 'commit' to save or 'abort' to discard.");
+        state.out.error("You have uncommitted changes. Use 'commit' to save or 'abort' to discard.");
+        state.exit_code = 1;
         return;
     }
     state.mode = Mode::Exec;
@@ -1486,7 +1807,10 @@ pub fn exit_key_edit(state: &mut ShellState) {
 // ============================================================
 
 /// Print help for feed-edit mode.
-pub fn help_feed_edit() {
+pub fn help_feed_edit(state: &mut ShellState) {
+    let out = state.out;
+    if out.is_json() { out.json(&json!({"help": "feed-edit", "interactive": true})); return; }
+    if !out.is_human() { return; }
     println!("Feed configuration commands:");
     println!("  source <endpoint>:<path>         Add a source (e.g. myserver:/inbound)");
     println!("  process encrypt <keyname>        Add an encrypt step using a public key");
@@ -1529,16 +1853,21 @@ fn feed_paths_match(a: &FeedPath, b: &FeedPath) -> bool {
 /// Add a source to the pending feed.
 pub fn set_source(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
-        println!("% Usage: source <endpoint>:<path>");
-        println!("% Example: source myserver:/inbound/data");
+        state.out.error_coded(
+            "USAGE",
+            "Usage: source <endpoint>:<path>  (e.g. source myserver:/inbound/data)",
+        );
+        state.exit_code = 2;
         return;
     }
+    let out = state.out;
 
     let input = args.join("");
     let feed_path = match parse_feed_path(&input) {
         Some(fp) => fp,
         None => {
-            println!("% Invalid format. Use: source <endpoint>:<path>");
+            out.error_coded("PARSE", "Invalid format. Use: source <endpoint>:<path>");
+            state.exit_code = 2;
             return;
         }
     };
@@ -1546,17 +1875,18 @@ pub fn set_source(args: &[&str], state: &mut ShellState) {
     // Warn if endpoint doesn't exist (best-effort RPC check)
     if let Some(ref mut rpc) = state.rpc {
         if let Ok(Response::Endpoint(None)) = rpc.call(Request::GetEndpoint { name: feed_path.endpoint.clone() }) {
-            println!("  (warning: endpoint '{}' does not exist yet)", feed_path.endpoint);
+            out.info(format!("  (warning: endpoint '{}' does not exist yet)", feed_path.endpoint));
         }
     }
 
     if let Some(ref mut feed) = state.pending_feed {
         if feed.sources.iter().any(|s| feed_paths_match(s, &feed_path)) {
-            println!("% Source '{}' already exists in this feed.", feed_path);
+            out.error_coded("ALREADY_EXISTS", format!("Source '{}' already exists in this feed.", feed_path));
+            state.exit_code = 1;
             return;
         }
         info!("Added source '{}'", feed_path);
-        println!("  source + {}", feed_path);
+        out.info(format!("  source + {}", feed_path));
         feed.sources.push(feed_path);
     }
 }
@@ -1564,16 +1894,21 @@ pub fn set_source(args: &[&str], state: &mut ShellState) {
 /// Add a destination to the pending feed.
 pub fn set_destination(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
-        println!("% Usage: destination <endpoint>:<path>");
-        println!("% Example: destination archive:/backup/landing");
+        state.out.error_coded(
+            "USAGE",
+            "Usage: destination <endpoint>:<path>  (e.g. destination archive:/backup/landing)",
+        );
+        state.exit_code = 2;
         return;
     }
+    let out = state.out;
 
     let input = args.join("");
     let feed_path = match parse_feed_path(&input) {
         Some(fp) => fp,
         None => {
-            println!("% Invalid format. Use: destination <endpoint>:<path>");
+            out.error_coded("PARSE", "Invalid format. Use: destination <endpoint>:<path>");
+            state.exit_code = 2;
             return;
         }
     };
@@ -1581,17 +1916,18 @@ pub fn set_destination(args: &[&str], state: &mut ShellState) {
     // Warn if endpoint doesn't exist (best-effort RPC check)
     if let Some(ref mut rpc) = state.rpc {
         if let Ok(Response::Endpoint(None)) = rpc.call(Request::GetEndpoint { name: feed_path.endpoint.clone() }) {
-            println!("  (warning: endpoint '{}' does not exist yet)", feed_path.endpoint);
+            out.info(format!("  (warning: endpoint '{}' does not exist yet)", feed_path.endpoint));
         }
     }
 
     if let Some(ref mut feed) = state.pending_feed {
         if feed.destinations.iter().any(|d| feed_paths_match(d, &feed_path)) {
-            println!("% Destination '{}' already exists in this feed.", feed_path);
+            out.error_coded("ALREADY_EXISTS", format!("Destination '{}' already exists in this feed.", feed_path));
+            state.exit_code = 1;
             return;
         }
         info!("Added destination '{}'", feed_path);
-        println!("  destination + {}", feed_path);
+        out.info(format!("  destination + {}", feed_path));
         feed.destinations.push(feed_path);
     }
 }
@@ -1601,11 +1937,15 @@ pub fn set_destination(args: &[&str], state: &mut ShellState) {
 ///        process decrypt <keyname>
 pub fn add_process(args: &[&str], state: &mut ShellState) {
     if args.len() < 2 {
-        println!("% Usage: process <encrypt|decrypt> <keyname>");
-        println!("% Example: process decrypt vendor-private-key");
-        println!("% Example: process encrypt partner-public-key");
+        state.out.error_coded(
+            "USAGE",
+            "Usage: process <encrypt|decrypt> <keyname>  \
+             (e.g. process decrypt vendor-private-key, process encrypt partner-public-key)",
+        );
+        state.exit_code = 2;
         return;
     }
+    let out = state.out;
 
     let action = args[0];
     let key_name = args[1].to_string();
@@ -1615,14 +1955,14 @@ pub fn add_process(args: &[&str], state: &mut ShellState) {
         match rpc.call(Request::GetKey { name: key_name.clone() }) {
             Ok(Response::Key(Some(k))) => {
                 if action == "encrypt" && k.key_type.as_ref() != Some(&KeyType::Public) {
-                    println!("  (warning: key '{}' is not marked as public — encrypt requires a public key)", key_name);
+                    out.info(format!("  (warning: key '{}' is not marked as public — encrypt requires a public key)", key_name));
                 }
                 if action == "decrypt" && k.key_type.as_ref() != Some(&KeyType::Private) {
-                    println!("  (warning: key '{}' is not marked as private — decrypt requires a private key)", key_name);
+                    out.info(format!("  (warning: key '{}' is not marked as private — decrypt requires a private key)", key_name));
                 }
             }
             Ok(Response::Key(None)) => {
-                println!("  (warning: key '{}' does not exist yet)", key_name);
+                out.info(format!("  (warning: key '{}' does not exist yet)", key_name));
             }
             _ => {}
         }
@@ -1631,15 +1971,19 @@ pub fn add_process(args: &[&str], state: &mut ShellState) {
     let step = match action {
         "encrypt" => ProcessStep::Encrypt { key: key_name },
         "decrypt" => ProcessStep::Decrypt { key: key_name },
-        _ => {
-            println!("% Unknown process action '{}'. Use 'encrypt' or 'decrypt'.", action);
+        other => {
+            out.error_coded(
+                "USAGE",
+                format!("Unknown process action '{}'. Use 'encrypt' or 'decrypt'.", other),
+            );
+            state.exit_code = 2;
             return;
         }
     };
 
     if let Some(ref mut feed) = state.pending_feed {
         info!("Added process step: {}", step);
-        println!("  process + {}", step);
+        out.info(format!("  process + {}", step));
         feed.process.push(step);
     }
 }
@@ -1647,22 +1991,26 @@ pub fn add_process(args: &[&str], state: &mut ShellState) {
 /// Add a cron schedule to the pending feed.
 pub fn set_schedule(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
-        println!("% Usage: schedule <cron expression>");
-        println!("% Example: schedule * * * * *       (every minute)");
-        println!("% Example: schedule 0 */6 * * *     (every 6 hours)");
-        println!("% Format: min hour day month weekday");
+        state.out.error_coded(
+            "USAGE",
+            "Usage: schedule <cron expression>  \
+             (format: min hour day month weekday — e.g. '* * * * *' or '0 */6 * * *')",
+        );
+        state.exit_code = 2;
         return;
     }
+    let out = state.out;
 
     let cron_expr = args.join(" ");
     if let Some(ref mut feed) = state.pending_feed {
         if feed.schedules.contains(&cron_expr) {
-            println!("% Schedule '{}' already exists in this feed.", cron_expr);
+            out.error_coded("ALREADY_EXISTS", format!("Schedule '{}' already exists in this feed.", cron_expr));
+            state.exit_code = 1;
             return;
         }
         feed.schedules.push(cron_expr.clone());
         info!("Added schedule '{}'", cron_expr);
-        println!("  schedule + {}", cron_expr);
+        out.info(format!("  schedule + {}", cron_expr));
     }
 }
 
@@ -1678,18 +2026,21 @@ fn parse_yes_no(input: &str) -> Option<bool> {
 /// Set a flag on the pending feed.
 pub fn set_flag(args: &[&str], state: &mut ShellState) {
     if args.len() < 2 {
-        println!("% Usage: flag <name> <yes|no>");
-        println!("% Available flags:");
-        println!("    enabled                        Enable or disable this feed");
-        println!("    delete_source_after_transfer   Delete source files after successful transfer");
+        state.out.error_coded(
+            "USAGE",
+            "Usage: flag <name> <yes|no>  (available: enabled, delete_source_after_transfer)",
+        );
+        state.exit_code = 2;
         return;
     }
+    let out = state.out;
 
     let flag_name = args[0];
     let value = match parse_yes_no(args[1]) {
         Some(v) => v,
         None => {
-            println!("% Invalid value '{}'. Use 'yes' or 'no'.", args[1]);
+            out.error_coded("PARSE", format!("Invalid value '{}'. Use 'yes' or 'no'.", args[1]));
+            state.exit_code = 2;
             return;
         }
     };
@@ -1699,16 +2050,22 @@ pub fn set_flag(args: &[&str], state: &mut ShellState) {
             "enabled" => {
                 feed.flags.enabled = value;
                 info!("Set flag enabled = {}", if value { "yes" } else { "no" });
-                println!("  enabled → {}", if value { "yes" } else { "no" });
+                out.info(format!("  enabled → {}", if value { "yes" } else { "no" }));
             }
             "delete_source_after_transfer" => {
                 feed.flags.delete_source_after_transfer = value;
                 info!("Set flag delete_source_after_transfer = {}", if value { "yes" } else { "no" });
-                println!("  delete_source_after_transfer → {}", if value { "yes" } else { "no" });
+                out.info(format!("  delete_source_after_transfer → {}", if value { "yes" } else { "no" }));
             }
-            _ => {
-                println!("% Unknown flag: '{}'", flag_name);
-                println!("% Available flags: enabled, delete_source_after_transfer");
+            other => {
+                out.error_coded(
+                    "USAGE",
+                    format!(
+                        "Unknown flag: '{}'. Available: enabled, delete_source_after_transfer",
+                        other,
+                    ),
+                );
+                state.exit_code = 2;
             }
         }
     }
@@ -1717,9 +2074,11 @@ pub fn set_flag(args: &[&str], state: &mut ShellState) {
 /// Handle 'no <property> [value]' in feed-edit mode.
 pub fn no_feed_command(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
-        println!("% Usage: no <source|process|destination|schedule> [value]");
+        state.out.error_coded("USAGE", "Usage: no <source|process|destination|schedule> [value]");
+        state.exit_code = 2;
         return;
     }
+    let out = state.out;
 
     if let Some(ref mut feed) = state.pending_feed {
         let property = args[0];
@@ -1730,18 +2089,20 @@ pub fn no_feed_command(args: &[&str], state: &mut ShellState) {
                 if value_args.is_empty() {
                     let count = feed.sources.len();
                     feed.sources.clear();
-                    println!("  All sources removed ({} cleared).", count);
+                    out.info(format!("  All sources removed ({} cleared).", count));
                 } else {
                     let input = value_args.join("");
                     if let Some(fp) = parse_feed_path(&input) {
                         if let Some(pos) = feed.sources.iter().position(|s| feed_paths_match(s, &fp)) {
                             feed.sources.remove(pos);
-                            println!("  source - {}", fp);
+                            out.info(format!("  source - {}", fp));
                         } else {
-                            println!("% Source '{}' not found.", fp);
+                            out.error_coded("NOT_FOUND", format!("Source '{}' not found.", fp));
+                            state.exit_code = 1;
                         }
                     } else {
-                        println!("% Invalid format. Use: no source <endpoint>:<path>");
+                        out.error_coded("PARSE", "Invalid format. Use: no source <endpoint>:<path>");
+                        state.exit_code = 2;
                     }
                 }
             }
@@ -1749,17 +2110,23 @@ pub fn no_feed_command(args: &[&str], state: &mut ShellState) {
                 if value_args.is_empty() {
                     let count = feed.process.len();
                     feed.process.clear();
-                    println!("  All process steps removed ({} cleared).", count);
+                    out.info(format!("  All process steps removed ({} cleared).", count));
                 } else {
                     let index_str = value_args[0];
                     match index_str.parse::<usize>() {
                         Ok(idx) if idx >= 1 && idx <= feed.process.len() => {
                             let removed = feed.process.remove(idx - 1);
-                            println!("  process - [{}] {}", idx, removed);
+                            out.info(format!("  process - [{}] {}", idx, removed));
                         }
                         _ => {
-                            println!("% Invalid index '{}'. Use 1-{} or omit to clear all.",
-                                index_str, feed.process.len());
+                            out.error_coded(
+                                "PARSE",
+                                format!(
+                                    "Invalid index '{}'. Use 1-{} or omit to clear all.",
+                                    index_str, feed.process.len(),
+                                ),
+                            );
+                            state.exit_code = 2;
                         }
                     }
                 }
@@ -1768,18 +2135,20 @@ pub fn no_feed_command(args: &[&str], state: &mut ShellState) {
                 if value_args.is_empty() {
                     let count = feed.destinations.len();
                     feed.destinations.clear();
-                    println!("  All destinations removed ({} cleared).", count);
+                    out.info(format!("  All destinations removed ({} cleared).", count));
                 } else {
                     let input = value_args.join("");
                     if let Some(fp) = parse_feed_path(&input) {
                         if let Some(pos) = feed.destinations.iter().position(|d| feed_paths_match(d, &fp)) {
                             feed.destinations.remove(pos);
-                            println!("  destination - {}", fp);
+                            out.info(format!("  destination - {}", fp));
                         } else {
-                            println!("% Destination '{}' not found.", fp);
+                            out.error_coded("NOT_FOUND", format!("Destination '{}' not found.", fp));
+                            state.exit_code = 1;
                         }
                     } else {
-                        println!("% Invalid format. Use: no destination <endpoint>:<path>");
+                        out.error_coded("PARSE", "Invalid format. Use: no destination <endpoint>:<path>");
+                        state.exit_code = 2;
                     }
                 }
             }
@@ -1787,17 +2156,23 @@ pub fn no_feed_command(args: &[&str], state: &mut ShellState) {
                 if value_args.is_empty() {
                     let count = feed.nextsteps.len();
                     feed.nextsteps.clear();
-                    println!("  All next steps removed ({} cleared).", count);
+                    out.info(format!("  All next steps removed ({} cleared).", count));
                 } else {
                     let index_str = value_args[0];
                     match index_str.parse::<usize>() {
                         Ok(idx) if idx >= 1 && idx <= feed.nextsteps.len() => {
                             let removed = feed.nextsteps.remove(idx - 1);
-                            println!("  nextstep - [{}] {}", idx, removed.display_inline());
+                            out.info(format!("  nextstep - [{}] {}", idx, removed.display_inline()));
                         }
                         _ => {
-                            println!("% Invalid index '{}'. Use 1-{} or omit to clear all.",
-                                index_str, feed.nextsteps.len());
+                            out.error_coded(
+                                "PARSE",
+                                format!(
+                                    "Invalid index '{}'. Use 1-{} or omit to clear all.",
+                                    index_str, feed.nextsteps.len(),
+                                ),
+                            );
+                            state.exit_code = 2;
                         }
                     }
                 }
@@ -1806,18 +2181,22 @@ pub fn no_feed_command(args: &[&str], state: &mut ShellState) {
                 if value_args.is_empty() {
                     let count = feed.schedules.len();
                     feed.schedules.clear();
-                    println!("  All schedules removed ({} cleared).", count);
+                    out.info(format!("  All schedules removed ({} cleared).", count));
                 } else {
                     let expr = value_args.join(" ");
                     if let Some(pos) = feed.schedules.iter().position(|s| s == &expr) {
                         feed.schedules.remove(pos);
-                        println!("  schedule - {}", expr);
+                        out.info(format!("  schedule - {}", expr));
                     } else {
-                        println!("% Schedule '{}' not found.", expr);
+                        out.error_coded("NOT_FOUND", format!("Schedule '{}' not found.", expr));
+                        state.exit_code = 1;
                     }
                 }
             }
-            _ => println!("% Unknown property: '{}'", property),
+            other => {
+                out.error_coded("USAGE", format!("Unknown property: '{}'", other));
+                state.exit_code = 2;
+            }
         }
     }
 }
@@ -1825,21 +2204,25 @@ pub fn no_feed_command(args: &[&str], state: &mut ShellState) {
 /// Move a nextstep from one position to another (1-based indices).
 pub fn move_nextstep(args: &[&str], state: &mut ShellState) {
     if args.len() < 3 || args[0] != "nextstep" {
-        println!("% Usage: move nextstep <from> <to>");
+        state.out.error_coded("USAGE", "Usage: move nextstep <from> <to>");
+        state.exit_code = 2;
         return;
     }
+    let out = state.out;
 
     if let Some(ref mut feed) = state.pending_feed {
         let len = feed.nextsteps.len();
         if len < 2 {
-            println!("% Need at least 2 next steps to reorder.");
+            out.error("Need at least 2 next steps to reorder.");
+            state.exit_code = 1;
             return;
         }
 
         let from = match args[1].parse::<usize>() {
             Ok(i) if i >= 1 && i <= len => i,
             _ => {
-                println!("% Invalid 'from' index '{}'. Use 1-{}.", args[1], len);
+                out.error_coded("PARSE", format!("Invalid 'from' index '{}'. Use 1-{}.", args[1], len));
+                state.exit_code = 2;
                 return;
             }
         };
@@ -1847,37 +2230,42 @@ pub fn move_nextstep(args: &[&str], state: &mut ShellState) {
         let to = match args[2].parse::<usize>() {
             Ok(i) if i >= 1 && i <= len => i,
             _ => {
-                println!("% Invalid 'to' index '{}'. Use 1-{}.", args[2], len);
+                out.error_coded("PARSE", format!("Invalid 'to' index '{}'. Use 1-{}.", args[2], len));
+                state.exit_code = 2;
                 return;
             }
         };
 
         if from == to {
-            println!("% Indices are the same, nothing to move.");
+            out.error("Indices are the same, nothing to move.");
+            state.exit_code = 1;
             return;
         }
 
         let ns = feed.nextsteps.remove(from - 1);
         feed.nextsteps.insert(to - 1, ns);
         info!("Moved nextstep from position {} to {}", from, to);
-        println!("  Moved nextstep [{}] → [{}].", from, to);
-
+        out.info(format!("  Moved nextstep [{}] → [{}].", from, to));
         for (i, ns) in feed.nextsteps.iter().enumerate() {
-            println!("    [{}] {}", i + 1, ns.display_inline());
+            out.info(format!("    [{}] {}", i + 1, ns.display_inline()));
         }
     }
 }
 
 /// Show the pending feed configuration.
 pub fn show_pending_feed(state: &ShellState) {
+    let out = state.out;
     let feed_name = match &state.mode {
         Mode::FeedEdit(name) => name.clone(),
         _ => return,
     };
 
     match &state.pending_feed {
-        Some(feed) => feed.display(&feed_name),
-        None => println!("% No pending configuration."),
+        Some(feed) => out.result(
+            || feed.display(&feed_name),
+            || json!({"name": feed_name, "feed": feed}),
+        ),
+        None => out.error("No pending configuration."),
     }
 }
 
@@ -1893,12 +2281,13 @@ pub fn commit_feed(state: &mut ShellState) {
         None => return,
     };
 
+    if !has_rpc(state) { return; }
+    let out = state.out;
     let success = {
-        if !has_rpc(state) { return; }
         let rpc = state.rpc.as_mut().unwrap();
         match rpc.call(Request::PutFeed { name: feed_name.clone(), feed }) {
             Ok(Response::Ok) => true,
-            Err(e) => { eprintln!("% Error: {}", e); false }
+            Err(e) => { report_err(out, &e, &mut state.exit_code); false }
             _ => false,
         }
     };
@@ -1906,7 +2295,7 @@ pub fn commit_feed(state: &mut ShellState) {
     if success {
         state.pending_feed = None;
         info!("Committed feed '{}'", feed_name);
-        println!("Feed '{}' committed.", feed_name);
+        out.ok(format!("Feed '{}' committed.", feed_name));
         // Dkron schedule sync is handled daemon-side after PutFeed.
 
         state.mode = Mode::Exec;
@@ -1916,7 +2305,7 @@ pub fn commit_feed(state: &mut ShellState) {
 /// Abort feed editing, discard pending changes.
 pub fn abort_feed(state: &mut ShellState) {
     info!("Aborted feed edit, discarding changes");
-    println!("Changes discarded.");
+    state.out.info("Changes discarded.");
     state.pending_feed = None;
     state.mode = Mode::Exec;
 }
@@ -1924,7 +2313,8 @@ pub fn abort_feed(state: &mut ShellState) {
 /// Exit feed-edit mode (warns if uncommitted changes).
 pub fn exit_feed_edit(state: &mut ShellState) {
     if state.pending_feed.is_some() {
-        println!("% You have uncommitted changes. Use 'commit' to save or 'abort' to discard.");
+        state.out.error("You have uncommitted changes. Use 'commit' to save or 'abort' to discard.");
+        state.exit_code = 1;
         return;
     }
     state.mode = Mode::Exec;
@@ -1946,11 +2336,14 @@ pub fn enter_nextstep(state: &mut ShellState) {
         on: Vec::new(),
     });
     state.mode = Mode::NextStepEdit(feed_name);
-    println!("Configuring a new next step. Type 'help' for options, 'done' to add it.");
+    state.out.info("Configuring a new next step. Type 'help' for options, 'done' to add it.");
 }
 
 /// Print help for nextstep-edit mode.
-pub fn help_nextstep_edit() {
+pub fn help_nextstep_edit(state: &mut ShellState) {
+    let out = state.out;
+    if out.is_json() { out.json(&json!({"help": "nextstep-edit", "interactive": true})); return; }
+    if !out.is_human() { return; }
     println!("Next step configuration:");
     println!("  type <feed|email|sleep>      Set action type");
     println!("  target <value>               Set target (varies by type, see below)");
@@ -1970,41 +2363,52 @@ pub fn help_nextstep_edit() {
 /// Set the nextstep action type.
 pub fn set_nextstep_type(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
-        println!("% Usage: type <feed|email>");
+        state.out.error_coded("USAGE", "Usage: type <feed|email|sleep>");
+        state.exit_code = 2;
         return;
     }
+    let out = state.out;
 
     match args[0] {
         "feed" => {
             if let Some(ref mut ns) = state.pending_nextstep {
                 ns.action = NextStepAction::RunFeed { feed: String::new() };
-                println!("  type → feed");
+                out.info("  type → feed");
             }
         }
         "email" => {
             if let Some(ref mut ns) = state.pending_nextstep {
                 ns.action = NextStepAction::SendEmail { emails: Vec::new() };
-                println!("  type → email");
+                out.info("  type → email");
             }
         }
         "sleep" => {
             if let Some(ref mut ns) = state.pending_nextstep {
                 ns.action = NextStepAction::Sleep { seconds: 0 };
-                println!("  type → sleep");
+                out.info("  type → sleep");
             }
         }
-        _ => println!("% Unknown type '{}'. Available: feed, email, sleep", args[0]),
+        other => {
+            out.error_coded(
+                "USAGE",
+                format!("Unknown type '{}'. Available: feed, email, sleep", other),
+            );
+            state.exit_code = 2;
+        }
     }
 }
 
 /// Set the nextstep target.
 pub fn set_nextstep_target(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
-        println!("% Usage: target <name>              (for feed type)");
-        println!("        target <email1,email2,...>  (for email type)");
-        println!("        target <seconds>            (for sleep type)");
+        state.out.error_coded(
+            "USAGE",
+            "Usage: target <name> (feed type) | <email1,email2,...> (email type) | <seconds> (sleep type)",
+        );
+        state.exit_code = 2;
         return;
     }
+    let out = state.out;
 
     // For RunFeed targets, check if the feed exists (best-effort RPC check)
     let is_run_feed = matches!(
@@ -2020,7 +2424,7 @@ pub fn set_nextstep_target(args: &[&str], state: &mut ShellState) {
         if !editing_self {
             if let Some(ref mut rpc) = state.rpc {
                 if let Ok(Response::Feed(None)) = rpc.call(Request::GetFeed { name: target.clone() }) {
-                    println!("  (warning: feed '{}' does not exist yet)", target);
+                    out.info(format!("  (warning: feed '{}' does not exist yet)", target));
                 }
             }
         }
@@ -2031,7 +2435,7 @@ pub fn set_nextstep_target(args: &[&str], state: &mut ShellState) {
             NextStepAction::RunFeed { feed } => {
                 let target = args[0].to_string();
                 *feed = target.clone();
-                println!("  target → {}", target);
+                out.info(format!("  target → {}", target));
             }
             NextStepAction::SendEmail { emails } => {
                 let raw = args.join(" ");
@@ -2041,20 +2445,25 @@ pub fn set_nextstep_target(args: &[&str], state: &mut ShellState) {
                     .filter(|s| !s.is_empty())
                     .collect();
                 if parsed.is_empty() {
-                    println!("% No email addresses provided.");
+                    out.error("No email addresses provided.");
+                    state.exit_code = 2;
                     return;
                 }
                 *emails = parsed.clone();
-                println!("  target → {}", parsed.join(", "));
+                out.info(format!("  target → {}", parsed.join(", ")));
             }
             NextStepAction::Sleep { seconds } => {
                 match args[0].parse::<u64>() {
                     Ok(secs) => {
                         *seconds = secs;
-                        println!("  target → {}s", secs);
+                        out.info(format!("  target → {}s", secs));
                     }
                     Err(_) => {
-                        println!("% Invalid number '{}'. Provide seconds as a whole number.", args[0]);
+                        out.error_coded(
+                            "PARSE",
+                            format!("Invalid number '{}'. Provide seconds as a whole number.", args[0]),
+                        );
+                        state.exit_code = 2;
                     }
                 }
             }
@@ -2075,45 +2484,55 @@ fn parse_trigger(input: &str) -> Option<TriggerCondition> {
 /// Add a trigger condition to the pending nextstep.
 pub fn add_nextstep_condition(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
-        println!("% Usage: on <success|noaction|failed>");
+        state.out.error_coded("USAGE", "Usage: on <success|noaction|failed>");
+        state.exit_code = 2;
         return;
     }
+    let out = state.out;
 
     let condition = match parse_trigger(args[0]) {
         Some(c) => c,
         None => {
-            println!("% Unknown condition '{}'. Use: success, noaction, failed", args[0]);
+            out.error_coded(
+                "USAGE",
+                format!("Unknown condition '{}'. Use: success, noaction, failed", args[0]),
+            );
+            state.exit_code = 2;
             return;
         }
     };
 
     if let Some(ref mut ns) = state.pending_nextstep {
         if ns.on.contains(&condition) {
-            println!("% Condition '{}' already set.", condition);
+            out.error_coded("ALREADY_EXISTS", format!("Condition '{}' already set.", condition));
+            state.exit_code = 1;
             return;
         }
         ns.on.push(condition.clone());
         ns.on.sort();
-        println!("  on + {}", condition);
+        out.info(format!("  on + {}", condition));
     }
 }
 
 /// Handle 'no on <condition>' in nextstep-edit mode.
 pub fn no_nextstep_command(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
-        println!("% Usage: no on <success|noaction|failed>");
+        state.out.error_coded("USAGE", "Usage: no on <success|noaction|failed>");
+        state.exit_code = 2;
         return;
     }
+    let out = state.out;
 
     if args[0] != "on" {
-        println!("% Usage: no on <success|noaction|failed>");
+        out.error_coded("USAGE", "Usage: no on <success|noaction|failed>");
+        state.exit_code = 2;
         return;
     }
 
     if args.len() < 2 {
         if let Some(ref mut ns) = state.pending_nextstep {
             ns.on.clear();
-            println!("  All conditions cleared.");
+            out.info("  All conditions cleared.");
         }
         return;
     }
@@ -2121,7 +2540,11 @@ pub fn no_nextstep_command(args: &[&str], state: &mut ShellState) {
     let condition = match parse_trigger(args[1]) {
         Some(c) => c,
         None => {
-            println!("% Unknown condition '{}'. Use: success, noaction, failed", args[1]);
+            out.error_coded(
+                "USAGE",
+                format!("Unknown condition '{}'. Use: success, noaction, failed", args[1]),
+            );
+            state.exit_code = 2;
             return;
         }
     };
@@ -2129,48 +2552,53 @@ pub fn no_nextstep_command(args: &[&str], state: &mut ShellState) {
     if let Some(ref mut ns) = state.pending_nextstep {
         if let Some(pos) = ns.on.iter().position(|c| c == &condition) {
             ns.on.remove(pos);
-            println!("  on - {}", condition);
+            out.info(format!("  on - {}", condition));
         } else {
-            println!("% Condition '{}' not set.", condition);
+            out.error_coded("NOT_FOUND", format!("Condition '{}' not set.", condition));
+            state.exit_code = 1;
         }
     }
 }
 
 /// Show the pending nextstep configuration.
 pub fn show_pending_nextstep(state: &ShellState) {
+    let out = state.out;
     match &state.pending_nextstep {
-        Some(ns) => {
-            println!("Next step (pending):");
-            match &ns.action {
-                NextStepAction::RunFeed { feed } => {
-                    println!("  type      feed");
-                    println!("  target    {}", if feed.is_empty() { "(not set)" } else { feed.as_str() });
-                }
-                NextStepAction::SendEmail { emails } => {
-                    println!("  type      email");
-                    if emails.is_empty() {
-                        println!("  target    (not set)");
-                    } else {
-                        println!("  target    {}", emails.join(", "));
+        Some(ns) => out.result(
+            || {
+                println!("Next step (pending):");
+                match &ns.action {
+                    NextStepAction::RunFeed { feed } => {
+                        println!("  type      feed");
+                        println!("  target    {}", if feed.is_empty() { "(not set)" } else { feed.as_str() });
+                    }
+                    NextStepAction::SendEmail { emails } => {
+                        println!("  type      email");
+                        if emails.is_empty() {
+                            println!("  target    (not set)");
+                        } else {
+                            println!("  target    {}", emails.join(", "));
+                        }
+                    }
+                    NextStepAction::Sleep { seconds } => {
+                        println!("  type      sleep");
+                        if *seconds == 0 {
+                            println!("  target    (not set)");
+                        } else {
+                            println!("  target    {}s", seconds);
+                        }
                     }
                 }
-                NextStepAction::Sleep { seconds } => {
-                    println!("  type      sleep");
-                    if *seconds == 0 {
-                        println!("  target    (not set)");
-                    } else {
-                        println!("  target    {}s", seconds);
-                    }
+                if ns.on.is_empty() {
+                    println!("  on        (none)");
+                } else {
+                    let conditions: Vec<String> = ns.on.iter().map(|c| c.to_string()).collect();
+                    println!("  on        {}", conditions.join(", "));
                 }
-            }
-            if ns.on.is_empty() {
-                println!("  on        (none)");
-            } else {
-                let conditions: Vec<String> = ns.on.iter().map(|c| c.to_string()).collect();
-                println!("  on        {}", conditions.join(", "));
-            }
-        }
-        None => println!("% No pending next step."),
+            },
+            || json!({"nextstep": ns}),
+        ),
+        None => out.error("No pending next step."),
     }
 }
 
@@ -2180,38 +2608,43 @@ pub fn done_nextstep(state: &mut ShellState) {
         Mode::NextStepEdit(name) => name.clone(),
         _ => return,
     };
+    let out = state.out;
 
     if let Some(ref ns) = state.pending_nextstep {
         match &ns.action {
             NextStepAction::RunFeed { feed } => {
                 if feed.is_empty() {
-                    println!("% Target feed not set. Use 'target <feedname>'.");
+                    out.error("Target feed not set. Use 'target <feedname>'.");
+                    state.exit_code = 2;
                     return;
                 }
             }
             NextStepAction::SendEmail { emails } => {
                 if emails.is_empty() {
-                    println!("% No email addresses set. Use 'target <email1,email2,...>'.");
+                    out.error("No email addresses set. Use 'target <email1,email2,...>'.");
+                    state.exit_code = 2;
                     return;
                 }
             }
             NextStepAction::Sleep { seconds } => {
                 if *seconds == 0 {
-                    println!("% Sleep duration not set. Use 'target <seconds>'.");
+                    out.error("Sleep duration not set. Use 'target <seconds>'.");
+                    state.exit_code = 2;
                     return;
                 }
             }
         }
 
         if ns.on.is_empty() {
-            println!("% No trigger conditions set. Use 'on <success|noaction|failed>'.");
+            out.error("No trigger conditions set. Use 'on <success|noaction|failed>'.");
+            state.exit_code = 2;
             return;
         }
     }
 
     if let Some(ns) = state.pending_nextstep.take() {
         info!("Added next step: {}", ns.display_inline());
-        println!("  nextstep + {}", ns.display_inline());
+        out.info(format!("  nextstep + {}", ns.display_inline()));
         if let Some(ref mut feed) = state.pending_feed {
             feed.nextsteps.push(ns);
         }
@@ -2226,7 +2659,7 @@ pub fn abort_nextstep(state: &mut ShellState) {
         _ => return,
     };
 
-    println!("Next step discarded.");
+    state.out.info("Next step discarded.");
     state.pending_nextstep = None;
     state.mode = Mode::FeedEdit(feed_name);
 }
@@ -2241,28 +2674,34 @@ pub fn abort_nextstep(state: &mut ShellState) {
 /// Handle 'show' subcommands in exec mode.
 pub fn show(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
-        println!("Usage: show <subcommand>");
-        println!("  endpoints          List all endpoints");
-        println!("  endpoint <name>    Show endpoint details");
-        println!("  keys               List all keys");
-        println!("  key <name>         Show key details");
-        println!("  feeds              List all feeds");
-        println!("  feed <name>        Show feed details");
-        println!("  runs <feed> [N]    Show run history for a feed (default: 25)");
-        println!("  audit [N]          Show recent cluster mutations (default: 50)");
-        println!("  server             Show server connection settings");
-        println!("  version            Show SFTPflow version");
+        let out = state.out;
+        out.human(|| {
+            println!("Usage: show <subcommand>");
+            println!("  endpoints          List all endpoints");
+            println!("  endpoint <name>    Show endpoint details");
+            println!("  keys               List all keys");
+            println!("  key <name>         Show key details");
+            println!("  feeds              List all feeds");
+            println!("  feed <name>        Show feed details");
+            println!("  runs <feed> [N]    Show run history for a feed (default: 25)");
+            println!("  audit [N]          Show recent cluster mutations (default: 50)");
+            println!("  server             Show server connection settings");
+            println!("  version            Show SFTPflow version");
+        });
+        out.json(&json!({"error": {"code": "USAGE", "message": "show requires a subcommand"}}));
+        state.exit_code = 2;
         return;
     }
 
     match args[0] {
-        "version"   => version(),
-        "server"    => state.config.server.display(),
+        "version"   => version(state),
+        "server"    => show_server(state),
         "secrets"   => show_secrets(state),
         "endpoints" => show_endpoints(state),
         "endpoint"  => {
             if args.len() < 2 {
-                println!("% Usage: show endpoint <name>");
+                state.out.error_coded("USAGE", "Usage: show endpoint <name>");
+                state.exit_code = 2;
                 return;
             }
             show_endpoint_detail(args[1], state);
@@ -2270,7 +2709,8 @@ pub fn show(args: &[&str], state: &mut ShellState) {
         "keys"      => show_keys(state),
         "key"       => {
             if args.len() < 2 {
-                println!("% Usage: show key <name>");
+                state.out.error_coded("USAGE", "Usage: show key <name>");
+                state.exit_code = 2;
                 return;
             }
             show_key_detail(args[1], state);
@@ -2278,14 +2718,16 @@ pub fn show(args: &[&str], state: &mut ShellState) {
         "feeds"     => show_feeds(state),
         "feed"      => {
             if args.len() < 2 {
-                println!("% Usage: show feed <name>");
+                state.out.error_coded("USAGE", "Usage: show feed <name>");
+                state.exit_code = 2;
                 return;
             }
             show_feed_detail(args[1], state);
         }
         "runs"      => {
             if args.len() < 2 {
-                println!("% Usage: show runs <feed> [limit]");
+                state.out.error_coded("USAGE", "Usage: show runs <feed> [limit]");
+                state.exit_code = 2;
                 return;
             }
             let limit = args.get(2).and_then(|s| s.parse::<u32>().ok());
@@ -2295,36 +2737,78 @@ pub fn show(args: &[&str], state: &mut ShellState) {
             let limit = args.get(1).and_then(|s| s.parse::<u32>().ok());
             show_audit(limit, state);
         }
-        _ => println!("% Unknown show subcommand: '{}'", args[0]),
+        other => {
+            state.out.error_coded("USAGE", format!("Unknown show subcommand: '{}'", other));
+            state.exit_code = 2;
+        }
     }
+}
+
+/// `show server` — print the active server connection. Local config,
+/// no RPC. JSON mode mirrors the same fields as the human display.
+fn show_server(state: &mut ShellState) {
+    let out = state.out;
+    let s = &state.config.server;
+    out.result(
+        || s.display(),
+        || json!({
+            "host":      s.host,
+            "port":      s.port,
+            "username":  s.username,
+            "dkron_url": s.dkron_url,
+        }),
+    );
 }
 
 /// List all configured endpoints (fetched from daemon).
 fn show_endpoints(state: &mut ShellState) {
     if !has_rpc(state) { return; }
+    let out = state.out;
     let rpc = state.rpc.as_mut().unwrap();
 
     let names = match rpc.call(Request::ListEndpoints) {
         Ok(Response::Names(n)) => n,
-        Err(e) => { println!("% Error: {}", e); return; }
+        Err(e) => { report_err(out, &e, &mut state.exit_code); return; }
         _ => return,
     };
 
-    if names.is_empty() {
+    // Fetch every endpoint up-front so JSON mode emits a single
+    // self-contained array. Errors fetching individual endpoints
+    // are folded into a per-row error field rather than aborting
+    // the whole listing.
+    let mut entries: Vec<(String, Option<Endpoint>)> = Vec::with_capacity(names.len());
+    for name in &names {
+        let ep = match rpc.call(Request::GetEndpoint { name: name.clone() }) {
+            Ok(Response::Endpoint(Some(ep))) => Some(ep),
+            _ => None,
+        };
+        entries.push((name.clone(), ep));
+    }
+
+    if out.is_json() {
+        let v: Vec<_> = entries.iter().map(|(n, ep)| match ep {
+            Some(ep) => json!({"name": n, "endpoint": ep}),
+            None     => json!({"name": n, "error": "could not fetch details"}),
+        }).collect();
+        out.json(&v);
+        return;
+    }
+
+    if entries.is_empty() {
         println!("No endpoints configured.");
         return;
     }
 
     println!("Configured endpoints:");
-    for name in &names {
-        match rpc.call(Request::GetEndpoint { name: name.clone() }) {
-            Ok(Response::Endpoint(Some(ep))) => {
+    for (name, ep) in &entries {
+        match ep {
+            Some(ep) => {
                 let host = ep.host.as_deref().unwrap_or("(no host)");
                 let port = ep.port.map_or(String::new(), |p| format!(":{}", p));
                 let user = ep.username.as_deref().unwrap_or("(no user)");
                 println!("  {:20} {}@{}{}", name, user, host, port);
             }
-            _ => println!("  {:20} (error fetching details)", name),
+            None => println!("  {:20} (error fetching details)", name),
         }
     }
 }
@@ -2332,12 +2816,21 @@ fn show_endpoints(state: &mut ShellState) {
 /// Show detail for a single endpoint (fetched from daemon).
 fn show_endpoint_detail(name: &str, state: &mut ShellState) {
     if !has_rpc(state) { return; }
+    let out = state.out;
     let rpc = state.rpc.as_mut().unwrap();
 
     match rpc.call(Request::GetEndpoint { name: name.to_string() }) {
-        Ok(Response::Endpoint(Some(ep))) => ep.display(name),
-        Ok(Response::Endpoint(None)) => println!("% Endpoint '{}' does not exist.", name),
-        Err(e) => println!("% Error: {}", e),
+        Ok(Response::Endpoint(Some(ep))) => {
+            out.result(
+                || ep.display(name),
+                || json!({"name": name, "endpoint": ep}),
+            );
+        }
+        Ok(Response::Endpoint(None)) => {
+            out.error_coded("NOT_FOUND", format!("Endpoint '{}' does not exist.", name));
+            state.exit_code = 1;
+        }
+        Err(e) => report_err(out, &e, &mut state.exit_code),
         _ => {}
     }
 }
@@ -2345,23 +2838,42 @@ fn show_endpoint_detail(name: &str, state: &mut ShellState) {
 /// List all configured keys (fetched from daemon).
 fn show_keys(state: &mut ShellState) {
     if !has_rpc(state) { return; }
+    let out = state.out;
     let rpc = state.rpc.as_mut().unwrap();
 
     let names = match rpc.call(Request::ListKeys) {
         Ok(Response::Names(n)) => n,
-        Err(e) => { println!("% Error: {}", e); return; }
+        Err(e) => { report_err(out, &e, &mut state.exit_code); return; }
         _ => return,
     };
 
-    if names.is_empty() {
+    let mut entries: Vec<(String, Option<PgpKey>)> = Vec::with_capacity(names.len());
+    for name in &names {
+        let key = match rpc.call(Request::GetKey { name: name.clone() }) {
+            Ok(Response::Key(Some(k))) => Some(k),
+            _ => None,
+        };
+        entries.push((name.clone(), key));
+    }
+
+    if out.is_json() {
+        let v: Vec<_> = entries.iter().map(|(n, k)| match k {
+            Some(k) => json!({"name": n, "key": k}),
+            None    => json!({"name": n, "error": "could not fetch details"}),
+        }).collect();
+        out.json(&v);
+        return;
+    }
+
+    if entries.is_empty() {
         println!("No keys configured.");
         return;
     }
 
     println!("Configured keys:");
-    for name in &names {
-        match rpc.call(Request::GetKey { name: name.clone() }) {
-            Ok(Response::Key(Some(key))) => {
+    for (name, key) in &entries {
+        match key {
+            Some(key) => {
                 let ktype = key.key_type.as_ref().map_or("(no type)", |t| match t {
                     KeyType::Public  => "public",
                     KeyType::Private => "private",
@@ -2369,7 +2881,7 @@ fn show_keys(state: &mut ShellState) {
                 let has_contents = if key.contents.is_some() { "loaded" } else { "empty" };
                 println!("  {:20} {:10} {}", name, ktype, has_contents);
             }
-            _ => println!("  {:20} (error fetching details)", name),
+            None => println!("  {:20} (error fetching details)", name),
         }
     }
 }
@@ -2377,12 +2889,21 @@ fn show_keys(state: &mut ShellState) {
 /// Show detail for a single key (fetched from daemon).
 fn show_key_detail(name: &str, state: &mut ShellState) {
     if !has_rpc(state) { return; }
+    let out = state.out;
     let rpc = state.rpc.as_mut().unwrap();
 
     match rpc.call(Request::GetKey { name: name.to_string() }) {
-        Ok(Response::Key(Some(key))) => key.display(name),
-        Ok(Response::Key(None)) => println!("% Key '{}' does not exist.", name),
-        Err(e) => println!("% Error: {}", e),
+        Ok(Response::Key(Some(key))) => {
+            out.result(
+                || key.display(name),
+                || json!({"name": name, "key": key}),
+            );
+        }
+        Ok(Response::Key(None)) => {
+            out.error_coded("NOT_FOUND", format!("Key '{}' does not exist.", name));
+            state.exit_code = 1;
+        }
+        Err(e) => report_err(out, &e, &mut state.exit_code),
         _ => {}
     }
 }
@@ -2390,13 +2911,19 @@ fn show_key_detail(name: &str, state: &mut ShellState) {
 /// List all configured feeds (fetched from daemon via FeedSummaries).
 fn show_feeds(state: &mut ShellState) {
     if !has_rpc(state) { return; }
+    let out = state.out;
     let rpc = state.rpc.as_mut().unwrap();
 
     let summaries = match rpc.call(Request::ListFeeds) {
         Ok(Response::FeedSummaries(s)) => s,
-        Err(e) => { println!("% Error: {}", e); return; }
+        Err(e) => { report_err(out, &e, &mut state.exit_code); return; }
         _ => return,
     };
+
+    if out.is_json() {
+        out.json(&summaries);
+        return;
+    }
 
     if summaries.is_empty() {
         println!("No feeds configured.");
@@ -2418,12 +2945,21 @@ fn show_feeds(state: &mut ShellState) {
 /// Show detail for a single feed (fetched from daemon).
 fn show_feed_detail(name: &str, state: &mut ShellState) {
     if !has_rpc(state) { return; }
+    let out = state.out;
     let rpc = state.rpc.as_mut().unwrap();
 
     match rpc.call(Request::GetFeed { name: name.to_string() }) {
-        Ok(Response::Feed(Some(feed))) => feed.display(name),
-        Ok(Response::Feed(None)) => println!("% Feed '{}' does not exist.", name),
-        Err(e) => println!("% Error: {}", e),
+        Ok(Response::Feed(Some(feed))) => {
+            out.result(
+                || feed.display(name),
+                || json!({"name": name, "feed": feed}),
+            );
+        }
+        Ok(Response::Feed(None)) => {
+            out.error_coded("NOT_FOUND", format!("Feed '{}' does not exist.", name));
+            state.exit_code = 1;
+        }
+        Err(e) => report_err(out, &e, &mut state.exit_code),
         _ => {}
     }
 }
@@ -2431,10 +2967,15 @@ fn show_feed_detail(name: &str, state: &mut ShellState) {
 /// Show run history for a feed (fetched from daemon).
 fn show_runs(feed: &str, limit: Option<u32>, state: &mut ShellState) {
     if !has_rpc(state) { return; }
+    let out = state.out;
     let rpc = state.rpc.as_mut().unwrap();
 
     match rpc.call(Request::GetRunHistory { feed: feed.to_string(), limit }) {
         Ok(Response::RunHistory(entries)) => {
+            if out.is_json() {
+                out.json(&json!({"feed": feed, "entries": entries}));
+                return;
+            }
             if entries.is_empty() {
                 println!("No run history for feed '{}'.", feed);
                 return;
@@ -2466,8 +3007,7 @@ fn show_runs(feed: &str, limit: Option<u32>, state: &mut ShellState) {
                 );
             }
         }
-        Err(RpcError::Proto(e)) => println!("% {}", e.message),
-        Err(e) => println!("% Error: {}", e),
+        Err(e) => report_err(out, &e, &mut state.exit_code),
         _ => {}
     }
 }
@@ -2482,10 +3022,15 @@ fn show_runs(feed: &str, limit: Option<u32>, state: &mut ShellState) {
 /// when deleting an in-use endpoint).
 fn show_audit(limit: Option<u32>, state: &mut ShellState) {
     if !has_rpc(state) { return; }
+    let out = state.out;
     let rpc = state.rpc.as_mut().unwrap();
 
     match rpc.call(Request::GetAuditLog { limit, since_unix: None }) {
         Ok(Response::AuditLog(entries)) => {
+            if out.is_json() {
+                out.json(&entries);
+                return;
+            }
             if entries.is_empty() {
                 println!("No audit rows yet.");
                 return;
@@ -2520,8 +3065,7 @@ fn show_audit(limit: Option<u32>, state: &mut ShellState) {
                 );
             }
         }
-        Err(RpcError::Proto(e)) => println!("% {}", e.message),
-        Err(e) => println!("% Error: {}", e),
+        Err(e) => report_err(out, &e, &mut state.exit_code),
         _ => {}
     }
 }
@@ -2583,14 +3127,16 @@ fn format_duration(secs: f64) -> String {
 /// subcommand also accepts `--dry-run` (or `-n`) for a preview.
 pub fn secret(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
-        println!("% Usage: secret <add|list|delete> [name]");
+        state.out.error_coded("USAGE", "Usage: secret <add|list|delete> [name]");
+        state.exit_code = 2;
         return;
     }
 
     match args[0] {
         "add"    => {
             if args.len() < 2 {
-                println!("% Usage: secret add <name>");
+                state.out.error_coded("USAGE", "Usage: secret add <name>");
+                state.exit_code = 2;
                 return;
             }
             secret_add(args[1], state);
@@ -2603,35 +3149,53 @@ pub fn secret(args: &[&str], state: &mut ShellState) {
             // (`secret delete --dry-run X` or `secret delete X -n`).
             let (dry_run, rest) = take_dry_run_flag(&args[1..]);
             if rest.is_empty() {
-                println!("% Usage: secret delete [--dry-run] <name>");
+                state.out.error_coded("USAGE", "Usage: secret delete [--dry-run] <name>");
+                state.exit_code = 2;
                 return;
             }
             secret_delete(rest[0], dry_run, state);
         }
-        _ => println!("% Unknown secret subcommand '{}'. Use add, list, or delete.", args[0]),
+        other => {
+            state.out.error_coded(
+                "USAGE",
+                format!("Unknown secret subcommand '{}'. Use add, list, or delete.", other),
+            );
+            state.exit_code = 2;
+        }
     }
 }
 
 /// Prompt for a secret value (hidden) and send a PutSecret RPC.
 fn secret_add(name: &str, state: &mut ShellState) {
     if !has_rpc(state) { return; }
+    let out = state.out;
 
     // Prompt twice and require both to match, so typos don't silently
     // seal the wrong value into the store.
     let value = match rpassword::prompt_password(format!("Value for '{}': ", name)) {
         Ok(v) => v,
-        Err(e) => { println!("% Could not read value: {}", e); return; }
+        Err(e) => {
+            out.error(format!("Could not read value: {}", e));
+            state.exit_code = 1;
+            return;
+        }
     };
     if value.is_empty() {
-        println!("% Empty value — aborting.");
+        out.error("Empty value — aborting.");
+        state.exit_code = 1;
         return;
     }
     let confirm = match rpassword::prompt_password("Confirm: ") {
         Ok(v) => v,
-        Err(e) => { println!("% Could not read confirmation: {}", e); return; }
+        Err(e) => {
+            out.error(format!("Could not read confirmation: {}", e));
+            state.exit_code = 1;
+            return;
+        }
     };
     if confirm != value {
-        println!("% Values did not match — aborting.");
+        out.error("Values did not match — aborting.");
+        state.exit_code = 1;
         return;
     }
 
@@ -2639,10 +3203,9 @@ fn secret_add(name: &str, state: &mut ShellState) {
     match rpc.call(Request::PutSecret { name: name.to_string(), value }) {
         Ok(Response::Ok) => {
             info!("Stored secret '{}'", name);
-            println!("Secret '{}' stored.", name);
+            out.ok(format!("Secret '{}' stored.", name));
         }
-        Err(RpcError::Proto(e)) => println!("% {}", e.message),
-        Err(e) => println!("% Error: {}", e),
+        Err(e) => report_err(out, &e, &mut state.exit_code),
         _ => {}
     }
 }
@@ -2650,10 +3213,15 @@ fn secret_add(name: &str, state: &mut ShellState) {
 /// Send a ListSecrets RPC and print the names.
 fn secret_list(state: &mut ShellState) {
     if !has_rpc(state) { return; }
+    let out = state.out;
     let rpc = state.rpc.as_mut().unwrap();
 
     match rpc.call(Request::ListSecrets) {
         Ok(Response::Names(names)) => {
+            if out.is_json() {
+                out.json(&names);
+                return;
+            }
             if names.is_empty() {
                 println!("No secrets configured.");
                 return;
@@ -2663,8 +3231,7 @@ fn secret_list(state: &mut ShellState) {
                 println!("  {}", name);
             }
         }
-        Err(RpcError::Proto(e)) => println!("% {}", e.message),
-        Err(e) => println!("% Error: {}", e),
+        Err(e) => report_err(out, &e, &mut state.exit_code),
         _ => {}
     }
 }
@@ -2672,14 +3239,14 @@ fn secret_list(state: &mut ShellState) {
 /// Send a DeleteSecret RPC, or its dry-run preview.
 fn secret_delete(name: &str, dry_run: bool, state: &mut ShellState) {
     if !has_rpc(state) { return; }
+    let out = state.out;
     let rpc = state.rpc.as_mut().unwrap();
     let req = Request::DeleteSecret { name: name.to_string() };
 
     if dry_run {
         match rpc.call_dry_run(req) {
-            Ok(Response::DryRunReport(r)) => print_dry_run_report(&r),
-            Err(RpcError::Proto(e)) => println!("% {}", e.message),
-            Err(e) => println!("% Error: {}", e),
+            Ok(Response::DryRunReport(r)) => render_dry_run_report(out, &r),
+            Err(e) => report_err(out, &e, &mut state.exit_code),
             _ => {}
         }
         return;
@@ -2688,10 +3255,9 @@ fn secret_delete(name: &str, dry_run: bool, state: &mut ShellState) {
     match rpc.call(req) {
         Ok(Response::Ok) => {
             info!("Deleted secret '{}'", name);
-            println!("Secret '{}' deleted.", name);
+            out.ok(format!("Secret '{}' deleted.", name));
         }
-        Err(RpcError::Proto(e)) => println!("% {}", e.message),
-        Err(e) => println!("% Error: {}", e),
+        Err(e) => report_err(out, &e, &mut state.exit_code),
         _ => {}
     }
 }
@@ -2710,16 +3276,18 @@ fn show_secrets(state: &mut ShellState) {
 /// Clears any inline plaintext password so the YAML stays clean.
 pub fn set_password_ref(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
-        println!("% Usage: password_ref <secret-name>");
+        state.out.error_coded("USAGE", "Usage: password_ref <secret-name>");
+        state.exit_code = 2;
         return;
     }
     let name = args[0].to_string();
+    let out = state.out;
 
     // Warn if the secret doesn't exist yet (best-effort RPC check).
     if let Some(ref mut rpc) = state.rpc {
         if let Ok(Response::Names(names)) = rpc.call(Request::ListSecrets) {
             if !names.iter().any(|n| n == &name) {
-                println!("  (warning: secret '{}' does not exist yet — use 'secret add {}' first)", name, name);
+                out.info(format!("  (warning: secret '{}' does not exist yet — use 'secret add {}' first)", name, name));
             }
         }
     }
@@ -2728,22 +3296,24 @@ pub fn set_password_ref(args: &[&str], state: &mut ShellState) {
         ep.password_ref = Some(name.clone());
         ep.password = None;
         info!("Set password_ref = '{}'", name);
-        println!("  password_ref → {}", name);
+        out.info(format!("  password_ref → {}", name));
     }
 }
 
 /// `ssh_key_ref <name>` — store a ref to a sealed SSH key by name.
 pub fn set_ssh_key_ref(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
-        println!("% Usage: ssh_key_ref <secret-name>");
+        state.out.error_coded("USAGE", "Usage: ssh_key_ref <secret-name>");
+        state.exit_code = 2;
         return;
     }
     let name = args[0].to_string();
+    let out = state.out;
 
     if let Some(ref mut rpc) = state.rpc {
         if let Ok(Response::Names(names)) = rpc.call(Request::ListSecrets) {
             if !names.iter().any(|n| n == &name) {
-                println!("  (warning: secret '{}' does not exist yet — use 'secret add {}' first)", name, name);
+                out.info(format!("  (warning: secret '{}' does not exist yet — use 'secret add {}' first)", name, name));
             }
         }
     }
@@ -2752,22 +3322,24 @@ pub fn set_ssh_key_ref(args: &[&str], state: &mut ShellState) {
         ep.ssh_key_ref = Some(name.clone());
         ep.ssh_key = None;
         info!("Set ssh_key_ref = '{}'", name);
-        println!("  ssh_key_ref → {}", name);
+        out.info(format!("  ssh_key_ref → {}", name));
     }
 }
 
 /// `contents_ref <name>` — store a ref to sealed PGP key material.
 pub fn set_key_contents_ref(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
-        println!("% Usage: contents_ref <secret-name>");
+        state.out.error_coded("USAGE", "Usage: contents_ref <secret-name>");
+        state.exit_code = 2;
         return;
     }
     let name = args[0].to_string();
+    let out = state.out;
 
     if let Some(ref mut rpc) = state.rpc {
         if let Ok(Response::Names(names)) = rpc.call(Request::ListSecrets) {
             if !names.iter().any(|n| n == &name) {
-                println!("  (warning: secret '{}' does not exist yet — use 'secret add {}' first)", name, name);
+                out.info(format!("  (warning: secret '{}' does not exist yet — use 'secret add {}' first)", name, name));
             }
         }
     }
@@ -2776,7 +3348,7 @@ pub fn set_key_contents_ref(args: &[&str], state: &mut ShellState) {
         k.contents_ref = Some(name.clone());
         k.contents = None;
         info!("Set contents_ref = '{}'", name);
-        println!("  contents_ref → {}", name);
+        out.info(format!("  contents_ref → {}", name));
     }
 }
 
@@ -2793,7 +3365,8 @@ pub fn set_key_contents_ref(args: &[&str], state: &mut ShellState) {
 /// Route 'cluster status|token|remove|leave|join|bootstrap|backup ...' in exec mode.
 pub fn cluster(args: &[&str], state: &mut ShellState) {
     if args.is_empty() {
-        println!("% Usage: cluster <status|token|remove|leave|join|bootstrap|backup> [args]");
+        state.out.error_coded("USAGE", "Usage: cluster <status|token|remove|leave|join|bootstrap|backup> [args]");
+        state.exit_code = 2;
         return;
     }
 
@@ -2806,7 +3379,8 @@ pub fn cluster(args: &[&str], state: &mut ShellState) {
                 match args[1].parse::<u32>() {
                     Ok(n) => Some(n),
                     Err(_) => {
-                        println!("% Usage: cluster token [ttl-seconds]");
+                        state.out.error_coded("USAGE", "Usage: cluster token [ttl-seconds]");
+                        state.exit_code = 2;
                         return;
                     }
                 }
@@ -2821,13 +3395,15 @@ pub fn cluster(args: &[&str], state: &mut ShellState) {
             // 3 --dry-run` and `cluster remove --dry-run 3` both work.
             let (dry_run, rest) = take_dry_run_flag(&args[1..]);
             if rest.is_empty() {
-                println!("% Usage: cluster remove [--dry-run] <node-id>");
+                state.out.error_coded("USAGE", "Usage: cluster remove [--dry-run] <node-id>");
+                state.exit_code = 2;
                 return;
             }
             let node_id = match rest[0].parse::<u64>() {
                 Ok(n) => n,
                 Err(_) => {
-                    println!("% node-id must be a non-negative integer");
+                    state.out.error_coded("PARSE", "node-id must be a non-negative integer");
+                    state.exit_code = 2;
                     return;
                 }
             };
@@ -2836,37 +3412,54 @@ pub fn cluster(args: &[&str], state: &mut ShellState) {
         "leave" => cluster_leave(state),
         "join" => {
             if args.len() < 2 {
-                println!("% Usage: cluster join <user@host[:port]>");
+                state.out.error_coded("USAGE", "Usage: cluster join <user@host[:port]>");
+                state.exit_code = 2;
                 return;
             }
             cluster_join_remote(state, args[1]);
         }
         "bootstrap" => {
             if args.len() < 2 {
-                println!("% Usage: cluster bootstrap <user@host[:port]>");
+                state.out.error_coded("USAGE", "Usage: cluster bootstrap <user@host[:port]>");
+                state.exit_code = 2;
                 return;
             }
-            cluster_bootstrap_remote(args[1]);
+            cluster_bootstrap_remote(state, args[1]);
         }
         "backup" => {
             if args.len() < 2 {
-                println!("% Usage: cluster backup <server-side absolute path .tar.gz>");
-                println!("  e.g. cluster backup /var/lib/sftpflow/backups/sftpflow-2026-04-29.tar.gz");
+                state.out.error_coded(
+                    "USAGE",
+                    "Usage: cluster backup <server-side absolute path .tar.gz> \
+                     (e.g. /var/lib/sftpflow/backups/sftpflow-2026-04-29.tar.gz)",
+                );
+                state.exit_code = 2;
                 return;
             }
             cluster_backup_remote(state, args[1]);
         }
-        _ => println!("% Unknown cluster subcommand '{}'. Use status, token, remove, leave, join, bootstrap, or backup.", args[0]),
+        other => {
+            state.out.error_coded(
+                "USAGE",
+                format!("Unknown cluster subcommand '{}'. Use status, token, remove, leave, join, bootstrap, or backup.", other),
+            );
+            state.exit_code = 2;
+        }
     }
 }
 
 /// Send ClusterStatus and pretty-print the result.
 fn cluster_status(state: &mut ShellState) {
     if !has_rpc(state) { return; }
+    let out = state.out;
     let rpc = state.rpc.as_mut().unwrap();
 
     match rpc.call(Request::ClusterStatus) {
         Ok(Response::ClusterStatus(status)) => {
+            if out.is_json() {
+                out.json(&status);
+                return;
+            }
             // Header block: cluster id, leader, this node, uptime,
             // responder's local log tip / state-machine tip.
             println!("Cluster:    {}", status.cluster_id);
@@ -2927,8 +3520,7 @@ fn cluster_status(state: &mut ShellState) {
                 );
             }
         }
-        Err(RpcError::Proto(e)) => println!("% {}", e.message),
-        Err(e) => println!("% Error: {}", e),
+        Err(e) => report_err(out, &e, &mut state.exit_code),
         _ => {}
     }
 }
@@ -2968,27 +3560,33 @@ fn format_uptime(total_secs: u64) -> String {
 /// Send ClusterMintToken and print the resulting token + expiry.
 fn cluster_token(state: &mut ShellState, ttl_seconds: Option<u32>) {
     if !has_rpc(state) { return; }
+    let out = state.out;
     let rpc = state.rpc.as_mut().unwrap();
 
     match rpc.call(Request::ClusterMintToken { ttl_seconds }) {
         Ok(Response::ClusterToken(t)) => {
             info!("Minted cluster join token (expires_at_unix={})", t.expires_at_unix);
-            println!("Token:");
-            println!("  {}", t.token);
-            println!();
-            println!("Expires at unix={} ({} seconds from now)",
-                t.expires_at_unix,
-                t.expires_at_unix.saturating_sub(unix_now()),
-            );
-            println!();
-            println!("To use it manually on the joiner:");
-            println!("  sftpflowd join <seed-addr> --token <token> --ca-cert-file <ca.crt>");
-            println!();
-            println!("Or skip the manual ceremony:");
-            println!("  cluster join <user@host[:port]>   # mint+ship+remote-launch in one shot");
+            if out.is_json() {
+                out.json(&t);
+                return;
+            }
+            out.human(|| {
+                println!("Token:");
+                println!("  {}", t.token);
+                println!();
+                println!("Expires at unix={} ({} seconds from now)",
+                    t.expires_at_unix,
+                    t.expires_at_unix.saturating_sub(unix_now()),
+                );
+                println!();
+                println!("To use it manually on the joiner:");
+                println!("  sftpflowd join <seed-addr> --token <token> --ca-cert-file <ca.crt>");
+                println!();
+                println!("Or skip the manual ceremony:");
+                println!("  cluster join <user@host[:port]>   # mint+ship+remote-launch in one shot");
+            });
         }
-        Err(RpcError::Proto(e)) => println!("% {}", e.message),
-        Err(e) => println!("% Error: {}", e),
+        Err(e) => report_err(out, &e, &mut state.exit_code),
         _ => {}
     }
 }
@@ -3006,6 +3604,7 @@ fn cluster_token(state: &mut ShellState, ttl_seconds: Option<u32>) {
 /// the CLI just sees Response::Ok.
 fn cluster_leave(state: &mut ShellState) {
     if !has_rpc(state) { return; }
+    let out = state.out;
 
     // Look up the connected node's id + label so the confirm
     // prompt is unambiguous. If the status call fails we still
@@ -3023,24 +3622,24 @@ fn cluster_leave(state: &mut ShellState) {
         _ => ("?".to_string(), "-".to_string()),
     };
 
-    println!(
-        "Step the connected node out of the cluster?",
-    );
-    println!("  node_id={}  label={}", self_id_str, label_hint);
-    println!(
+    out.info("Step the connected node out of the cluster?");
+    out.info(format!("  node_id={}  label={}", self_id_str, label_hint));
+    out.info(
         "If this node is the leader it will step down first; \
          otherwise it forwards the removal to the current leader.",
     );
-    println!("This is irreversible. Type the node id again to confirm:");
+    out.info("This is irreversible. Type the node id again to confirm:");
 
     let mut input = String::new();
     if std::io::stdin().read_line(&mut input).is_err() {
-        println!("% Could not read confirmation — aborting.");
+        out.error("Could not read confirmation — aborting.");
+        state.exit_code = 1;
         return;
     }
     let typed = input.trim();
     if typed != self_id_str {
-        println!("% Confirmation did not match — aborting.");
+        out.error("Confirmation did not match — aborting.");
+        state.exit_code = 1;
         return;
     }
 
@@ -3048,11 +3647,15 @@ fn cluster_leave(state: &mut ShellState) {
     match rpc.call(Request::ClusterLeave) {
         Ok(Response::Ok) => {
             info!("cluster leave: node_id={} removed", self_id_str);
-            println!("Node {} has left the cluster.", self_id_str);
-            println!("(daemon is still running — re-join with `cluster join` or stop it manually)");
+            out.ok_with(
+                || {
+                    println!("Node {} has left the cluster.", self_id_str);
+                    println!("(daemon is still running — re-join with `cluster join` or stop it manually)");
+                },
+                &json!({"node_id": self_id_str, "left": true}),
+            );
         }
-        Err(RpcError::Proto(e)) => println!("% {}", e.message),
-        Err(e) => println!("% Error: {}", e),
+        Err(e) => report_err(out, &e, &mut state.exit_code),
         _ => {}
     }
 }
@@ -3066,13 +3669,18 @@ fn cluster_leave(state: &mut ShellState) {
 /// them verify their copy matches what the daemon wrote.
 fn cluster_backup_remote(state: &mut ShellState, out_path: &str) {
     if !has_rpc(state) { return; }
+    let out = state.out;
 
-    println!("Requesting backup → {}", out_path);
-    println!("(this is the path on the *server*; scp it back when done)");
+    out.info(format!("Requesting backup → {}", out_path));
+    out.info("(this is the path on the *server*; scp it back when done)");
 
     let rpc = state.rpc.as_mut().unwrap();
     match rpc.call(Request::ClusterBackup { out_path: out_path.to_string() }) {
         Ok(Response::BackupReport(report)) => {
+            if out.is_json() {
+                out.json(&report);
+                return;
+            }
             println!();
             println!("Backup written:");
             println!("  path:        {}", report.archive_path);
@@ -3091,8 +3699,7 @@ fn cluster_backup_remote(state: &mut ShellState, out_path: &str) {
             println!("To verify the copy locally:");
             println!("  sha256sum <local-copy>.tar.gz");
         }
-        Err(RpcError::Proto(e)) => println!("% {}", e.message),
-        Err(e) => println!("% Error: {}", e),
+        Err(e) => report_err(out, &e, &mut state.exit_code),
         _ => {}
     }
 }
@@ -3102,30 +3709,35 @@ fn cluster_backup_remote(state: &mut ShellState, out_path: &str) {
 /// preview instead of mutating membership.
 fn cluster_remove(state: &mut ShellState, node_id: u64, dry_run: bool) {
     if !has_rpc(state) { return; }
+    let out = state.out;
 
     if dry_run {
         // No confirmation prompt for previews — the whole point is
         // for the operator to inspect the plan before deciding.
         let rpc = state.rpc.as_mut().unwrap();
         match rpc.call_dry_run(Request::ClusterRemoveNode { node_id }) {
-            Ok(Response::DryRunReport(r)) => print_dry_run_report(&r),
-            Err(RpcError::Proto(e)) => println!("% {}", e.message),
-            Err(e) => println!("% Error: {}", e),
+            Ok(Response::DryRunReport(r)) => render_dry_run_report(out, &r),
+            Err(e) => report_err(out, &e, &mut state.exit_code),
             _ => {}
         }
         return;
     }
 
-    println!("Remove node_id={} from the cluster voter set?", node_id);
-    println!("This is irreversible. Type the node id again to confirm:");
+    // The double-confirm is interactive — only meaningful in human
+    // mode. JSON-mode callers are scripts; we still require the
+    // confirmation but document that it must be piped on stdin.
+    out.info(format!("Remove node_id={} from the cluster voter set?", node_id));
+    out.info("This is irreversible. Type the node id again to confirm:");
     let mut input = String::new();
     if std::io::stdin().read_line(&mut input).is_err() {
-        println!("% Could not read confirmation — aborting.");
+        out.error("Could not read confirmation — aborting.");
+        state.exit_code = 1;
         return;
     }
     let typed = input.trim();
     if typed != node_id.to_string() {
-        println!("% Confirmation did not match — aborting.");
+        out.error("Confirmation did not match — aborting.");
+        state.exit_code = 1;
         return;
     }
 
@@ -3133,10 +3745,9 @@ fn cluster_remove(state: &mut ShellState, node_id: u64, dry_run: bool) {
     match rpc.call(Request::ClusterRemoveNode { node_id }) {
         Ok(Response::Ok) => {
             info!("Removed node_id={} from the cluster", node_id);
-            println!("Node {} removed.", node_id);
+            out.ok(format!("Node {} removed.", node_id));
         }
-        Err(RpcError::Proto(e)) => println!("% {}", e.message),
-        Err(e) => println!("% Error: {}", e),
+        Err(e) => report_err(out, &e, &mut state.exit_code),
         _ => {}
     }
 }
@@ -3163,11 +3774,16 @@ fn cluster_remove(state: &mut ShellState, node_id: u64, dry_run: bool) {
 ///     needs a persistent source for restarts to work
 fn cluster_join_remote(state: &mut ShellState, target: &str) {
     if !has_rpc(state) { return; }
+    let out = state.out;
 
     // ---- 1. Parse user@host[:port] -----------------------------
     let (user, host, port) = match parse_ssh_target(target) {
         Ok(t) => t,
-        Err(msg) => { println!("% {}", msg); return; }
+        Err(msg) => {
+            out.error_coded("PARSE", msg);
+            state.exit_code = 2;
+            return;
+        }
     };
 
     // ---- 2. Read passphrase from local env ---------------------
@@ -3181,7 +3797,11 @@ fn cluster_join_remote(state: &mut ShellState, target: &str) {
         _ => {
             match rpassword::prompt_password("Cluster passphrase (also needed on the remote host): ") {
                 Ok(p) if !p.is_empty() => p,
-                _ => { println!("% No passphrase supplied — aborting."); return; }
+                _ => {
+                    out.error("No passphrase supplied — aborting.");
+                    state.exit_code = 1;
+                    return;
+                }
             }
         }
     };
@@ -3191,31 +3811,34 @@ fn cluster_join_remote(state: &mut ShellState, target: &str) {
     let token = match rpc.call(Request::ClusterMintToken { ttl_seconds: Some(600) }) {
         Ok(Response::ClusterToken(t)) => t.token,
         Err(RpcError::Proto(e)) => {
-            println!("% Could not mint join token: {}", e.message);
-            println!("%   Tip: in M12 only the bootstrap node holds the token-HMAC secret.");
-            println!("%        Reconnect to it via 'config' / 'connect' first.");
+            out.error_coded(format!("E{}", e.code), format!("Could not mint join token: {}", e.message));
+            out.info("  Tip: only the bootstrap node holds the token-HMAC secret.");
+            out.info("       Reconnect to it via 'config' / 'connect' first.");
+            state.exit_code = 1;
             return;
         }
-        Err(e) => { println!("% Error minting token: {}", e); return; }
+        Err(e) => { report_rpc_err(out, &e, &mut state.exit_code); return; }
         _ => return,
     };
 
     // ---- 4. Fetch CA cert + bootstrap advertise addr -----------
     let ca_pem = match rpc.call(Request::ClusterGetCa) {
         Ok(Response::ClusterCaCert(pem)) => pem,
-        Err(RpcError::Proto(e)) => { println!("% Could not fetch CA: {}", e.message); return; }
-        Err(e) => { println!("% Error fetching CA: {}", e); return; }
+        Err(e) => { report_err(out, &e, &mut state.exit_code); return; }
         _ => return,
     };
     let seed_advertise = match rpc.call(Request::ClusterStatus) {
         Ok(Response::ClusterStatus(s)) => {
             match s.members.iter().find(|m| m.node_id == s.self_id) {
                 Some(m) => m.advertise_addr.clone(),
-                None    => { println!("% Could not find self in cluster status"); return; }
+                None    => {
+                    out.error("Could not find self in cluster status");
+                    state.exit_code = 1;
+                    return;
+                }
             }
         }
-        Err(RpcError::Proto(e)) => { println!("% {}", e.message); return; }
-        Err(e) => { println!("% Error: {}", e); return; }
+        Err(e) => { report_err(out, &e, &mut state.exit_code); return; }
         _ => return,
     };
     let initial_member_count = match rpc.call(Request::ClusterStatus) {
@@ -3227,7 +3850,7 @@ fn cluster_join_remote(state: &mut ShellState, target: &str) {
         "cluster join: target={}@{} port={} seed_advertise={}",
         user, host, port.unwrap_or(22), seed_advertise,
     );
-    println!("Joining {}@{} to cluster (seed = {})", user, host, seed_advertise);
+    out.info(format!("Joining {}@{} to cluster (seed = {})", user, host, seed_advertise));
 
     // ---- 5. ssh + drive remote sftpflowd join ------------------
     // Stdin payload, three lines:
@@ -3244,25 +3867,33 @@ fn cluster_join_remote(state: &mut ShellState, target: &str) {
         &seed_advertise,
         &token,
     ) {
-        println!("% Remote join failed: {}", msg);
+        out.error_coded("REMOTE_JOIN", format!("Remote join failed: {}", msg));
+        state.exit_code = 1;
         return;
     }
 
     // ---- 6. Poll cluster_status for the new member -------------
-    println!("Waiting for new node to appear in membership (up to 30s)...");
+    out.info("Waiting for new node to appear in membership (up to 30s)...");
     for _ in 0..30 {
         std::thread::sleep(std::time::Duration::from_secs(1));
         let rpc = state.rpc.as_mut().unwrap();
         if let Ok(Response::ClusterStatus(s)) = rpc.call(Request::ClusterStatus) {
             if s.members.len() > initial_member_count {
-                println!("Joined! Cluster size is now {}.", s.members.len());
+                out.ok_with(
+                    || println!("Joined! Cluster size is now {}.", s.members.len()),
+                    &json!({"joined": true, "cluster_size": s.members.len()}),
+                );
                 return;
             }
         }
     }
-    println!("% Timed out after 30s. The remote join may still complete shortly —");
-    println!("%   re-run 'cluster status' to check, or look at /tmp/sftpflowd-join.log");
-    println!("%   on the remote host for diagnostics.");
+    out.error_coded(
+        "TIMEOUT",
+        "Timed out after 30s. The remote join may still complete shortly — \
+         re-run 'cluster status' to check, or look at /tmp/sftpflowd-join.log \
+         on the remote host for diagnostics.",
+    );
+    state.exit_code = 1;
 }
 
 /// Parse `user@host[:port]` into its three parts. Returns user-readable
@@ -3409,11 +4040,16 @@ fn ssh_drive_remote_join(
 ///   - sftpflowd binary in PATH
 ///   - writable state-dir (default /var/lib/sftpflow)
 ///   - sshd accepting the operator's key
-fn cluster_bootstrap_remote(target: &str) {
+fn cluster_bootstrap_remote(state: &mut ShellState, target: &str) {
+    let out = state.out;
     // ---- 1. Parse user@host[:port] -----------------------------
     let (user, host, port) = match parse_ssh_target(target) {
         Ok(t) => t,
-        Err(msg) => { println!("% {}", msg); return; }
+        Err(msg) => {
+            out.error_coded("PARSE", msg);
+            state.exit_code = 2;
+            return;
+        }
     };
 
     // ---- 2. Read passphrase from env or prompt -----------------
@@ -3427,7 +4063,11 @@ fn cluster_bootstrap_remote(target: &str) {
         _ => {
             match rpassword::prompt_password("Cluster passphrase (also needed on the remote host): ") {
                 Ok(p) if !p.is_empty() => p,
-                _ => { println!("% No passphrase supplied — aborting."); return; }
+                _ => {
+                    out.error("No passphrase supplied — aborting.");
+                    state.exit_code = 1;
+                    return;
+                }
             }
         }
     };
@@ -3436,11 +4076,12 @@ fn cluster_bootstrap_remote(target: &str) {
         "cluster bootstrap: target={}@{} port={}",
         user, host, port.unwrap_or(22),
     );
-    println!("Bootstrapping new cluster on {}@{}...", user, host);
+    out.info(format!("Bootstrapping new cluster on {}@{}...", user, host));
 
     // ---- 3. SSH + drive remote sftpflowd init + run ------------
     if let Err(msg) = ssh_drive_remote_bootstrap(user, host, port, &passphrase) {
-        println!("% Remote bootstrap failed: {}", msg);
+        out.error_coded("REMOTE_BOOTSTRAP", format!("Remote bootstrap failed: {}", msg));
+        state.exit_code = 1;
         return;
     }
 
@@ -3448,17 +4089,28 @@ fn cluster_bootstrap_remote(target: &str) {
     // The CLI talks to the daemon over SSH (NDJSON tunnel), not the
     // Raft port. So the post-bootstrap hint walks the operator
     // through pointing the CLI's `server` config at the new host.
-    println!();
-    println!("Cluster bootstrapped. Daemon is running on {} (Raft on :7900).", host);
-    println!("Point this CLI at it:");
-    println!("  configure terminal");
-    println!("  server host {}", host);
-    if let Some(p) = port {
-        println!("  server port {}", p);
-    }
-    println!("  server username {}", user);
-    println!("  end");
-    println!("  connect");
+    out.ok_with(
+        || {
+            println!();
+            println!("Cluster bootstrapped. Daemon is running on {} (Raft on :7900).", host);
+            println!("Point this CLI at it:");
+            println!("  configure terminal");
+            println!("  server host {}", host);
+            if let Some(p) = port {
+                println!("  server port {}", p);
+            }
+            println!("  server username {}", user);
+            println!("  end");
+            println!("  connect");
+        },
+        &json!({
+            "bootstrapped": true,
+            "host":      host,
+            "port":      port,
+            "username":  user,
+            "raft_port": 7900,
+        }),
+    );
 }
 
 /// Spawn ssh, pipe just the passphrase on stdin, and drive

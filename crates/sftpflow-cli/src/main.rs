@@ -8,7 +8,10 @@ pub use sftpflow_core as feed;
 mod cli;       // cli.rs - interactive shell loop and command dispatch
 mod commands;  // commands.rs - command implementations
 mod completer; // completer.rs - rustyline tab-completion helper
+mod output;    // output.rs - human / JSON / quiet output helpers
 pub mod rpc;   // rpc.rs - RPC client for talking to sftpflowd
+
+use crate::output::{Output, OutputMode};
 
 fn main() {
     // Initialize logging (set RUST_LOG=info to see log output)
@@ -16,70 +19,60 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
 
-    // Parse --socket <addr> for dev/direct-connect mode.
-    // Falls back to SFTPFLOW_SOCKET env var (used by dkron workers).
-    let socket_addr = parse_socket_arg(&args)
+    // ----------------------------------------------------------
+    // Parse global flags
+    // ----------------------------------------------------------
+    //
+    // Global flags can appear anywhere on the command line — we
+    // strip them out into a separate vector so the remaining
+    // tokens are just the (optional) command + its args.
+    //
+    //   sftpflow --json show feeds
+    //   sftpflow show --json feeds        (also accepted)
+    //   sftpflow -q --socket /tmp/s show feeds
+    //
+    // After parsing, `positional` holds whatever's left. Empty =>
+    // interactive shell; non-empty => one-shot non-interactive run.
+    let parsed = parse_global_flags(&args[1..]);
+
+    // SFTPFLOW_SOCKET env var still supported as a fallback for
+    // dkron workers that invoke `sftpflow run` without flags.
+    let socket_addr = parsed.socket_addr
         .or_else(|| std::env::var("SFTPFLOW_SOCKET").ok());
 
-    // Non-interactive mode: sftpflow run <feed-name>
-    // This is how dkron worker nodes invoke sftpflow. Connects to
-    // the daemon via RPC and sends RunFeedNow.
-    if args.len() >= 3 && args[1] == "run" {
-        let feed_name = &args[2];
-        let config = feed::Config::load();
+    let out = Output {
+        mode: if parsed.json { OutputMode::Json } else { OutputMode::Human },
+        quiet: parsed.quiet,
+    };
 
-        // Connect to daemon: prefer --socket if given, otherwise SSH
-        let mut client = if let Some(ref addr) = socket_addr {
-            match rpc::RpcClient::connect_socket(addr) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("% Failed to connect to daemon at {}: {}", addr, e);
-                    process::exit(1);
-                }
-            }
-        } else {
-            match rpc::RpcClient::connect_ssh(&config.server) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("% Failed to connect to daemon via SSH: {}", e);
-                    process::exit(1);
-                }
-            }
-        };
-
-        // Send RunFeedNow RPC
-        use sftpflow_proto::{Request, Response, RunStatus};
-        match client.call(Request::RunFeedNow { name: feed_name.to_string() }) {
-            Ok(Response::RunResult(result)) => {
-                println!(
-                    "Feed '{}': status={:?}, files_transferred={}",
-                    result.feed, result.status, result.files_transferred
-                );
-                if let Some(ref msg) = result.message {
-                    println!("  {}", msg);
-                }
-                match result.status {
-                    RunStatus::Success | RunStatus::Noaction => process::exit(0),
-                    RunStatus::Failed => process::exit(1),
-                }
-            }
-            Ok(other) => {
-                eprintln!("% Unexpected response: {:?}", other);
-                process::exit(1);
-            }
-            Err(e) => {
-                eprintln!("% RPC error: {}", e);
-                process::exit(1);
-            }
-        }
+    // ----------------------------------------------------------
+    // Non-interactive mode: run one command and exit.
+    // ----------------------------------------------------------
+    //
+    // Triggered by any positional arg(s) being present. Replaces
+    // the old special-cased `sftpflow run <feed>` block — that
+    // path now goes through the same dispatch as any other
+    // command, so `sftpflow show feeds`, `sftpflow cluster status`,
+    // and `sftpflow run feed nightly` all work uniformly.
+    if !parsed.positional.is_empty() {
+        let exit_code = cli::run_one_shot(socket_addr, out, &parsed.positional);
+        process::exit(exit_code);
     }
 
+    // ----------------------------------------------------------
     // Interactive shell
-    println!("SFTPflow v{}", env!("CARGO_PKG_VERSION"));
-    println!("Type 'help' for a list of commands.\n");
+    // ----------------------------------------------------------
+    //
+    // The startup banner is suppressed in JSON / quiet mode so a
+    // script that opens an interactive session via -i (rare, but
+    // possible) doesn't see a spurious version line.
+    if out.is_human() && !out.quiet {
+        println!("SFTPflow v{}", env!("CARGO_PKG_VERSION"));
+        println!("Type 'help' for a list of commands.\n");
+    }
 
-    if let Err(e) = cli::run(socket_addr) {
-        eprintln!("Error: {}", e);
+    if let Err(e) = cli::run(socket_addr, out) {
+        out.error(format!("{}", e));
         process::exit(1);
     }
 }
@@ -88,14 +81,48 @@ fn main() {
 // Argument helpers
 // ============================================================
 
-/// Scan for `--socket <addr>`. Returns Some(addr) if present.
-fn parse_socket_arg(args: &[String]) -> Option<String> {
-    let mut i = 1;
+#[derive(Default)]
+struct ParsedArgs {
+    socket_addr: Option<String>,
+    json:        bool,
+    quiet:       bool,
+    positional:  Vec<String>,
+}
+
+/// Walk argv (excluding argv[0]), pulling out global flags and
+/// leaving any non-flag tokens in `positional`. Unrecognized flags
+/// pass through as positional tokens — the dispatch path handles
+/// them as command syntax errors, which keeps this parser permissive.
+fn parse_global_flags(args: &[String]) -> ParsedArgs {
+    let mut parsed = ParsedArgs::default();
+    let mut i = 0;
     while i < args.len() {
-        if args[i] == "--socket" && i + 1 < args.len() {
-            return Some(args[i + 1].clone());
+        match args[i].as_str() {
+            "--socket" => {
+                if i + 1 < args.len() {
+                    parsed.socket_addr = Some(args[i + 1].clone());
+                    i += 2;
+                    continue;
+                } else {
+                    eprintln!("% --socket requires an argument");
+                    process::exit(2);
+                }
+            }
+            "--json" => {
+                parsed.json = true;
+                i += 1;
+                continue;
+            }
+            "-q" | "--quiet" => {
+                parsed.quiet = true;
+                i += 1;
+                continue;
+            }
+            other => {
+                parsed.positional.push(other.to_string());
+                i += 1;
+            }
         }
-        i += 1;
     }
-    None
+    parsed
 }

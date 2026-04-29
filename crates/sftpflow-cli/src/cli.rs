@@ -14,6 +14,7 @@ use sftpflow_proto::{Request, Response}; // sftpflow-proto
 use crate::commands; // commands.rs
 use crate::completer::{HelperData, NameCache, ShellHelper}; // completer.rs
 use crate::feed::{Config, Endpoint, Feed, NextStep, PgpKey, ServerConnection}; // feed.rs
+use crate::output::Output; // output.rs
 use crate::rpc::RpcClient; // rpc.rs
 
 /// Shell modes, similar to Cisco IOS privilege levels.
@@ -42,6 +43,14 @@ pub struct ShellState {
     pub rpc: Option<RpcClient>,
     /// Socket address for direct-connect (dev) mode; None = use SSH.
     pub socket_addr: Option<String>,
+    /// Output mode (human / JSON) + quiet flag. Copied locally inside
+    /// most command handlers as `let out = state.out;` so the &mut
+    /// borrow on `rpc` doesn't conflict with reads of `out`.
+    pub out: Output,
+    /// Process exit code in non-interactive mode. Commands set this
+    /// to non-zero to signal failure (rpc errors, run failures, etc.);
+    /// the shell loop ignores it.
+    pub exit_code: i32,
     /// Staging area: uncommitted edits to the feed being configured.
     pub pending_feed: Option<Feed>,
     /// Staging area: uncommitted edits to the endpoint being configured.
@@ -55,7 +64,7 @@ pub struct ShellState {
 }
 
 impl ShellState {
-    pub fn new(socket_addr: Option<String>) -> Self {
+    pub fn new(socket_addr: Option<String>, out: Output) -> Self {
         let config = Config::load();
         let mut state = ShellState {
             mode: Mode::Exec,
@@ -63,6 +72,8 @@ impl ShellState {
             config,
             rpc: None,
             socket_addr,
+            out,
+            exit_code: 0,
             pending_feed: None,
             pending_endpoint: None,
             pending_key: None,
@@ -75,14 +86,21 @@ impl ShellState {
 
     /// Attempt to connect to the daemon. Uses socket_addr (dev) or
     /// SSH via ServerConnection (prod).
+    ///
+    /// All status output here goes through `out.info` (banner-class) —
+    /// suppressed in JSON / quiet mode so a one-shot `sftpflow --json
+    /// show feeds` emits exactly one JSON document. If the connection
+    /// fails the `rpc` field stays None and the command's `has_rpc`
+    /// guard surfaces a clean NOT_CONNECTED error downstream.
     pub fn try_connect(&mut self) {
         self.rpc = None;
+        let out = self.out;
 
         let mut rpc = if let Some(ref addr) = self.socket_addr {
             match RpcClient::connect_socket(addr) {
                 Ok(r) => r,
                 Err(e) => {
-                    eprintln!("% Could not connect to {}: {}", addr, e);
+                    out.info(format!("Could not connect to {}: {}", addr, e));
                     return;
                 }
             }
@@ -91,8 +109,8 @@ impl ShellState {
             match RpcClient::connect_ssh(&server) {
                 Ok(r) => r,
                 Err(e) => {
-                    eprintln!("% Could not connect to daemon: {}", e);
-                    eprintln!("% Use 'config' to set server settings, then 'connect'.");
+                    out.info(format!("Could not connect to daemon: {}", e));
+                    out.info("Use 'config' to set server settings, then 'connect'.");
                     return;
                 }
             }
@@ -102,11 +120,13 @@ impl ShellState {
         use sftpflow_proto::{Request, Response};
         match rpc.call(Request::GetServerInfo) {
             Ok(Response::ServerInfo(info)) => {
-                println!("Connected to sftpflowd v{} ({}, up {}s)",
-                    info.version, info.hostname, info.uptime_seconds);
+                out.info(format!(
+                    "Connected to sftpflowd v{} ({}, up {}s)",
+                    info.version, info.hostname, info.uptime_seconds,
+                ));
             }
-            Ok(_) => println!("Connected to daemon."),
-            Err(e) => eprintln!("% Warning: server info unavailable: {}", e),
+            Ok(_) => out.info("Connected to daemon."),
+            Err(e) => out.info(format!("Warning: server info unavailable: {}", e)),
         }
 
         self.rpc = Some(rpc);
@@ -125,9 +145,30 @@ impl ShellState {
     }
 }
 
+/// One-shot non-interactive entry point.
+///
+/// Builds a transient ShellState, dispatches `argv` as if the operator
+/// had typed it at the prompt, then returns the resulting exit code.
+/// Used by `sftpflow show feeds`, `sftpflow run feed nightly`, etc.
+///
+/// The `argv` here is already-tokenized — we just join with spaces and
+/// pass through the same dispatch path as the interactive REPL, so
+/// non-interactive output is byte-identical to what an operator would
+/// see typing the same command interactively.
+pub fn run_one_shot(socket_addr: Option<String>, out: Output, argv: &[String]) -> i32 {
+    let mut state = ShellState::new(socket_addr, out);
+
+    // Stitch argv back into a single line so dispatch's split_whitespace
+    // sees the same tokens. (The shell flow takes a string anyway.)
+    let line = argv.join(" ");
+    dispatch(&line, &mut state);
+
+    state.exit_code
+}
+
 /// Main entry point for the interactive shell.
-pub fn run(socket_addr: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
-    let mut state = ShellState::new(socket_addr);
+pub fn run(socket_addr: Option<String>, out: Output) -> Result<(), Box<dyn std::error::Error>> {
+    let mut state = ShellState::new(socket_addr, out);
 
     // Shared state between the readline editor and the loop.
     // The completer reads `mode` + `names`; the loop syncs them
@@ -283,7 +324,7 @@ fn dispatch_invalidates_names(line: &str, mode: &Mode) -> bool {
 // ---- Command dispatch ----
 
 /// Parse the input line and route to the appropriate command handler.
-fn dispatch(line: &str, state: &mut ShellState) {
+pub(crate) fn dispatch(line: &str, state: &mut ShellState) {
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.is_empty() {
         return;
@@ -305,7 +346,7 @@ fn dispatch(line: &str, state: &mut ShellState) {
 /// Dispatch commands available in exec mode.
 fn dispatch_exec(cmd: &str, args: &[&str], state: &mut ShellState) {
     match cmd {
-        "help" | "?"       => commands::help_exec(),
+        "help" | "?"       => commands::help_exec(state),
         "create"           => commands::create(args, state),
         "edit"             => commands::edit(args, state),
         "delete"           => commands::delete(args, state),
@@ -319,15 +360,21 @@ fn dispatch_exec(cmd: &str, args: &[&str], state: &mut ShellState) {
         "cluster"          => commands::cluster(args, state),
         "config"           => commands::enter_config(state),
         "exit" | "quit"    => commands::exit_shell(state),
-        "version"          => commands::version(),
-        _ => println!("% Unknown command: '{}'. Type 'help' for available commands.", cmd),
+        "version"          => commands::version(state),
+        _ => {
+            state.out.error_coded(
+                "USAGE",
+                format!("Unknown command: '{}'. Type 'help' for available commands.", cmd),
+            );
+            state.exit_code = 2;
+        }
     }
 }
 
 /// Dispatch commands available in endpoint-edit mode.
 fn dispatch_endpoint_edit(cmd: &str, args: &[&str], state: &mut ShellState) {
     match cmd {
-        "help" | "?"       => commands::help_endpoint_edit(),
+        "help" | "?"       => commands::help_endpoint_edit(state),
         "protocol"         => commands::set_protocol(args, state),
         "host"             => commands::set_host(args, state),
         "port"             => commands::set_port(args, state),
@@ -344,14 +391,20 @@ fn dispatch_endpoint_edit(cmd: &str, args: &[&str], state: &mut ShellState) {
         "commit"           => commands::commit_endpoint(state),
         "abort"            => commands::abort_endpoint(state),
         "exit" | "end"     => commands::exit_endpoint_edit(state),
-        _ => println!("% Unknown command: '{}'. Type 'help' for available commands.", cmd),
+        _ => {
+            state.out.error_coded(
+                "USAGE",
+                format!("Unknown command: '{}'. Type 'help' for available commands.", cmd),
+            );
+            state.exit_code = 2;
+        }
     }
 }
 
 /// Dispatch commands available in key-edit mode.
 fn dispatch_key_edit(cmd: &str, args: &[&str], state: &mut ShellState) {
     match cmd {
-        "help" | "?"       => commands::help_key_edit(),
+        "help" | "?"       => commands::help_key_edit(state),
         "type"             => commands::set_key_type(args, state),
         "contents"         => commands::set_key_contents(args, state),
         "contents_ref"     => commands::set_key_contents_ref(args, state),
@@ -361,14 +414,20 @@ fn dispatch_key_edit(cmd: &str, args: &[&str], state: &mut ShellState) {
         "commit"           => commands::commit_key(state),
         "abort"            => commands::abort_key(state),
         "exit" | "end"     => commands::exit_key_edit(state),
-        _ => println!("% Unknown command: '{}'. Type 'help' for available commands.", cmd),
+        _ => {
+            state.out.error_coded(
+                "USAGE",
+                format!("Unknown command: '{}'. Type 'help' for available commands.", cmd),
+            );
+            state.exit_code = 2;
+        }
     }
 }
 
 /// Dispatch commands available in feed-edit mode.
 fn dispatch_feed_edit(cmd: &str, args: &[&str], state: &mut ShellState) {
     match cmd {
-        "help" | "?"       => commands::help_feed_edit(),
+        "help" | "?"       => commands::help_feed_edit(state),
         "source"           => commands::set_source(args, state),
         "destination"      => commands::set_destination(args, state),
         "process"          => commands::add_process(args, state),
@@ -381,14 +440,20 @@ fn dispatch_feed_edit(cmd: &str, args: &[&str], state: &mut ShellState) {
         "commit"           => commands::commit_feed(state),
         "abort"            => commands::abort_feed(state),
         "exit" | "end"     => commands::exit_feed_edit(state),
-        _ => println!("% Unknown command: '{}'. Type 'help' for available commands.", cmd),
+        _ => {
+            state.out.error_coded(
+                "USAGE",
+                format!("Unknown command: '{}'. Type 'help' for available commands.", cmd),
+            );
+            state.exit_code = 2;
+        }
     }
 }
 
 /// Dispatch commands available in nextstep-edit mode.
 fn dispatch_nextstep_edit(cmd: &str, args: &[&str], state: &mut ShellState) {
     match cmd {
-        "help" | "?"       => commands::help_nextstep_edit(),
+        "help" | "?"       => commands::help_nextstep_edit(state),
         "type"             => commands::set_nextstep_type(args, state),
         "target"           => commands::set_nextstep_target(args, state),
         "on"               => commands::add_nextstep_condition(args, state),
@@ -396,14 +461,20 @@ fn dispatch_nextstep_edit(cmd: &str, args: &[&str], state: &mut ShellState) {
         "show"             => commands::show_pending_nextstep(state),
         "done"             => commands::done_nextstep(state),
         "abort"            => commands::abort_nextstep(state),
-        _ => println!("% Unknown command: '{}'. Type 'help' for available commands.", cmd),
+        _ => {
+            state.out.error_coded(
+                "USAGE",
+                format!("Unknown command: '{}'. Type 'help' for available commands.", cmd),
+            );
+            state.exit_code = 2;
+        }
     }
 }
 
 /// Dispatch commands available in config-edit mode (server connection).
 fn dispatch_config_edit(cmd: &str, args: &[&str], state: &mut ShellState) {
     match cmd {
-        "help" | "?"       => commands::help_config_edit(),
+        "help" | "?"       => commands::help_config_edit(state),
         "host"             => commands::set_server_host(args, state),
         "port"             => commands::set_server_port(args, state),
         "username"         => commands::set_server_username(args, state),
@@ -413,7 +484,13 @@ fn dispatch_config_edit(cmd: &str, args: &[&str], state: &mut ShellState) {
         "commit"           => commands::commit_server(state),
         "abort"            => commands::abort_server(state),
         "exit" | "end"     => commands::exit_config_edit(state),
-        _ => println!("% Unknown command: '{}'. Type 'help' for available commands.", cmd),
+        _ => {
+            state.out.error_coded(
+                "USAGE",
+                format!("Unknown command: '{}'. Type 'help' for available commands.", cmd),
+            );
+            state.exit_code = 2;
+        }
     }
 }
 
