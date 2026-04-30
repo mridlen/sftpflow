@@ -10,6 +10,56 @@ use std::path::PathBuf;
 use log::info;
 
 // ============================================================
+// Identifier validation
+// ============================================================
+
+/// Strict allowlist for operator-supplied identifiers (feed names,
+/// endpoint names, key names, secret names, connection names).
+///
+/// Allowed: ASCII letters, digits, dash, underscore, dot. The first
+/// character must be alphanumeric to keep names from looking like
+/// CLI flags. Length capped at 64 bytes.
+///
+/// Why an allowlist rather than escaping at the use site: these
+/// names flow into shell command strings (dkron `shell` executor),
+/// HTTP path components (dkron job names), filesystem paths
+/// (audit/history exports), and YAML keys. Centralizing the rule
+/// here closes the door on injection across every downstream sink.
+pub fn validate_name(kind: &str, name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err(format!("{} name cannot be empty", kind));
+    }
+    if name.len() > 64 {
+        return Err(format!(
+            "{} name '{}' exceeds 64-character limit",
+            kind, name,
+        ));
+    }
+    let mut chars = name.chars();
+    let first = chars.next().unwrap();
+    if !first.is_ascii_alphanumeric() {
+        return Err(format!(
+            "{} name '{}' must start with a letter or digit",
+            kind, name,
+        ));
+    }
+    for c in name.chars() {
+        let ok = c.is_ascii_alphanumeric()
+            || c == '-'
+            || c == '_'
+            || c == '.';
+        if !ok {
+            return Err(format!(
+                "{} name '{}' contains invalid character '{}'; \
+                 use letters, digits, '-', '_', '.'",
+                kind, name, c,
+            ));
+        }
+    }
+    Ok(())
+}
+
+// ============================================================
 // Endpoint - connection details
 // ============================================================
 
@@ -97,6 +147,28 @@ pub struct Endpoint {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ssh_key_ref: Option<String>,
 
+    // ---- SFTP-specific options ----
+    /// Expected SSH host-key fingerprint (SFTP only).
+    ///
+    /// Format: standard OpenSSH SHA-256 form, e.g.
+    /// `SHA256:nThbg6kXUpJWGl7E1IGOCspRomTxdCARLviKw6E5SY8`
+    /// (the same string `ssh-keygen -lf <known_hosts>` prints).
+    ///
+    /// When set, the daemon refuses to authenticate unless the
+    /// server's presented host key hashes to this value. This
+    /// stops an on-path attacker from impersonating the partner
+    /// SFTP server and harvesting credentials/data.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_key_fingerprint: Option<String>,
+    /// Whether to enforce host-key verification (SFTP only).
+    /// None = default true. Operators may set `Some(false)` for
+    /// dev/legacy endpoints where a fingerprint is not yet known,
+    /// matching the FTPS `verify_tls` opt-out pattern. Disabling
+    /// host-key verification exposes the connection to MITM —
+    /// the daemon logs a loud warning each time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verify_host_key: Option<bool>,
+
     // ---- FTP/FTPS-specific options ----
     /// TLS negotiation style (FTPS only). None = default Explicit.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -136,6 +208,14 @@ impl Endpoint {
             (Some(r), _)    => println!("  ssh_key     (ref: {})", r),
             (None, Some(v)) => println!("  ssh_key     {}", v),
             (None, None)    => println!("  ssh_key     (not set)"),
+        }
+
+        // SFTP host-key fields only printed for SFTP endpoints.
+        if matches!(self.protocol, Protocol::Sftp) {
+            let verify = self.verify_host_key.unwrap_or(true);
+            println!("  verify_host_key  {}", verify);
+            println!("  host_key_fp      {}",
+                self.host_key_fingerprint.as_deref().unwrap_or("(not set)"));
         }
 
         // FTP/FTPS extras only printed when relevant, to avoid

@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use log::info;
+use log::{info, warn};
 use russh::client;
 use russh::keys::ssh_key;
 use russh::keys::PrivateKeyWithHashAlg;
@@ -22,25 +22,91 @@ use sftpflow_core::Endpoint;
 use crate::{Transport, TransportError};
 
 // ============================================================
-// SSH client handler — accepts all host keys for now
+// SSH client handler — host-key verification
 // ============================================================
 
-/// Minimal SSH client handler. Accepts any server host key.
-/// Host-key verification is deferred to milestone 11
-/// (credential security).
-struct SshHandler;
+/// SSH client handler that pins the server host key against an
+/// operator-configured fingerprint.
+///
+/// Behavior controlled by `Endpoint`:
+///   * `verify_host_key = Some(false)` — accept any key, log a
+///     loud warning. Mirrors the FTPS `verify_tls=false` opt-out.
+///   * `host_key_fingerprint = Some("SHA256:...")` — accept only
+///     when the presented key's SHA-256 fingerprint matches.
+///   * Neither set / `verify_host_key = None` — refuse to connect.
+///     Failing closed is the right default; an unconfigured
+///     endpoint is exactly the case where MITM would succeed.
+struct SshHandler {
+    endpoint_name: String,
+    expected_fingerprint: Option<String>,
+    verify_host_key: bool,
+}
 
 impl client::Handler for SshHandler {
     type Error = russh::Error;
 
     fn check_server_key(
         &mut self,
-        _server_public_key: &ssh_key::PublicKey,
+        server_public_key: &ssh_key::PublicKey,
     ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send
     {
-        // Accept all host keys (trust-on-first-use not yet
-        // implemented)
-        async { Ok(true) }
+        // Compute the SHA-256 fingerprint up front so the async
+        // block below stays self-contained.
+        let presented = server_public_key
+            .fingerprint(ssh_key::HashAlg::Sha256)
+            .to_string();
+        let endpoint_name = self.endpoint_name.clone();
+        let verify = self.verify_host_key;
+        let expected = self.expected_fingerprint.clone();
+
+        async move {
+            // ---- explicit opt-out ----
+            // Operator set verify_host_key=false. Log loudly so
+            // the audit trail makes the trade-off visible.
+            if !verify {
+                warn!(
+                    "sftp connect: host-key verification DISABLED for \
+                     endpoint '{}' (verify_host_key=false). Presented key: {}. \
+                     Connection is vulnerable to MITM.",
+                    endpoint_name, presented,
+                );
+                return Ok(true);
+            }
+
+            // ---- pin against configured fingerprint ----
+            match expected {
+                Some(want) => {
+                    let want = want.trim();
+                    if presented == want {
+                        info!(
+                            "sftp connect: host key verified for endpoint '{}' ({})",
+                            endpoint_name, presented,
+                        );
+                        Ok(true)
+                    } else {
+                        warn!(
+                            "sftp connect: host-key MISMATCH for endpoint '{}'. \
+                             Expected {}, server presented {}. Refusing connection.",
+                            endpoint_name, want, presented,
+                        );
+                        Ok(false)
+                    }
+                }
+                None => {
+                    // No fingerprint pinned and verification not
+                    // explicitly disabled — fail closed. Operator
+                    // must either set host_key_fingerprint or
+                    // explicitly opt out via verify_host_key=false.
+                    warn!(
+                        "sftp connect: endpoint '{}' has no host_key_fingerprint \
+                         configured and verify_host_key is not set to false. \
+                         Refusing connection. Server presented: {}",
+                        endpoint_name, presented,
+                    );
+                    Ok(false)
+                }
+            }
+        }
     }
 }
 
@@ -82,8 +148,17 @@ impl SftpTransport {
         );
 
         // ---- SSH connection ----
+        // Host-key verification policy is decided per-endpoint:
+        // see SshHandler::check_server_key. Default is fail-closed
+        // when neither host_key_fingerprint nor verify_host_key
+        // is set, so old configs surface the missing pin loudly
+        // rather than silently trusting any peer.
         let config = Arc::new(client::Config::default());
-        let handler = SshHandler;
+        let handler = SshHandler {
+            endpoint_name: name.to_string(),
+            expected_fingerprint: endpoint.host_key_fingerprint.clone(),
+            verify_host_key: endpoint.verify_host_key.unwrap_or(true),
+        };
 
         let mut handle = client::connect(
             config,
@@ -92,8 +167,13 @@ impl SftpTransport {
         )
         .await
         .map_err(|e| {
+            // russh maps a `check_server_key -> Ok(false)` to a
+            // "no common key" / disconnect error. Surface that as
+            // an explicit host-key failure so operators can tell
+            // it apart from network/auth problems.
             TransportError::Connection(format!(
-                "SSH connect to {}:{} failed: {}",
+                "SSH connect to {}:{} failed (this may indicate a \
+                 host-key verification failure — see daemon log): {}",
                 host, port, e
             ))
         })?;

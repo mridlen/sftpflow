@@ -23,7 +23,7 @@ use std::time::{Instant, SystemTime};
 
 use log::{error, info, warn};
 
-use sftpflow_core::{Config, Endpoint, NextStepAction, PgpKey, ProcessStep};
+use sftpflow_core::{validate_name, Config, Endpoint, NextStepAction, PgpKey, ProcessStep};
 use sftpflow_proto::{
     error_code,
     ClusterMemberInfo,
@@ -337,6 +337,20 @@ pub fn put_feed(
     name: String,
     feed: sftpflow_core::Feed,
 ) -> Result<Response, ProtoError> {
+    // Strict allowlist on feed names. Feed names flow into the
+    // dkron `shell` executor as a `sh -c "sftpflow run <name>"`
+    // command string, into HTTP path components for dkron job
+    // ids, and into YAML keys. Reject anything that could break
+    // out of any of those contexts at the source rather than
+    // escape per use site.
+    validate_name("feed", &name).map_err(|msg| {
+        ProtoError::with_hint(
+            error_code::INVALID_PARAMS,
+            msg,
+            "use letters, digits, '-', '_', '.' (max 64 chars; first char alphanumeric)",
+        )
+    })?;
+
     let existed = state.config.feeds.contains_key(&name);
     state.config.feeds.insert(name.clone(), feed);
     save(&state.config)?;
@@ -369,6 +383,17 @@ pub fn rename_feed(
     from: String,
     to: String,
 ) -> Result<Response, ProtoError> {
+    // Same allowlist as put_feed — the new name flows to dkron's
+    // shell executor, so an unvalidated rename is the same hole
+    // as an unvalidated put.
+    validate_name("feed", &to).map_err(|msg| {
+        ProtoError::with_hint(
+            error_code::INVALID_PARAMS,
+            msg,
+            "use letters, digits, '-', '_', '.' (max 64 chars; first char alphanumeric)",
+        )
+    })?;
+
     if !state.config.feeds.contains_key(&from) {
         return Err(not_found("feed", &from));
     }

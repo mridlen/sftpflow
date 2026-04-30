@@ -233,10 +233,19 @@ impl DkronClient {
         let mut tags = HashMap::new();
         tags.insert("role".to_string(), "sftpflow-worker:1".to_string());
 
+        // Defense in depth: feed names are already allowlisted in
+        // handlers::put_feed (`validate_name`), so no shell metas
+        // can reach here. The single-quote wrap below is belt-and-
+        // suspenders against (a) future call sites that forget the
+        // handler validation, and (b) anyone who tries to relax
+        // the allowlist without thinking through the dkron `shell`
+        // executor path. The dkron `shell` executor runs `command`
+        // through `sh -c`, so unquoted interpolation would be a
+        // straight injection.
         let mut executor_config = HashMap::new();
         executor_config.insert(
             "command".to_string(),
-            format!("sftpflow run {}", feed_name),
+            format!("sftpflow run {}", shell_single_quote(feed_name)),
         );
 
         let body = DkronJobBody {
@@ -299,5 +308,50 @@ fn is_feed_job(job_name: &str, base: &str) -> bool {
         suffix.parse::<usize>().is_ok()
     } else {
         false
+    }
+}
+
+/// POSIX-shell single-quote escape: wrap in `'...'`, and replace any
+/// embedded `'` with the canonical `'\''` sequence. Inside single
+/// quotes a POSIX shell strips no metacharacters at all, so this
+/// neutralizes `;`, `|`, `&`, `$()`, backticks, redirects, newlines
+/// — every shell-injection vector.
+fn shell_single_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_single_quote_plain() {
+        assert_eq!(shell_single_quote("nightly"), "'nightly'");
+    }
+
+    #[test]
+    fn shell_single_quote_metas_neutralized() {
+        // The injected payload would be `; rm -rf /` if unquoted.
+        assert_eq!(
+            shell_single_quote("nightly; rm -rf /"),
+            "'nightly; rm -rf /'",
+        );
+    }
+
+    #[test]
+    fn shell_single_quote_embedded_quote() {
+        // Operator name with a single quote: must close, escape,
+        // reopen. Result is still a single argument to `sh -c`.
+        assert_eq!(shell_single_quote("a'b"), "'a'\\''b'");
     }
 }
