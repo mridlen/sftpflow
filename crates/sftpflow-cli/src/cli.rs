@@ -64,8 +64,13 @@ pub struct ShellState {
 }
 
 impl ShellState {
-    pub fn new(socket_addr: Option<String>, out: Output) -> Self {
-        let config = Config::load();
+    /// Build a fresh shell state. Returns Err if the on-disk config
+    /// is unreadable or unparseable; callers (`run` / `run_one_shot`)
+    /// surface the error so a typo in `~/.sftpflow/config.yaml` is
+    /// loud, not silently masked by a fresh default that the next
+    /// commit would clobber.
+    pub fn new(socket_addr: Option<String>, out: Output) -> Result<Self, String> {
+        let config = Config::load()?;
         let mut state = ShellState {
             mode: Mode::Exec,
             running: true,
@@ -81,7 +86,7 @@ impl ShellState {
             pending_server: None,
         };
         state.try_connect();
-        state
+        Ok(state)
     }
 
     /// Attempt to connect to the daemon. Uses socket_addr (dev) or
@@ -156,7 +161,17 @@ impl ShellState {
 /// non-interactive output is byte-identical to what an operator would
 /// see typing the same command interactively.
 pub fn run_one_shot(socket_addr: Option<String>, out: Output, argv: &[String]) -> i32 {
-    let mut state = ShellState::new(socket_addr, out);
+    let mut state = match ShellState::new(socket_addr, out) {
+        Ok(s) => s,
+        Err(e) => {
+            // A corrupt config used to silently fall back to defaults
+            // — and the next `commit` would clobber the original. Now
+            // we surface the parse error and exit non-zero so the
+            // operator notices.
+            out.error(format!("{}", e));
+            return 1;
+        }
+    };
 
     // Stitch argv back into a single line so dispatch's split_whitespace
     // sees the same tokens. (The shell flow takes a string anyway.)
@@ -168,7 +183,7 @@ pub fn run_one_shot(socket_addr: Option<String>, out: Output, argv: &[String]) -
 
 /// Main entry point for the interactive shell.
 pub fn run(socket_addr: Option<String>, out: Output) -> Result<(), Box<dyn std::error::Error>> {
-    let mut state = ShellState::new(socket_addr, out);
+    let mut state = ShellState::new(socket_addr, out)?;
 
     // Shared state between the readline editor and the loop.
     // The completer reads `mode` + `names`; the loop syncs them
@@ -198,7 +213,15 @@ pub fn run(socket_addr: Option<String>, out: Output) -> Result<(), Box<dyn std::
                 if line.is_empty() {
                     continue;
                 }
-                let _ = rl.add_history_entry(&line);
+                // Scrub plaintext credentials before they hit the
+                // history file (~/.sftpflow_history). Edit-mode
+                // commands like `password <pw>`, `ssh_key <pem>`,
+                // `contents <pem>` flow verbatim into rustyline;
+                // we replace the value with `********` in the
+                // recorded entry so a stolen history doesn't reveal
+                // the original.
+                let history_line = redact_for_history(&line, &state.mode);
+                let _ = rl.add_history_entry(&history_line);
 
                 // Mark the cache dirty before dispatch so the next
                 // prompt re-fetches if this command may have
@@ -291,6 +314,50 @@ fn list_feed_names(rpc: &mut RpcClient) -> Vec<String> {
 /// list round-trip on the next prompt. `--dry-run` / `-n` anywhere
 /// on the line means the daemon didn't actually write, so the
 /// cache stays valid.
+/// Redact a command line before recording it in rustyline history.
+///
+/// Edit-mode `password <pw>`, `ssh_key <pem>`, `contents <pem>`,
+/// and the top-level `secret add <name> <value>` flow verbatim
+/// into ~/.sftpflow_history otherwise — a stolen history file
+/// would then leak credentials in cleartext. We replace just the
+/// value portion so the operator can still see WHAT they ran in
+/// history (useful for retrying), without seeing the secret.
+fn redact_for_history(line: &str, mode: &Mode) -> String {
+    let trimmed = line.trim_start();
+    // The first token is always the verb. We split into (verb, rest)
+    // so the redacted line preserves any leading whitespace.
+    let (verb, rest) = match trimmed.split_once(char::is_whitespace) {
+        Some((v, r)) => (v, r.trim_start()),
+        None         => return line.to_string(),
+    };
+
+    // Edit-mode credential setters: the value starts at `rest`.
+    let in_edit_mode = !matches!(mode, Mode::Exec);
+    if in_edit_mode {
+        match verb {
+            "password" | "ssh_key" | "contents" => {
+                if !rest.is_empty() {
+                    return format!("{} ********", verb);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // `secret add <name> <value>` — preserve the name token, redact
+    // anything after it.
+    if matches!(mode, Mode::Exec) && verb == "secret" {
+        let mut parts = rest.splitn(3, char::is_whitespace);
+        if let (Some(sub), Some(name), Some(_value)) = (parts.next(), parts.next(), parts.next()) {
+            if sub == "add" && !name.is_empty() {
+                return format!("secret add {} ********", name);
+            }
+        }
+    }
+
+    line.to_string()
+}
+
 fn dispatch_invalidates_names(line: &str, mode: &Mode) -> bool {
     let tokens: Vec<&str> = line.split_whitespace().collect();
     let first = tokens.first().copied().unwrap_or("");

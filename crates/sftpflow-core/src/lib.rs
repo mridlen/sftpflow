@@ -206,7 +206,11 @@ impl Endpoint {
         }
         match (&self.ssh_key_ref, &self.ssh_key) {
             (Some(r), _)    => println!("  ssh_key     (ref: {})", r),
-            (None, Some(v)) => println!("  ssh_key     {}", v),
+            // Don't dump the PEM body — it would scroll the terminal
+            // and could be shoulder-surfed. Show shape only; if the
+            // operator needs the actual key they have it in their
+            // sealed store (or the source they pasted from).
+            (None, Some(v)) => println!("  ssh_key     (inline, {} bytes)", v.len()),
             (None, None)    => println!("  ssh_key     (not set)"),
         }
 
@@ -612,34 +616,46 @@ pub struct Config {
 
 impl Config {
     /// Load config from the YAML file, or return a default if it doesn't exist.
-    pub fn load() -> Self {
+    ///
+    /// Returns Err on read or parse failure rather than silently
+    /// falling back to defaults — silently defaulting on a typo
+    /// causes the next `save()` to clobber the original config,
+    /// which has eaten user data in practice. Callers (CLI startup,
+    /// daemon startup) are expected to surface the error and refuse
+    /// to keep going rather than ship over the operator's work.
+    pub fn load() -> Result<Self, String> {
         let path = config_path();
         if !path.exists() {
             info!("No config file found at {}, using defaults", path.display());
-            return Config::default();
+            return Ok(Config::default());
         }
 
-        let contents = match fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("% Warning: could not read config file: {}", e);
-                return Config::default();
-            }
-        };
+        let contents = fs::read_to_string(&path).map_err(|e| {
+            format!("could not read config file '{}': {}", path.display(), e)
+        })?;
 
-        match serde_yaml::from_str(&contents) {
-            Ok(cfg) => {
-                info!("Loaded config from {}", path.display());
-                cfg
-            }
-            Err(e) => {
-                eprintln!("% Warning: could not parse config file: {}", e);
-                Config::default()
-            }
-        }
+        let cfg: Config = serde_yaml::from_str(&contents).map_err(|e| {
+            format!(
+                "could not parse config file '{}': {} \
+                 (refusing to load defaults — fix or remove the file before retrying)",
+                path.display(), e,
+            )
+        })?;
+
+        info!("Loaded config from {}", path.display());
+        Ok(cfg)
     }
 
     /// Save the config to the YAML file.
+    ///
+    /// Atomic-rename pattern: serialize → write to `<path>.tmp` →
+    /// fsync the temp file → set 0600 perms (Unix) → rename onto
+    /// the live path → fsync the parent directory. A crash at any
+    /// point leaves either the previous good file OR the new file,
+    /// never a half-written one. The 0600 perms keep credentials
+    /// (passwords/keys/dkron tokens that may be embedded inline) off
+    /// the world-readable bucket — `fs::write` would otherwise honor
+    /// the process umask.
     pub fn save(&self) -> Result<(), String> {
         let path = config_path();
 
@@ -652,12 +668,72 @@ impl Config {
         let yaml = serde_yaml::to_string(self)
             .map_err(|e| format!("Could not serialize config: {}", e))?;
 
-        fs::write(&path, &yaml)
-            .map_err(|e| format!("Could not write config file: {}", e))?;
+        // atomic_write_yaml() - below
+        atomic_write_yaml(&path, yaml.as_bytes())?;
 
         info!("Config saved to {}", path.display());
         Ok(())
     }
+}
+
+/// Write `bytes` to `path` atomically with restrictive permissions.
+///
+/// Steps:
+///   1. Stage to `<path>.tmp` (clobbering any leftover from a prior
+///      crashed run).
+///   2. `write_all` + `sync_all` so the data hits stable storage.
+///   3. On Unix, `chmod 0600` so an inline secret never lands in a
+///      world-readable file.
+///   4. Rename onto `path` (atomic on POSIX and modern NTFS).
+///   5. Best-effort fsync of the parent directory so the rename
+///      survives a crash on filesystems that decouple metadata
+///      durability (ext4 with default options).
+fn atomic_write_yaml(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write as _;
+
+    let tmp = {
+        let mut name = path.file_name()
+            .ok_or_else(|| format!("config path '{}' has no filename", path.display()))?
+            .to_os_string();
+        name.push(".tmp");
+        path.with_file_name(name)
+    };
+
+    {
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp)
+            .map_err(|e| format!("Could not create {}: {}", tmp.display(), e))?;
+        f.write_all(bytes)
+            .map_err(|e| format!("Could not write {}: {}", tmp.display(), e))?;
+        f.sync_all()
+            .map_err(|e| format!("Could not fsync {}: {}", tmp.display(), e))?;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("chmod 0600 on {}: {}", tmp.display(), e))?;
+    }
+
+    fs::rename(&tmp, path)
+        .map_err(|e| format!("rename {} -> {}: {}", tmp.display(), path.display(), e))?;
+
+    // Best-effort: fsync the parent directory so the rename is
+    // durable on filesystems that don't auto-flush directory
+    // entries. Failures here are logged-and-ignored — the file is
+    // already on disk.
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        if let Ok(d) = fs::File::open(parent) {
+            let _ = d.sync_all();
+        }
+    }
+
+    Ok(())
 }
 
 /// Return the path to the config file.

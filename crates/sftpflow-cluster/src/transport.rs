@@ -434,25 +434,34 @@ impl BootstrapService for BootstrapServiceImpl {
         // HMAC + nonce is the auth.
         let req = request.into_inner();
 
-        // 1. Validate the token against this cluster.
-        let used = self.used_nonces.lock().await;
-        let validated = token::validate(
-            &self.token_secret,
-            &req.token,
-            &self.cluster_id,
-            &used,
-        )
-        .map_err(|e| Status::permission_denied(format!("token: {}", e)))?;
-        drop(used);
+        // 1. Validate AND reserve the nonce in one critical section
+        //    so two concurrent joiners can't both pass validation
+        //    before either inserts. Without this, a single token
+        //    could be redeemed by N peers in parallel.
+        let validated = {
+            let mut used = self.used_nonces.lock().await;
+            let v = token::validate(
+                &self.token_secret,
+                &req.token,
+                &self.cluster_id,
+                &used,
+            )
+            .map_err(|e| Status::permission_denied(format!("token: {}", e)))?;
+            used.insert(v.nonce_b64.clone());
+            v
+        };
 
         // 2. Hand off to the daemon-side handler (CSR sign, Raft
-        //    add_learner, promote to voter).
-        let resp = (self.join_handler)(req).await
-            .map_err(|e| Status::internal(format!("join: {}", e)))?;
-
-        // 3. Mark nonce used only AFTER the join succeeded — a
-        //    failed join shouldn't burn the operator's token.
-        self.used_nonces.lock().await.insert(validated.nonce_b64);
+        //    add_learner, promote to voter). On failure we roll back
+        //    the reservation so a transient error doesn't burn the
+        //    operator's one-shot token.
+        let resp = match (self.join_handler)(req).await {
+            Ok(r)  => r,
+            Err(e) => {
+                self.used_nonces.lock().await.remove(&validated.nonce_b64);
+                return Err(Status::internal(format!("join: {}", e)));
+            }
+        };
 
         Ok(Response::new(resp))
     }

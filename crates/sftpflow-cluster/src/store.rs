@@ -63,6 +63,11 @@ use crate::state::{ClusterMember, Command, CommandResult, TypeConfig};
 
 #[derive(Clone)]
 pub struct SledDb {
+    /// Owning Db handle. Kept here (in addition to the Tree
+    /// handles) so opening a SledDb doesn't have to leak the Db
+    /// to keep the underlying file alive for the Tree's lifetime.
+    /// `Db` is internally Arc-y, so cloning is cheap.
+    _db:      std::sync::Arc<Db>,
     pub log:  Tree,
     pub meta: Tree,
 }
@@ -73,11 +78,11 @@ impl SledDb {
         let db: Db = sled::open(path)?;
         let log  = db.open_tree("raft_log")?;
         let meta = db.open_tree("raft_meta")?;
-        // Keep the Db alive for the process lifetime — Tree handles
-        // hold internal references but the user-facing Db handle
-        // dropping would close the underlying file.
-        Box::leak(Box::new(db));
-        Ok(Self { log, meta })
+        Ok(Self {
+            _db: std::sync::Arc::new(db),
+            log,
+            meta,
+        })
     }
 }
 

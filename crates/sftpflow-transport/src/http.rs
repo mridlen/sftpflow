@@ -22,11 +22,22 @@
 //     FTPS; HTTPS in v1 always validates certs.
 
 use std::path::Path;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use log::info;
 use ureq::Agent;
+
+/// Cap initial TCP/TLS connect to a remote HTTP source. Slower than
+/// the FTP/SFTP cap because public CDNs sometimes redirect through
+/// multiple hops on the first hit.
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Cap on each socket-level read/write during the body stream. A
+/// stalled response (slow loris) gives up within this window rather
+/// than holding a tokio blocking-pool thread forever.
+const HTTP_IO_TIMEOUT: Duration = Duration::from_secs(120);
 
 use sftpflow_core::{Endpoint, Protocol};
 
@@ -93,7 +104,13 @@ impl HttpTransport {
             if auth_header.is_some() { "basic" } else { "none" },
         );
 
-        let agent = ureq::AgentBuilder::new().build();
+        // Cap connect + per-socket-op timeouts so a black-holed remote
+        // can't pin a tokio blocking-pool thread indefinitely.
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(HTTP_CONNECT_TIMEOUT)
+            .timeout_read(HTTP_IO_TIMEOUT)
+            .timeout_write(HTTP_IO_TIMEOUT)
+            .build();
 
         Ok(HttpTransport {
             agent,

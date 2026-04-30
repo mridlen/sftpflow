@@ -629,23 +629,70 @@ pub mod framing {
         w.flush()
     }
 
+    /// Cap on a single NDJSON line. A misbehaving or malicious
+    /// peer could otherwise send an unbounded line and OOM the
+    /// reader. 16 MiB is well above any legitimate envelope (the
+    /// largest is a Feed YAML or PGP key blob, both under 1 MiB
+    /// in practice) but small enough that a runaway sender fails
+    /// fast.
+    pub const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+
     /// Read one JSON line from `r` and deserialize into `T`.
     /// Returns `Ok(None)` on clean EOF.
+    ///
+    /// Lines longer than `MAX_LINE_BYTES` are rejected with
+    /// `InvalidData` so a hung or malicious peer can't drain the
+    /// reader's memory.
     pub fn read_line<R, T>(r: &mut R) -> std::io::Result<Option<T>>
     where
         R: BufRead,
         T: DeserializeOwned,
     {
-        let mut line = String::new();
-        let n = r.read_line(&mut line)?;
-        if n == 0 {
+        // Read one line, byte by byte through the BufRead's
+        // internal buffer, capping at MAX_LINE_BYTES so a hung or
+        // malicious peer can't drain memory by streaming an
+        // unbounded line.
+        let mut buf: Vec<u8> = Vec::new();
+        let mut got_newline = false;
+        loop {
+            let chunk = r.fill_buf()?;
+            if chunk.is_empty() {
+                break;
+            }
+            if let Some(pos) = chunk.iter().position(|b| *b == b'\n') {
+                buf.extend_from_slice(&chunk[..=pos]);
+                let consume = pos + 1;
+                r.consume(consume);
+                got_newline = true;
+                break;
+            }
+            let take = chunk.len();
+            buf.extend_from_slice(chunk);
+            r.consume(take);
+            if buf.len() > MAX_LINE_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("ndjson line exceeded {} bytes", MAX_LINE_BYTES),
+                ));
+            }
+        }
+        if buf.is_empty() {
             return Ok(None);
         }
-        let trimmed = line.trim_end_matches(|c| c == '\n' || c == '\r');
-        if trimmed.is_empty() {
+        if !got_newline && buf.len() > MAX_LINE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("ndjson line exceeded {} bytes", MAX_LINE_BYTES),
+            ));
+        }
+        // Trim trailing CR / LF.
+        while matches!(buf.last(), Some(b'\n' | b'\r')) {
+            buf.pop();
+        }
+        if buf.is_empty() {
             return Ok(None);
         }
-        let value = serde_json::from_str(trimmed)
+        let value = serde_json::from_slice(&buf)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         Ok(Some(value))
     }

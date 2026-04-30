@@ -197,20 +197,62 @@ impl SecretStore {
         final_bytes.extend_from_slice(MAGIC_HEADER.as_bytes());
         final_bytes.extend_from_slice(&encrypted);
 
-        // Write atomically: write to a sibling tempfile, then rename.
-        let tmp_path = self.path.with_extension("new");
-        fs::write(&tmp_path, &final_bytes).map_err(|e| {
-            format!("could not write secrets to '{}': {}", tmp_path.display(), e)
-        })?;
+        // Atomic write: stage to <name>.age.tmp, fsync, chmod 0600,
+        // rename onto live path, fsync parent dir. `with_extension`
+        // would replace the existing `.age` extension, so we build
+        // the tmp name by appending instead.
+        let tmp_path = {
+            let mut name = self.path.file_name().ok_or_else(|| {
+                format!("secrets path '{}' has no filename", self.path.display())
+            })?.to_os_string();
+            name.push(".tmp");
+            self.path.with_file_name(name)
+        };
 
-        // On Unix we'd chmod 0600 here; the daemon is expected to run
-        // as a dedicated service user so directory-level perms protect it.
+        {
+            let mut f = fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&tmp_path)
+                .map_err(|e| format!(
+                    "could not create '{}': {}", tmp_path.display(), e,
+                ))?;
+            f.write_all(&final_bytes).map_err(|e| {
+                format!("could not write secrets to '{}': {}", tmp_path.display(), e)
+            })?;
+            f.sync_all().map_err(|e| {
+                format!("could not fsync '{}': {}", tmp_path.display(), e)
+            })?;
+        }
+
+        // Tighten perms on the staged file before exposing it under
+        // its real name. The sealed-secrets blob is encrypted, but a
+        // 0600 mode is still defense in depth for shared boxes.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))
+                .map_err(|e| format!(
+                    "chmod 0600 on '{}': {}", tmp_path.display(), e,
+                ))?;
+        }
+
         fs::rename(&tmp_path, &self.path).map_err(|e| {
             format!(
                 "could not rename '{}' -> '{}': {}",
                 tmp_path.display(), self.path.display(), e
             )
         })?;
+
+        // Best-effort directory fsync so the rename is durable on
+        // filesystems that decouple metadata flushing.
+        #[cfg(unix)]
+        if let Some(parent) = self.path.parent() {
+            if let Ok(d) = fs::File::open(parent) {
+                let _ = d.sync_all();
+            }
+        }
 
         info!(
             "secrets: saved {} entry(ies) to '{}'",

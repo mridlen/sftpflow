@@ -21,6 +21,12 @@
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+/// Read/write timeout applied to the FTP control channel after
+/// connect. Caps how long a single command can hang on a
+/// black-holed server.
+const FTP_IO_TIMEOUT: Duration = Duration::from_secs(120);
 
 use async_trait::async_trait;
 use log::{info, warn};
@@ -104,6 +110,26 @@ impl FtpClient {
         match self {
             FtpClient::Plain(s) => s.rm(path),
             FtpClient::Tls(s)   => s.rm(path),
+        }
+    }
+
+    /// Apply read+write timeouts to the underlying TCP control
+    /// stream so a hung server surfaces as an I/O error instead of
+    /// blocking the orchestrator forever. Best-effort: any error
+    /// from the OS is logged and ignored.
+    fn set_io_timeouts(&self, timeout: Duration) {
+        // suppaftp::ImplFtpStream::get_ref returns &TcpStream
+        // regardless of plain vs TLS — it walks down past the
+        // TLS wrapper to the underlying socket.
+        let stream = match self {
+            FtpClient::Plain(s) => s.get_ref(),
+            FtpClient::Tls(s)   => s.get_ref(),
+        };
+        if let Err(e) = stream.set_read_timeout(Some(timeout)) {
+            warn!("ftp: set_read_timeout failed: {}", e);
+        }
+        if let Err(e) = stream.set_write_timeout(Some(timeout)) {
+            warn!("ftp: set_write_timeout failed: {}", e);
         }
     }
 }
@@ -225,6 +251,10 @@ impl FtpTransport {
                     "FTP TYPE I failed: {}", e,
                 ))
             })?;
+
+            // Apply read/write timeouts on the control channel so a
+            // hung server doesn't block the daemon indefinitely.
+            client.set_io_timeouts(FTP_IO_TIMEOUT);
 
             Ok(client)
         })

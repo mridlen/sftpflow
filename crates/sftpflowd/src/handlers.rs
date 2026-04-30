@@ -23,7 +23,7 @@ use std::time::{Instant, SystemTime};
 
 use log::{error, info, warn};
 
-use sftpflow_core::{validate_name, Config, Endpoint, NextStepAction, PgpKey, ProcessStep};
+use sftpflow_core::{validate_name, Config, Endpoint, Feed, NextStepAction, PgpKey, ProcessStep};
 use sftpflow_proto::{
     error_code,
     ClusterMemberInfo,
@@ -33,6 +33,7 @@ use sftpflow_proto::{
     FeedSummary,
     ProtoError,
     Response,
+    RunResult,
     ServerInfo,
     SyncReport,
 };
@@ -132,6 +133,46 @@ pub fn get_endpoint(state: &DaemonState, name: &str) -> Response {
     Response::Endpoint(state.config.endpoints.get(name).cloned())
 }
 
+/// Run `validate_name` and convert any error into an INVALID_PARAMS
+/// ProtoError with a uniform hint. Used by every mutating handler
+/// that accepts an operator-supplied identifier (endpoint, key,
+/// feed, secret) to keep the allowlist enforcement DRY.
+fn require_valid_name(kind: &str, name: &str) -> Result<(), ProtoError> {
+    validate_name(kind, name).map_err(|msg| {
+        ProtoError::with_hint(
+            error_code::INVALID_PARAMS,
+            msg,
+            "use letters, digits, '-', '_', '.' (max 64 chars; first char alphanumeric)",
+        )
+    })?;
+
+    // Feed names additionally must not end with `-<digits>`. The
+    // dkron scheduler emits jobs as `sftpflow-<feed>` for a single
+    // schedule and `sftpflow-<feed>-<N>` for multi-schedule feeds;
+    // a feed named e.g. `foo-1` would otherwise collide with feed
+    // `foo`'s second schedule on delete/sync. Strict, surfaces the
+    // collision at create time. Endpoint/key/secret names don't
+    // flow through dkron, so the rule only applies to feeds.
+    if kind == "feed" {
+        if let Some(idx) = name.rfind('-') {
+            let suffix = &name[idx + 1..];
+            if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
+                return Err(ProtoError::with_hint(
+                    error_code::INVALID_PARAMS,
+                    format!(
+                        "feed name '{}' ends with '-<digits>' which would collide \
+                         with the dkron schedule-index suffix",
+                        name,
+                    ),
+                    "rename to use '_' instead of '-' before the digits, e.g. 'foo_1'",
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Upsert: create or replace. No collision check — `Put` is idempotent
 /// from the caller's perspective.
 pub fn put_endpoint(
@@ -139,6 +180,10 @@ pub fn put_endpoint(
     name: String,
     endpoint: Endpoint,
 ) -> Result<Response, ProtoError> {
+    // Strict allowlist on endpoint names: they appear as YAML keys,
+    // log identifiers, and audit rows. require_valid_name() - above.
+    require_valid_name("endpoint", &name)?;
+
     let existed = state.config.endpoints.contains_key(&name);
     state.config.endpoints.insert(name.clone(), endpoint);
     save(&state.config)?;
@@ -169,6 +214,11 @@ pub fn rename_endpoint(
     from: String,
     to: String,
 ) -> Result<Response, ProtoError> {
+    // Same allowlist as put_endpoint — the new name flows into
+    // YAML keys and audit rows, so unvalidated rename is the same
+    // hole as unvalidated put.
+    require_valid_name("endpoint", &to)?;
+
     if !state.config.endpoints.contains_key(&from) {
         return Err(not_found("endpoint", &from));
     }
@@ -220,6 +270,10 @@ pub fn put_key(
     name: String,
     key: PgpKey,
 ) -> Result<Response, ProtoError> {
+    // Strict allowlist: key names appear as YAML keys, audit rows,
+    // and as referents in feed process steps. require_valid_name() - above.
+    require_valid_name("key", &name)?;
+
     let existed = state.config.keys.contains_key(&name);
     state.config.keys.insert(name.clone(), key);
     save(&state.config)?;
@@ -249,6 +303,9 @@ pub fn rename_key(
     from: String,
     to: String,
 ) -> Result<Response, ProtoError> {
+    // Same allowlist as put_key.
+    require_valid_name("key", &to)?;
+
     if !state.config.keys.contains_key(&from) {
         return Err(not_found("key", &from));
     }
@@ -342,14 +399,8 @@ pub fn put_feed(
     // command string, into HTTP path components for dkron job
     // ids, and into YAML keys. Reject anything that could break
     // out of any of those contexts at the source rather than
-    // escape per use site.
-    validate_name("feed", &name).map_err(|msg| {
-        ProtoError::with_hint(
-            error_code::INVALID_PARAMS,
-            msg,
-            "use letters, digits, '-', '_', '.' (max 64 chars; first char alphanumeric)",
-        )
-    })?;
+    // escape per use site. require_valid_name() - above.
+    require_valid_name("feed", &name)?;
 
     let existed = state.config.feeds.contains_key(&name);
     state.config.feeds.insert(name.clone(), feed);
@@ -370,8 +421,35 @@ pub fn delete_feed(
     if state.config.feeds.remove(name).is_none() {
         return Err(not_found("feed", name));
     }
+
+    // Sweep dangling nextstep references: any other feed that
+    // had a `RunFeed { feed: <name> }` action would otherwise
+    // silently fail at run time. We drop those entries and log
+    // each one so the operator can see what they lost. rename
+    // already handles the live-rename case; this is the
+    // delete-counterpart.
+    let mut dangling = 0usize;
+    for (other_name, f) in state.config.feeds.iter_mut() {
+        let before = f.nextsteps.len();
+        f.nextsteps.retain(|ns| match &ns.action {
+            NextStepAction::RunFeed { feed } => feed != name,
+            _ => true,
+        });
+        let dropped = before - f.nextsteps.len();
+        if dropped > 0 {
+            warn!(
+                "delete_feed '{}': dropped {} dangling nextstep run_feed reference(s) from feed '{}'",
+                name, dropped, other_name,
+            );
+            dangling += dropped;
+        }
+    }
+
     save(&state.config)?;
-    info!("deleted feed '{}'", name);
+    info!(
+        "deleted feed '{}' (swept {} dangling nextstep ref(s))",
+        name, dangling,
+    );
     maybe_delete_feed_jobs(state, name);
     Ok(Response::Ok)
 }
@@ -385,14 +463,8 @@ pub fn rename_feed(
 ) -> Result<Response, ProtoError> {
     // Same allowlist as put_feed — the new name flows to dkron's
     // shell executor, so an unvalidated rename is the same hole
-    // as an unvalidated put.
-    validate_name("feed", &to).map_err(|msg| {
-        ProtoError::with_hint(
-            error_code::INVALID_PARAMS,
-            msg,
-            "use letters, digits, '-', '_', '.' (max 64 chars; first char alphanumeric)",
-        )
-    })?;
+    // as an unvalidated put. require_valid_name() - above.
+    require_valid_name("feed", &to)?;
 
     if !state.config.feeds.contains_key(&from) {
         return Err(not_found("feed", &from));
@@ -429,27 +501,39 @@ pub fn rename_feed(
     Ok(Response::Ok)
 }
 
-/// Execute a feed: download from sources, upload to destinations,
-/// optionally delete source files afterward. Records the run in
-/// the SQLite history database.
-///
-/// Creates a short-lived tokio runtime to bridge into the async
-/// transport layer (russh/russh-sftp). The runtime is dropped
-/// when this function returns.
-pub fn run_feed_now(
+/// Snapshot of everything `execute_run_feed` needs after the
+/// daemon mutex is released. Built under the lock by
+/// `prepare_run_feed` so the transfer runs without holding it.
+pub struct RunPrep {
+    pub feed_name:  String,
+    pub feed:       Feed,
+    pub endpoints:  BTreeMap<String, Endpoint>,
+    pub keys:       BTreeMap<String, PgpKey>,
+    pub started_at: String,
+    pub timer:      Instant,
+}
+
+/// Phase 1 of RunFeedNow: validate the feed exists, clone the
+/// config slices we need, and resolve any `*_ref` fields against
+/// the sealed secret store. Caller holds the daemon mutex while
+/// this runs (it's all in-memory + fast), then releases the lock
+/// before calling `execute_run_feed`.
+pub fn prepare_run_feed(
     state: &DaemonState,
     name: &str,
-) -> Result<Response, ProtoError> {
+) -> Result<RunPrep, ProtoError> {
+    // Defense in depth: every other operator-supplied name flows
+    // through require_valid_name; do the same here so an attacker
+    // can't sneak metachars through if they reach this RPC by some
+    // other path. require_valid_name() - above.
+    require_valid_name("feed", name)?;
+
     let feed = state.config.feeds.get(name).ok_or_else(|| {
         not_found("feed", name)
     })?;
 
     info!("run_feed_now requested for '{}'", name);
 
-    // Clone the data we need so we can release the DaemonState
-    // lock before blocking on async I/O. Resolve any `*_ref` fields
-    // against the sealed secret store so the transport layer only
-    // ever sees plaintext values.
     let feed = feed.clone();
     let mut endpoints = state.config.endpoints.clone();
     let mut keys = state.config.keys.clone();
@@ -464,31 +548,49 @@ pub fn run_feed_now(
         ));
     }
 
-    let feed_name = name.to_string();
+    Ok(RunPrep {
+        feed_name:  name.to_string(),
+        feed,
+        endpoints,
+        keys,
+        started_at: iso8601_now(),
+        timer:      Instant::now(),
+    })
+}
 
-    // Capture the start time for history recording.
-    let started_at = iso8601_now();
-    let timer = Instant::now();
+/// Phase 2 of RunFeedNow: actually move bytes. Runs WITHOUT the
+/// daemon mutex held — the transfer can take seconds to minutes
+/// and we don't want to block every other RPC behind it.
+///
+/// Returns the run result plus the timing/identity bits the caller
+/// needs to record the run in SQLite afterward.
+pub fn execute_run_feed(prep: RunPrep) -> (RunResult, std::time::Duration, String, String) {
+    let RunPrep { feed_name, feed, endpoints, keys, started_at, timer } = prep;
 
     // Build a single-threaded tokio runtime for the transfer.
     // The daemon is thread-per-connection, so each RunFeedNow
     // gets its own runtime. This keeps the sync↔async boundary
     // clean and self-contained.
-    let rt = tokio::runtime::Runtime::new().map_err(|e| {
-        error!("run_feed_now '{}': failed to create tokio runtime: {}", feed_name, e);
-        ProtoError::new(
-            error_code::INTERNAL_ERROR,
-            format!("failed to create async runtime: {}", e),
-        )
-    })?;
-
-    // run_feed() in sftpflow-transport (lib.rs)
-    let result = rt.block_on(sftpflow_transport::run_feed(
-        &feed_name,
-        &feed,
-        &endpoints,
-        &keys,
-    ));
+    let result = match tokio::runtime::Runtime::new() {
+        Ok(rt) => {
+            // run_feed() in sftpflow-transport (lib.rs)
+            rt.block_on(sftpflow_transport::run_feed(
+                &feed_name,
+                &feed,
+                &endpoints,
+                &keys,
+            ))
+        }
+        Err(e) => {
+            error!("run_feed_now '{}': failed to create tokio runtime: {}", feed_name, e);
+            RunResult {
+                feed: feed_name.clone(),
+                status: sftpflow_proto::RunStatus::Failed,
+                files_transferred: 0,
+                message: Some(format!("failed to create async runtime: {}", e)),
+            }
+        }
+    };
 
     let duration = timer.elapsed();
 
@@ -497,12 +599,22 @@ pub fn run_feed_now(
         feed_name, result.status, result.files_transferred, duration.as_secs_f64()
     );
 
-    // Record the run in SQLite (best-effort).
-    if let Some(ref db) = state.run_db {
-        db.record_run(&feed_name, &started_at, duration, &result);
-    }
+    (result, duration, started_at, feed_name)
+}
 
-    Ok(Response::RunResult(result))
+/// Phase 3 of RunFeedNow: record the run in SQLite. Caller holds
+/// the daemon mutex briefly for this — it's a single INSERT.
+/// Best-effort: a missing `run_db` is silently skipped.
+pub fn record_run_history(
+    state: &DaemonState,
+    feed_name: &str,
+    started_at: &str,
+    duration: std::time::Duration,
+    result: &RunResult,
+) {
+    if let Some(ref db) = state.run_db {
+        db.record_run(feed_name, started_at, duration, result);
+    }
 }
 
 /// Format the current wall-clock time as ISO 8601 UTC.
@@ -645,6 +757,12 @@ pub fn put_secret(
     name: String,
     value: String,
 ) -> Result<Response, ProtoError> {
+    // Strict allowlist: secret names are referenced from
+    // password_ref / ssh_key_ref / contents_ref string-equality
+    // lookups, so a name with whitespace or weird chars silently
+    // breaks the lookup at run time. require_valid_name() - above.
+    require_valid_name("secret", &name)?;
+
     let store = require_secrets_mut(state)?;
     store.put(name.clone(), value).map_err(|e| ProtoError::with_hint(
         error_code::INTERNAL_ERROR,
@@ -898,35 +1016,21 @@ pub fn cluster_mint_token(
 pub fn cluster_get_ca(state: &DaemonState) -> Result<Response, ProtoError> {
     let _ctx = require_cluster(state)?;
 
-    // The state_dir layout is fixed by node_state::ca_cert_path.
-    // We don't have a direct reference to state_dir from the handler
-    // (DaemonState doesn't carry it; main.rs resolves it once at
-    // startup). For now use the default location, which matches
-    // every code path that constructs DaemonState in cluster mode.
-    // M13 will plumb state_dir through DaemonState explicitly.
-    let state_dir = default_state_dir();
-    let pem = std::fs::read_to_string(crate::node_state::ca_cert_path(&state_dir))
-        .map_err(|e| ProtoError::with_hint(
-            error_code::CONFIG_ERROR,
-            format!("could not read cluster CA cert: {}", e),
-            "verify $state_dir/cluster/ca.crt exists and is readable by the daemon",
-        ))?;
+    // Use state.paths.state_dir so a daemon started with a custom
+    // --state-dir reads its own CA, not whatever lives at the
+    // platform default. Earlier versions hard-coded
+    // `default_state_dir()` here, which silently returned NOT_FOUND
+    // (or a stale CA from the default path) on operators using a
+    // non-default layout.
+    let pem = std::fs::read_to_string(
+        crate::node_state::ca_cert_path(&state.paths.state_dir),
+    )
+    .map_err(|e| ProtoError::with_hint(
+        error_code::CONFIG_ERROR,
+        format!("could not read cluster CA cert: {}", e),
+        "verify $state_dir/cluster/ca.crt exists and is readable by the daemon",
+    ))?;
     Ok(Response::ClusterCaCert(pem))
-}
-
-/// Platform default state-dir, mirroring main.rs::default_state_dir.
-/// Local copy here so handlers.rs doesn't need a reference back
-/// into main.rs (which would create a cycle). Identical layout.
-fn default_state_dir() -> std::path::PathBuf {
-    #[cfg(unix)]
-    {
-        std::path::PathBuf::from("/var/lib/sftpflow")
-    }
-    #[cfg(not(unix))]
-    {
-        let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
-        std::path::PathBuf::from(base).join("sftpflow")
-    }
 }
 
 /// `cluster remove <node_id>`: drop a node from the voter set.

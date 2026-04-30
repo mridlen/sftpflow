@@ -16,12 +16,24 @@
 // into a SyncReport, but never fail the calling RPC.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::time::Duration;
 
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 
 use sftpflow_core::Feed;
 use sftpflow_proto::SyncReport;
+
+/// Connect timeout for dkron HTTP calls. Dkron lives next to the
+/// daemon (same compose / k8s namespace), so a slow connect almost
+/// always means dkron is gone — fail fast rather than wedging the
+/// daemon mutex.
+const DKRON_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Read timeout for dkron HTTP calls. Generous enough for a sluggish
+/// dkron under load, short enough that a hung dkron doesn't block
+/// every PutFeed for ureq's default ~30s.
+const DKRON_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ============================================================
 // Dkron API types
@@ -53,12 +65,19 @@ struct DkronJobInfo {
 
 pub struct DkronClient {
     base_url: String,
+    agent:    ureq::Agent,
 }
 
 impl DkronClient {
     pub fn new(base_url: &str) -> Self {
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(DKRON_CONNECT_TIMEOUT)
+            .timeout_read(DKRON_READ_TIMEOUT)
+            .timeout_write(DKRON_READ_TIMEOUT)
+            .build();
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
+            agent,
         }
     }
 
@@ -205,7 +224,7 @@ impl DkronClient {
     /// List all dkron jobs whose name starts with "sftpflow-".
     fn list_sftpflow_jobs(&self) -> Result<HashMap<String, DkronJobInfo>, String> {
         let url = format!("{}/v1/jobs", self.base_url);
-        let resp = ureq::get(&url)
+        let resp = self.agent.get(&url)
             .call()
             .map_err(|e| format!("GET /v1/jobs: {}", e))?;
 
@@ -262,7 +281,7 @@ impl DkronClient {
             .map_err(|e| format!("serialize: {}", e))?;
 
         let url = format!("{}/v1/jobs", self.base_url);
-        ureq::post(&url)
+        self.agent.post(&url)
             .set("Content-Type", "application/json")
             .send_string(&json)
             .map_err(|e| format!("POST /v1/jobs: {}", e))?;
@@ -273,7 +292,7 @@ impl DkronClient {
     /// Delete a single dkron job by name. 404 is not an error.
     fn delete_job(&self, job_name: &str) -> Result<(), String> {
         let url = format!("{}/v1/jobs/{}", self.base_url, job_name);
-        match ureq::delete(&url).call() {
+        match self.agent.delete(&url).call() {
             Ok(_) => Ok(()),
             Err(ureq::Error::Status(404, _)) => Ok(()), // already gone
             Err(e) => Err(format!("DELETE /v1/jobs/{}: {}", job_name, e)),

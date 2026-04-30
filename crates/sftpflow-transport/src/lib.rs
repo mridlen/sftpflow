@@ -278,6 +278,45 @@ fn validate_endpoint(
 }
 
 // ============================================================
+// Server-supplied filename validation
+// ============================================================
+//
+// Filenames returned by `Transport::list_files` are passed
+// directly to `staging_dir.join(file_name)`. A malicious or
+// buggy server could return `../../etc/passwd`, an absolute
+// path, or names with embedded slashes / NULs / control chars
+// — and our subsequent `download(remote_path, local_path)`
+// would then write outside the staging directory.
+//
+// `is_safe_remote_filename` is the gate. It accepts only:
+//   - non-empty
+//   - exactly one path component (no '/' or '\\')
+//   - not '.' or '..'
+//   - no NUL bytes or other control chars
+//
+// Anything else is rejected at run time and the feed fails —
+// fail-loud so an operator sees "this server is misbehaving"
+// rather than silently ingesting a hostile name.
+fn is_safe_remote_filename(name: &str) -> bool {
+    if name.is_empty() || name == "." || name == ".." {
+        return false;
+    }
+    if name.contains('/') || name.contains('\\') {
+        return false;
+    }
+    if name.chars().any(|c| c == '\0' || (c.is_control() && c != '\t')) {
+        return false;
+    }
+    // Path::components on a single segment yields exactly one Normal.
+    let mut iter = std::path::Path::new(name).components();
+    let first = iter.next();
+    if iter.next().is_some() {
+        return false;
+    }
+    matches!(first, Some(std::path::Component::Normal(_)))
+}
+
+// ============================================================
 // run_feed — the main orchestrator
 // ============================================================
 
@@ -418,6 +457,26 @@ pub async fn run_feed(
 
         let mut src_files = Vec::new();
         for file_name in &files {
+            // Reject server-supplied names that could escape the
+            // staging directory (path traversal defense).
+            // is_safe_remote_filename() - above
+            if !is_safe_remote_filename(file_name) {
+                error!(
+                    "run_feed '{}': source '{}' returned unsafe filename '{}' \
+                     — refusing transfer",
+                    feed_name, src.endpoint, file_name.escape_debug(),
+                );
+                return RunResult {
+                    feed: feed_name.to_string(),
+                    status: RunStatus::Failed,
+                    files_transferred: 0,
+                    message: Some(format!(
+                        "source '{}' returned unsafe filename '{}' — refusing transfer",
+                        src.endpoint, file_name.escape_debug(),
+                    )),
+                };
+            }
+
             // Transport decides how to join base+name — HTTP returns
             // the base verbatim because a URL is already a full file.
             let remote_path = transport.remote_path(&src.path, file_name);

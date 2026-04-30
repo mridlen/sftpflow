@@ -467,7 +467,7 @@ fn cmd_init(daemon: DaemonArgs, args: InitArgs) -> Result<(), String> {
     info!("init: sealed {} into credential store", node_state::CLUSTER_TOKEN_SECRET_KEY);
 
     // ---- 7. Daemon prelude (config, run history) ----
-    let config = Config::load();
+    let config = Config::load()?;
     info!(
         "init: loaded config (endpoints={}, keys={}, feeds={})",
         config.endpoints.len(), config.keys.len(), config.feeds.len(),
@@ -705,7 +705,7 @@ fn cmd_join(daemon: DaemonArgs, args: JoinArgs) -> Result<(), String> {
     info!("join: wrote cluster state under {}", state_dir.display());
 
     // ---- 8. Daemon prelude (config, run history, optional secrets) ----
-    let config = Config::load();
+    let config = Config::load()?;
     info!(
         "join: loaded config (endpoints={}, keys={}, feeds={})",
         config.endpoints.len(), config.keys.len(), config.feeds.len(),
@@ -1004,7 +1004,7 @@ fn cmd_run_cluster(
     };
 
     // ---- 5. Daemon prelude (config + run history) ----
-    let config = Config::load();
+    let config = Config::load()?;
     info!(
         "sftpflowd v{} starting (cluster mode; endpoints={}, keys={}, feeds={})",
         env!("CARGO_PKG_VERSION"),
@@ -1151,7 +1151,7 @@ fn cmd_run_legacy(daemon: DaemonArgs) -> Result<(), String> {
 
     // Load the shared config. The daemon owns this at runtime;
     // the CLI mutates it through RPC (not by editing the YAML).
-    let config = Config::load();
+    let config = Config::load()?;
 
     info!(
         "sftpflowd v{} starting (endpoints={}, keys={}, feeds={})",

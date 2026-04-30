@@ -294,6 +294,14 @@ pub fn run_restore_cold(
         manifest.version, manifest.files.len(), manifest.cluster_id, manifest.node_id,
     );
 
+    // ---- 1a. Reject any archive entry whose path could escape the
+    //          state dir (tar-slip defense). The tar crate does NOT
+    //          block `..` or absolute paths by default.
+    for fe in &manifest.files {
+        // validate_archive_path() - below
+        validate_archive_path(&fe.archive_path)?;
+    }
+
     // ---- 2. Build target paths + refuse if any exist ----
     let targets: Vec<(FileEntry, PathBuf)> = manifest
         .files
@@ -346,6 +354,12 @@ pub fn run_restore_cold(
         if path_in_archive == MANIFEST_FILE {
             continue;
         }
+
+        // Tar-slip defense, second checkpoint: even if the manifest
+        // was clean, the actual archive entry path is what we'd
+        // resolve, so re-validate it before any filesystem I/O.
+        // validate_archive_path() - below
+        validate_archive_path(&path_in_archive)?;
 
         // Look up the manifest row. An archive that contains a file
         // not in the manifest is malformed — refuse.
@@ -608,6 +622,9 @@ fn read_manifest(archive_path: &Path) -> Result<Manifest, String> {
 
 /// Map an archive-relative path to its on-disk destination during
 /// restore. Mirrors the layout written by `collect_backup_files`.
+///
+/// Callers MUST run `validate_archive_path` first; this function
+/// trusts that the path has no `..` segments and is not absolute.
 fn resolve_archive_dest(paths: &DaemonPaths, archive_path: &str) -> PathBuf {
     match archive_path {
         "node.json"        => node_state::node_json_path(&paths.state_dir),
@@ -621,19 +638,68 @@ fn resolve_archive_dest(paths: &DaemonPaths, archive_path: &str) -> PathBuf {
         "config.yaml"      => paths.config_yaml.clone(),
         other => {
             // raft/<...> — preserve the path under the state_dir's
-            // raft directory.
+            // raft directory. Anything else falls under state_dir
+            // verbatim. validate_archive_path() has already rejected
+            // `..` and absolute paths so the join is safe.
             if let Some(rest) = other.strip_prefix("raft/") {
                 node_state::raft_dir(&paths.state_dir).join(rest)
             } else {
-                // Unknown path: drop it under the state dir so
-                // restore at least surfaces it instead of silently
-                // routing it to /tmp. The caller already validates
-                // every archive_path against the manifest, so this
-                // branch is mostly defensive.
                 paths.state_dir.join(other)
             }
         }
     }
+}
+
+/// Reject archive paths that could escape the state directory.
+///
+/// Tar-slip defense: tar archives can contain `..` segments or
+/// absolute paths that, when joined to a base directory, end up
+/// writing outside it. The `tar` crate does not block this by
+/// default. We require:
+///   - non-empty
+///   - no leading `/` or drive prefix (must be relative)
+///   - every component is `Component::Normal` (rejects `..`,
+///     `.`, prefix, root)
+///   - no embedded NUL bytes
+fn validate_archive_path(p: &str) -> Result<(), String> {
+    if p.is_empty() {
+        return Err("archive contains an empty path entry".to_string());
+    }
+    if p.contains('\0') {
+        return Err(format!(
+            "archive entry '{}' contains a NUL byte — refusing restore",
+            p.escape_debug(),
+        ));
+    }
+    // Reject absolute paths up-front, including Windows-style
+    // drive prefixes that `Path::components` would happily accept.
+    if p.starts_with('/') || p.starts_with('\\') {
+        return Err(format!(
+            "archive entry '{}' is absolute — refusing restore (tar-slip defense)",
+            p,
+        ));
+    }
+    if let Some(c) = p.chars().nth(1) {
+        if c == ':' {
+            return Err(format!(
+                "archive entry '{}' has a drive prefix — refusing restore",
+                p,
+            ));
+        }
+    }
+    for component in std::path::Path::new(p).components() {
+        match component {
+            std::path::Component::Normal(_) => {}
+            other => {
+                return Err(format!(
+                    "archive entry '{}' contains a non-normal path component ({:?}) — \
+                     refusing restore (tar-slip defense)",
+                    p, other,
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// True if a given archive path holds key material the operator

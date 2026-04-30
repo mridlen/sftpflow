@@ -21,12 +21,22 @@
 // we send/receive NDJSON RequestEnvelope / ResponseEnvelope pairs.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
+
+/// Hard cap on connect; if the daemon's TCP/Unix port is silent for
+/// this long, give up rather than hang the operator's terminal.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Per-RPC read/write timeout for persistent socket transports. A
+/// healthy daemon replies in milliseconds; this catches a daemon
+/// that accepted the connection but then wedged.
+const RPC_IO_TIMEOUT: Duration = Duration::from_secs(60);
 
 use log::debug;
 
@@ -142,7 +152,24 @@ impl RpcClient {
     }
 
     fn connect_tcp(addr: &str) -> Result<Self, RpcError> {
-        let stream = TcpStream::connect(addr)?;
+        // TcpStream::connect_timeout needs a resolved SocketAddr, so
+        // we resolve manually and try the first address. The default
+        // TcpStream::connect would block indefinitely on a black-holed
+        // host, which is the bug we're fixing.
+        let socket_addr = addr
+            .to_socket_addrs()?
+            .next()
+            .ok_or_else(|| {
+                RpcError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("could not resolve '{}'", addr),
+                ))
+            })?;
+        let stream = TcpStream::connect_timeout(&socket_addr, CONNECT_TIMEOUT)?;
+        // Per-call I/O timeout so a daemon that accepted but never
+        // replied surfaces as an error instead of a hung terminal.
+        stream.set_read_timeout(Some(RPC_IO_TIMEOUT))?;
+        stream.set_write_timeout(Some(RPC_IO_TIMEOUT))?;
         debug!("rpc: connected via tcp to {}", addr);
         let reader = stream.try_clone()?;
         Ok(RpcClient {
@@ -157,6 +184,9 @@ impl RpcClient {
     #[cfg(unix)]
     fn connect_unix(path: &str) -> Result<Self, RpcError> {
         let stream = UnixStream::connect(path)?;
+        // UnixStream supports the same read/write timeout API as TCP.
+        stream.set_read_timeout(Some(RPC_IO_TIMEOUT))?;
+        stream.set_write_timeout(Some(RPC_IO_TIMEOUT))?;
         debug!("rpc: connected via unix socket {}", path);
         let reader = stream.try_clone()?;
         Ok(RpcClient {
@@ -236,7 +266,15 @@ impl RpcClient {
             dry_run,
             request,
         };
-        debug!("rpc: sending id={} dry_run={} {:?}", id, dry_run, envelope);
+        // Don't `{:?}` the envelope — Request variants like
+        // PutSecret { value }, PutEndpoint { endpoint.password }, and
+        // PutKey { key.contents } embed secret material that would
+        // otherwise leak into RUST_LOG=debug output. method_name() is
+        // safe (compile-time constant strings).
+        debug!(
+            "rpc: sending id={} method={} dry_run={}",
+            id, method_name(&envelope.request), dry_run,
+        );
 
         let response = match &mut self.inner {
             RpcInner::Persistent { reader, writer } => {
@@ -249,7 +287,32 @@ impl RpcClient {
             }
         };
 
-        debug!("rpc: received id={} {:?}", response.id, response.outcome);
+        // Defense in depth: each request gets a unique monotonic id;
+        // the daemon echoes it in the response. A mismatch here means
+        // the framing desynced (e.g. a stray line on the wire), and
+        // we'd otherwise silently match the wrong response to the
+        // wrong request. Bail loudly so the operator sees the issue.
+        if response.id != id {
+            return Err(RpcError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "rpc framing desync: sent id={} but received id={}",
+                    id, response.id,
+                ),
+            )));
+        }
+
+        // Same care for the response: error envelopes contain just
+        // the operator-safe error fields, but we keep the log uniform
+        // (method-only) so future variants don't accidentally leak.
+        match &response.outcome {
+            ResponseOutcome::Success { .. } => {
+                debug!("rpc: received id={} ok", response.id);
+            }
+            ResponseOutcome::Failure { error } => {
+                debug!("rpc: received id={} err code={}", response.id, error.code);
+            }
+        }
 
         match response.outcome {
             ResponseOutcome::Success { result } => Ok(result),
@@ -286,13 +349,28 @@ fn one_shot_ssh_call(
     //     driving an interactive shell — pty would echo input back
     //     and corrupt the framing).
     // BatchMode=yes: never prompt for a password — auth is by key.
-    cmd.arg("-T").arg("-o").arg("BatchMode=yes");
+    // ConnectTimeout=10: cap initial TCP/handshake so a black-holed
+    //     server fails fast.
+    // ServerAliveInterval=15 + ServerAliveCountMax=3: ssh probes
+    //     every 15s and disconnects after ~45s of silence — caps how
+    //     long the operator's terminal hangs when the daemon wedges
+    //     mid-RPC.
+    cmd.arg("-T")
+        .arg("-o").arg("BatchMode=yes")
+        .arg("-o").arg("ConnectTimeout=10")
+        .arg("-o").arg("ServerAliveInterval=15")
+        .arg("-o").arg("ServerAliveCountMax=3");
     cmd.arg(format!("{}@{}", username, host));
     cmd.arg("sftpflow-shell");
 
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::inherit());
+    // Capture stderr so ssh banners / "Permission denied" / MOTD
+    // lines don't splat onto the operator's terminal mid-render and
+    // (more importantly) don't corrupt --json output by mixing free
+    // text with the structured stdout. We surface stderr only when
+    // the subprocess exits non-zero, folded into the error message.
+    cmd.stderr(Stdio::piped());
 
     debug!("rpc(ssh one-shot): spawning ssh to {}@{}", username, host);
     let mut child = cmd.spawn().map_err(|e| {
@@ -321,6 +399,13 @@ fn one_shot_ssh_call(
     let mut sink = Vec::new();
     let _ = reader.read_to_end(&mut sink);
 
+    // Drain captured stderr so wait() doesn't deadlock on a child
+    // that still has bytes pending in the pipe.
+    let mut stderr_buf = Vec::new();
+    if let Some(mut e) = child.stderr.take() {
+        let _ = e.read_to_end(&mut stderr_buf);
+    }
+
     let status = child.wait().map_err(|e| {
         RpcError::Io(io::Error::new(
             e.kind(),
@@ -328,12 +413,58 @@ fn one_shot_ssh_call(
         ))
     })?;
     if !status.success() {
+        let stderr_str = String::from_utf8_lossy(&stderr_buf);
+        let stderr_trimmed = stderr_str.trim();
+        let suffix = if stderr_trimmed.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", stderr_trimmed)
+        };
         return Err(RpcError::Io(io::Error::other(format!(
-            "ssh subprocess exited with status {}", status.code().unwrap_or(-1),
+            "ssh subprocess exited with status {}{}",
+            status.code().unwrap_or(-1), suffix,
         ))));
     }
 
     envelope.ok_or(RpcError::UnexpectedEof)
+}
+
+/// Static method name for a Request variant. Used by the debug
+/// log path so we can identify the call without printing the
+/// `params` (which may contain secret material).
+fn method_name(req: &Request) -> &'static str {
+    match req {
+        Request::Ping              => "ping",
+        Request::GetServerInfo     => "get_server_info",
+        Request::ListEndpoints     => "list_endpoints",
+        Request::GetEndpoint    {..} => "get_endpoint",
+        Request::PutEndpoint    {..} => "put_endpoint",
+        Request::DeleteEndpoint {..} => "delete_endpoint",
+        Request::RenameEndpoint {..} => "rename_endpoint",
+        Request::ListKeys           => "list_keys",
+        Request::GetKey       {..}  => "get_key",
+        Request::PutKey       {..}  => "put_key",
+        Request::DeleteKey    {..}  => "delete_key",
+        Request::RenameKey    {..}  => "rename_key",
+        Request::ListFeeds          => "list_feeds",
+        Request::GetFeed      {..}  => "get_feed",
+        Request::PutFeed      {..}  => "put_feed",
+        Request::DeleteFeed   {..}  => "delete_feed",
+        Request::RenameFeed   {..}  => "rename_feed",
+        Request::RunFeedNow   {..}  => "run_feed_now",
+        Request::SyncSchedules      => "sync_schedules",
+        Request::GetRunHistory{..}  => "get_run_history",
+        Request::PutSecret    {..}  => "put_secret",
+        Request::DeleteSecret {..}  => "delete_secret",
+        Request::ListSecrets        => "list_secrets",
+        Request::ClusterStatus      => "cluster_status",
+        Request::ClusterMintToken{..}  => "cluster_mint_token",
+        Request::ClusterRemoveNode{..} => "cluster_remove_node",
+        Request::ClusterLeave         => "cluster_leave",
+        Request::ClusterGetCa         => "cluster_get_ca",
+        Request::ClusterBackup{..}    => "cluster_backup",
+        Request::GetAuditLog{..}      => "get_audit_log",
+    }
 }
 
 // ============================================================

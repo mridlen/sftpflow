@@ -157,6 +157,12 @@ impl UsedNonces {
     pub fn new() -> Self { Self::default() }
     pub fn contains(&self, nonce_b64: &str) -> bool { self.nonces.contains(nonce_b64) }
     pub fn insert(&mut self, nonce_b64: String) { self.nonces.insert(nonce_b64); }
+    /// Remove a nonce. Used by the BootstrapService to roll back a
+    /// reservation when the join handler ultimately failed — we
+    /// reserve up-front to close the TOCTOU between concurrent
+    /// joiners, then un-reserve on failure so a transient error
+    /// doesn't burn the operator's one-shot token.
+    pub fn remove(&mut self, nonce_b64: &str) -> bool { self.nonces.remove(nonce_b64) }
     pub fn len(&self) -> usize { self.nonces.len() }
     pub fn is_empty(&self) -> bool { self.nonces.is_empty() }
 }

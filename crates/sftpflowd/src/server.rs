@@ -28,6 +28,7 @@ use sftpflow_proto::{
     framing,
     Request,
     RequestEnvelope,
+    Response,
     ResponseEnvelope,
 };
 
@@ -214,6 +215,21 @@ fn serve_unix(path: &str, state: SharedDaemonState) -> std::io::Result<()> {
 
     let listener = UnixListener::bind(path)?;
     info!("unix listener bound to {}", path);
+
+    // The socket inherits the process umask, which on most Linux
+    // distros is 0022 — leaving the socket world-readable and
+    // sometimes world-writable. Tighten to 0660 so only the daemon
+    // user and its group can speak NDJSON to us; operators on a
+    // shared host should run sftpflow under a dedicated group.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(
+            path,
+            std::fs::Permissions::from_mode(0o660),
+        ) {
+            warn!("could not chmod 0660 on '{}': {}", path, e);
+        }
+    }
 
     for incoming in listener.incoming() {
         match incoming {
@@ -495,9 +511,37 @@ fn dispatch_local_inner(env: RequestEnvelope, state: &SharedDaemonState) -> Resp
         // Raft leader (which then dispatches to a chosen member);
         // M12 just refuses on followers.
         Request::RunFeedNow { name } => {
-            let guard = state.lock().unwrap();
-            if let Some(rsp) = enforce_leader(id, &guard) { return rsp; }
-            result_to_envelope(id, handlers::run_feed_now(&guard, &name))
+            // Three-phase run so the daemon mutex isn't held during
+            // the transfer (which can take seconds to minutes and
+            // would otherwise serialize every other RPC).
+            //
+            //   1. Lock briefly: enforce leader, snapshot config,
+            //      resolve sealed-secret refs.
+            //   2. Drop lock: run the SFTP/FTP/HTTP transfer.
+            //   3. Re-lock briefly: record the run in SQLite.
+            let prep = {
+                let guard = state.lock().unwrap();
+                if let Some(rsp) = enforce_leader(id, &guard) { return rsp; }
+                // prepare_run_feed() in handlers.rs
+                match handlers::prepare_run_feed(&guard, &name) {
+                    Ok(p)  => p,
+                    Err(e) => return result_to_envelope(id, Err(e)),
+                }
+            };
+
+            // execute_run_feed() in handlers.rs - no daemon lock held here
+            let (result, duration, started_at, feed_name) =
+                handlers::execute_run_feed(prep);
+
+            // record_run_history() in handlers.rs
+            {
+                let guard = state.lock().unwrap();
+                handlers::record_run_history(
+                    &guard, &feed_name, &started_at, duration, &result,
+                );
+            }
+
+            ResponseEnvelope::success(id, Response::RunResult(result))
         }
 
         // ---- scheduler ----

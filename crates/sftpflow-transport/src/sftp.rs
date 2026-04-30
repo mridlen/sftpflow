@@ -8,6 +8,15 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
+
+/// Idle ssh connections die after this long with no traffic, so a
+/// stalled remote doesn't block the orchestrator forever.
+const SFTP_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Send a keepalive every 30s; combined with russh's default
+/// `keepalive_max = 3`, a black-holed remote drops within ~90s.
+const SFTP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 use async_trait::async_trait;
 use log::{info, warn};
@@ -153,7 +162,14 @@ impl SftpTransport {
         // when neither host_key_fingerprint nor verify_host_key
         // is set, so old configs surface the missing pin loudly
         // rather than silently trusting any peer.
-        let config = Arc::new(client::Config::default());
+        // Default Config has no inactivity / keepalive timeouts, so a
+        // hung TCP connection blocks the orchestrator forever. Cap
+        // both so a wedged peer surfaces as a connection error within
+        // ~90s instead of stalling the daemon.
+        let mut config = client::Config::default();
+        config.inactivity_timeout = Some(SFTP_INACTIVITY_TIMEOUT);
+        config.keepalive_interval = Some(SFTP_KEEPALIVE_INTERVAL);
+        let config = Arc::new(config);
         let handler = SshHandler {
             endpoint_name: name.to_string(),
             expected_fingerprint: endpoint.host_key_fingerprint.clone(),

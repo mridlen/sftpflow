@@ -106,6 +106,16 @@ fn validity_window(years: i32) -> (OffsetDateTime, OffsetDateTime) {
 pub struct ClusterCa {
     cert:     rcgen::Certificate,
     key_pair: KeyPair,
+    /// PEM bytes from the original on-disk CA cert, when this
+    /// `ClusterCa` was reloaded via `from_pem`. We hand THIS back
+    /// out of `cert_pem()` rather than `self.cert.pem()`, because
+    /// rcgen's `params.self_signed(&key_pair)` synthesizes a NEW
+    /// cert with a fresh serial / not_before / not_after every
+    /// call — so without this override, every restart would emit a
+    /// different cert PEM than the one already distributed to
+    /// joiners, breaking trust chains. `None` for a freshly
+    /// generated CA, where the in-memory cert IS the on-disk one.
+    persisted_cert_pem: Option<String>,
 }
 
 impl ClusterCa {
@@ -132,24 +142,40 @@ impl ClusterCa {
         ];
 
         let cert = params.self_signed(&key_pair)?;
-        Ok(Self { cert, key_pair })
+        Ok(Self { cert, key_pair, persisted_cert_pem: None })
     }
 
     /// Reload an existing CA from PEM bytes (cert + matching key).
     /// Called by the bootstrap node on restart.
+    ///
+    /// We keep the original `cert_pem` text in `persisted_cert_pem`
+    /// so subsequent calls to `cert_pem()` return the same bytes the
+    /// operator originally distributed. The synthesized rcgen
+    /// Certificate is still used internally for `sign_csr` (which
+    /// reads issuer DN + key from the params/keypair), and signed
+    /// leaves still chain to the persisted CA cert because the
+    /// issuer DN and the public key (hence SKI / AKI) are identical.
     pub fn from_pem(cert_pem: &str, key_pem: &str) -> Result<Self, TlsError> {
         let key_pair = KeyPair::from_pem(key_pem)
             .map_err(|e| TlsError::InvalidPem(format!("ca key: {}", e)))?;
         let params = CertificateParams::from_ca_cert_pem(cert_pem)
             .map_err(|e| TlsError::InvalidPem(format!("ca cert: {}", e)))?;
         let cert = params.self_signed(&key_pair)?;
-        Ok(Self { cert, key_pair })
+        Ok(Self {
+            cert,
+            key_pair,
+            persisted_cert_pem: Some(cert_pem.to_string()),
+        })
     }
 
     /// PEM-encoded CA certificate. Distributed to every member as
     /// the trust anchor.
     pub fn cert_pem(&self) -> String {
-        self.cert.pem()
+        if let Some(ref pem) = self.persisted_cert_pem {
+            pem.clone()
+        } else {
+            self.cert.pem()
+        }
     }
 
     /// PEM-encoded CA private key. **Sensitive** — only persisted
@@ -333,6 +359,21 @@ mod tests {
         // Reloading must succeed and produce the same DN.
         let reloaded = ClusterCa::from_pem(&cert_pem, &key_pem).unwrap();
         assert!(reloaded.cert_pem().contains("BEGIN CERTIFICATE"));
+    }
+
+    #[test]
+    fn reloaded_ca_returns_original_cert_pem() {
+        // Regression: from_pem used to re-self-sign and emit a
+        // freshly generated certificate (different serial / dates),
+        // breaking trust chains across restarts. Make sure the
+        // reloaded CA hands back exactly the PEM it was given.
+        let ca = ClusterCa::generate("test-cluster-stable").unwrap();
+        let cert_pem = ca.cert_pem();
+        let key_pem  = ca.key_pem();
+
+        let reloaded = ClusterCa::from_pem(&cert_pem, &key_pem).unwrap();
+        assert_eq!(reloaded.cert_pem(), cert_pem,
+            "reloaded CA must return the persisted PEM byte-for-byte");
     }
 
     #[test]
