@@ -395,7 +395,26 @@ pub async fn run_feed(
             feed_name, src.endpoint, src.path
         );
 
-        let ep = &endpoints[&src.endpoint];
+        // validate_feed already checked this referent exists, but
+        // index access would panic if a future caller bypassed
+        // validation. .get() turns that into a structured error.
+        let ep = match endpoints.get(&src.endpoint) {
+            Some(ep) => ep,
+            None => {
+                error!(
+                    "run_feed '{}': source endpoint '{}' missing from config",
+                    feed_name, src.endpoint,
+                );
+                return RunResult {
+                    feed: feed_name.to_string(),
+                    status: RunStatus::Failed,
+                    files_transferred: 0,
+                    message: Some(format!(
+                        "source endpoint '{}' not found", src.endpoint,
+                    )),
+                };
+            }
+        };
         let transport = match connect_endpoint(&src.endpoint, ep).await
         {
             Ok(t) => t,
@@ -567,7 +586,23 @@ pub async fn run_feed(
             feed_name, dst.endpoint, dst.path
         );
 
-        let ep = &endpoints[&dst.endpoint];
+        let ep = match endpoints.get(&dst.endpoint) {
+            Some(ep) => ep,
+            None => {
+                error!(
+                    "run_feed '{}': destination endpoint '{}' missing from config",
+                    feed_name, dst.endpoint,
+                );
+                return RunResult {
+                    feed: feed_name.to_string(),
+                    status: RunStatus::Failed,
+                    files_transferred: 0,
+                    message: Some(format!(
+                        "destination endpoint '{}' not found", dst.endpoint,
+                    )),
+                };
+            }
+        };
         let transport = match connect_endpoint(&dst.endpoint, ep).await
         {
             Ok(t) => t,
@@ -633,7 +668,17 @@ pub async fn run_feed(
                 continue;
             }
 
-            let ep = &endpoints[&src.endpoint];
+            let ep = match endpoints.get(&src.endpoint) {
+                Some(ep) => ep,
+                None => {
+                    warn!(
+                        "run_feed '{}': source endpoint '{}' missing from \
+                         config during cleanup; skipping",
+                        feed_name, src.endpoint,
+                    );
+                    continue;
+                }
+            };
             let transport =
                 match connect_endpoint(&src.endpoint, ep).await {
                     Ok(t) => t,

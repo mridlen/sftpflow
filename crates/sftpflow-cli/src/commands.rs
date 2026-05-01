@@ -318,6 +318,13 @@ fn parse_user_at_host(target: &str) -> Result<(String, String, Option<u16>), Str
     if let Some((host, port_str)) = host_port.rsplit_once(':') {
         let port = port_str.parse::<u16>()
             .map_err(|_| format!("'{}' is not a valid port number", port_str))?;
+        // u16 parses 0 successfully but port 0 is meaningless for an
+        // outbound connection (it's the kernel's "pick any" signal
+        // for binders); reject explicitly so an operator typo
+        // surfaces here, not as a confusing connect failure later.
+        if port == 0 {
+            return Err(format!("port 0 is not a valid destination in '{}'", target));
+        }
         if host.is_empty() {
             return Err(format!("empty host in '{}'", target));
         }
@@ -1156,6 +1163,13 @@ pub fn set_server_port(args: &[&str], state: &mut ShellState) {
     }
     let out = state.out;
     match args[0].parse::<u16>() {
+        Ok(0) => {
+            out.error_coded("PARSE", format!(
+                "Invalid port number: '{}' (port 0 is not a valid destination)",
+                args[0],
+            ));
+            state.exit_code = 2;
+        }
         Ok(p) => {
             if let Some(ref mut server) = state.pending_server {
                 info!("Set server port = {}", p);
@@ -1370,6 +1384,14 @@ pub fn set_port(args: &[&str], state: &mut ShellState) {
     }
     let out = state.out;
     let value: u16 = match args[0].parse() {
+        Ok(0) => {
+            out.error_coded("PARSE", format!(
+                "Invalid port number: '{}' (port 0 is not a valid destination)",
+                args[0],
+            ));
+            state.exit_code = 2;
+            return;
+        }
         Ok(v) => v,
         Err(_) => {
             out.error_coded("PARSE", format!("Invalid port number: '{}'", args[0]));
@@ -3945,6 +3967,9 @@ fn parse_ssh_target(target: &str) -> Result<(&str, &str, Option<u16>), String> {
     if let Some((host, port_str)) = host_port.rsplit_once(':') {
         let port = port_str.parse::<u16>()
             .map_err(|_| format!("'{}' is not a valid port number", port_str))?;
+        if port == 0 {
+            return Err(format!("port 0 is not a valid destination in '{}'", target));
+        }
         if host.is_empty() {
             return Err(format!("Empty host in '{}'", target));
         }

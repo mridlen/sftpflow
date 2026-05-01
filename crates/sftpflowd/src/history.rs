@@ -13,7 +13,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use log::{error, info};
+use log::{error, info, warn};
 use rusqlite::{Connection, params};
 
 use sftpflow_proto::{RunHistoryEntry, RunResult, RunStatus};
@@ -45,8 +45,18 @@ impl RunDb {
         })?;
 
         // Enable WAL mode for better concurrency (multiple readers
-        // while one writer records a run).
-        conn.execute_batch("PRAGMA journal_mode=WAL;").ok();
+        // while one writer records a run). SQLite silently downgrades
+        // to rollback-journal mode when WAL isn't supported (read-only
+        // FS, network mounts that block shared-memory mapping); log
+        // the downgrade so operators don't assume durability semantics
+        // they don't have.
+        if let Err(e) = conn.execute_batch("PRAGMA journal_mode=WAL;") {
+            warn!(
+                "run history at '{}': WAL mode could not be set: {} \
+                 (concurrent reads while writing may block)",
+                path.display(), e,
+            );
+        }
 
         // Create the runs table if it doesn't exist yet.
         conn.execute_batch(

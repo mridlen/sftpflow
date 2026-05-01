@@ -306,6 +306,25 @@ fn missing(name: &str, field: &str) -> TransportError {
     TransportError::MissingField(name.to_string(), field.to_string())
 }
 
+/// Acquire the FTP client mutex, recovering gracefully from a
+/// poisoned mutex (a previous panic while the lock was held).
+/// Recovery is safe here because the FtpClient is just a wrapper
+/// around a TCP stream — a panic mid-call may have left the FTP
+/// command pipeline in an unknown state, but our caller's next
+/// FTP command will surface that as a protocol error rather than
+/// taking the daemon down with a fresh `unwrap` panic.
+fn lock_client<'a>(
+    inner: &'a std::sync::Mutex<FtpClient>,
+) -> std::sync::MutexGuard<'a, FtpClient> {
+    match inner.lock() {
+        Ok(g) => g,
+        Err(poison) => {
+            warn!("ftp: recovering from poisoned mutex");
+            poison.into_inner()
+        }
+    }
+}
+
 // ============================================================
 // rustls ClientConfig builder
 // ============================================================
@@ -398,7 +417,7 @@ impl Transport for FtpTransport {
         let inner = Arc::clone(&self.inner);
         let dir = remote_dir.to_string();
         tokio::task::spawn_blocking(move || -> Result<Vec<String>, TransportError> {
-            let mut guard = inner.lock().unwrap();
+            let mut guard = lock_client(&inner);
             let names = guard.list(Some(&dir)).map_err(|e| {
                 TransportError::Io(format!("FTP NLST '{}' failed: {}", dir, e))
             })?;
@@ -431,7 +450,7 @@ impl Transport for FtpTransport {
         let remote = remote_path.to_string();
         let local = local_path.to_path_buf();
         tokio::task::spawn_blocking(move || -> Result<(), TransportError> {
-            let mut guard = inner.lock().unwrap();
+            let mut guard = lock_client(&inner);
             // retr_to_file() in this file
             guard.retr_to_file(&remote, &local).map_err(|e| {
                 TransportError::Io(format!(
@@ -458,7 +477,7 @@ impl Transport for FtpTransport {
         let partial = format!("{}.partial", remote_path);
         let local = local_path.to_path_buf();
         tokio::task::spawn_blocking(move || -> Result<(), TransportError> {
-            let mut guard = inner.lock().unwrap();
+            let mut guard = lock_client(&inner);
             // put_from_file() in this file
             if let Err(e) = guard.put_from_file(&partial, &local) {
                 // Best-effort cleanup so the next run doesn't trip
@@ -498,7 +517,7 @@ impl Transport for FtpTransport {
         let inner = Arc::clone(&self.inner);
         let remote = remote_path.to_string();
         tokio::task::spawn_blocking(move || -> Result<(), TransportError> {
-            let mut guard = inner.lock().unwrap();
+            let mut guard = lock_client(&inner);
             guard.rm(&remote).map_err(|e| {
                 TransportError::Io(format!(
                     "FTP DELE '{}' failed: {}", remote, e,

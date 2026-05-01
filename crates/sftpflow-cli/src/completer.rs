@@ -175,7 +175,17 @@ impl Completer for ShellHelper {
         // prefix_start points at the first character of the
         // current token. Anything before it counts as "prior"
         // tokens that have already been typed.
-        let prefix_end   = pos;
+        //
+        // rustyline gives us `pos` as a byte offset. If the user
+        // pasted multibyte text and the cursor lands mid-codepoint,
+        // a naive `&line[..pos]` would panic. Defensively snap pos
+        // back to the nearest char boundary at or before the
+        // requested index — completion at a non-boundary cursor
+        // position isn't meaningful anyway.
+        let mut prefix_end = pos.min(line.len());
+        while prefix_end > 0 && !line.is_char_boundary(prefix_end) {
+            prefix_end -= 1;
+        }
         let prefix_start = line[..prefix_end]
             .rfind(char::is_whitespace)
             .map(|i| i + 1)

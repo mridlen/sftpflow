@@ -478,15 +478,26 @@ fn method_name(req: &Request) -> &'static str {
 /// last Tuesday?". Falls back to `unknown@local` when the OS gives
 /// no username.
 fn local_caller_for(addr: &str) -> String {
-    let user = std::env::var("USER")
+    let raw = std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
         .unwrap_or_else(|_| "unknown".to_string());
-    // Keep the address suffix short — full Unix paths are noisy in
-    // an audit table. Just include host:port for TCP, drop the path
-    // for Unix sockets (the "@local" already conveys "this box").
+    // The OS-supplied username is operator-controlled (someone can
+    // export USER='admin@evil' before running the CLI) so we
+    // sanitize before stamping it into an audit row. Strip every
+    // char that could let it impersonate the SSH attribution form
+    // (`<ssh-user>@<host>`): @, whitespace, and control bytes.
+    // Anything left empty after stripping falls back to "unknown".
+    let sanitized: String = raw
+        .chars()
+        .filter(|c| *c != '@' && !c.is_whitespace() && !c.is_control())
+        .collect();
+    let user = if sanitized.is_empty() { "unknown".to_string() } else { sanitized };
+    // The `local:` prefix is a tag the SSH path can never produce
+    // (SSH callers are stamped `<user>@<host>`), so audit consumers
+    // can distinguish dev-socket calls at a glance.
     if addr.starts_with('/') {
-        format!("{}@local", user)
+        format!("local:{}@local", user)
     } else {
-        format!("{}@local:{}", user, addr)
+        format!("local:{}@local:{}", user, addr)
     }
 }

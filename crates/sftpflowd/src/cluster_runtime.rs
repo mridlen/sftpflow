@@ -547,8 +547,22 @@ fn make_seed_join_handler(
             // clean error rather than a half-applied membership.
             let existing: BTreeSet<u64> = handle.members().keys().copied().collect();
             let assigned_node_id = if req.desired_node_id == 0 {
-                existing.iter().copied().max().unwrap_or(0) + 1
+                // checked_add so a (vanishingly unlikely) cluster
+                // sitting at u64::MAX doesn't wrap to 0 in release.
+                let highest = existing.iter().copied().max().unwrap_or(0);
+                highest.checked_add(1).ok_or_else(|| {
+                    format!(
+                        "cannot allocate node_id: existing max is {} (u64::MAX)",
+                        highest,
+                    )
+                })?
             } else {
+                if req.desired_node_id == 0 {
+                    // Defense in depth: 0 is the wire signal for
+                    // "auto-assign", so an explicit 0 in the
+                    // non-zero branch must never make it here.
+                    return Err("desired_node_id 0 is reserved as the auto-assign signal".to_string());
+                }
                 if existing.contains(&req.desired_node_id) {
                     return Err(format!(
                         "node_id {} already exists in this cluster",

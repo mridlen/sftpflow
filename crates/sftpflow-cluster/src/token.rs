@@ -285,7 +285,11 @@ pub fn validate(
         .duration_since(UNIX_EPOCH)
         .map_err(|_| TokenError::ClockError)?
         .as_secs();
-    if now > exp_unix {
+    // `>=` so a token with `exp_unix == now` is treated as expired.
+    // The earlier `>` permitted a one-second grace window which had
+    // no defensible reason and combined with `mint(ttl=0)` allowed
+    // an effectively-already-expired token to validate for a tick.
+    if now >= exp_unix {
         return Err(TokenError::Expired);
     }
 

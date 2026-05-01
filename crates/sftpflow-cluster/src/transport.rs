@@ -434,6 +434,20 @@ impl BootstrapService for BootstrapServiceImpl {
         // HMAC + nonce is the auth.
         let req = request.into_inner();
 
+        // 0. Sanitize the wire-supplied advertise_addr. The string
+        //    flows into ClusterMember.advertise_addr → the Raft log
+        //    → every peer's `Endpoint::from_shared("https://{}", ...)`
+        //    on each restart. A name with `/`, `@`, or whitespace
+        //    in it would let a hostile joiner steer the URL parser
+        //    in unexpected directions on every node. Require
+        //    `host:port` shape and parseable port.
+        // validate_advertise_addr() - below
+        if let Err(e) = validate_advertise_addr(&req.advertise_addr) {
+            return Err(Status::invalid_argument(format!(
+                "advertise_addr '{}' rejected: {}", req.advertise_addr, e,
+            )));
+        }
+
         // 1. Validate AND reserve the nonce in one critical section
         //    so two concurrent joiners can't both pass validation
         //    before either inserts. Without this, a single token
@@ -612,4 +626,66 @@ pub async fn run_grpc_server(
 #[allow(dead_code)]
 fn _silence_unused() {
     let _: Option<RemoteError<u64, ClusterMember, RaftError<u64>>> = None;
+}
+
+/// Reject anything that doesn't look like `host:port` so a hostile
+/// joiner can't poison the cluster's shared `advertise_addr` field
+/// with a string the URL parser would interpret as a different
+/// host on every peer (slashes, `@` userinfo, whitespace, etc.).
+fn validate_advertise_addr(addr: &str) -> Result<(), String> {
+    if addr.is_empty() {
+        return Err("empty".into());
+    }
+    if addr.len() > 253 {
+        return Err("longer than 253 chars".into());
+    }
+    if addr.contains(|c: char| {
+        c == '/' || c == '\\' || c == '@' || c == '?' || c == '#'
+            || c == ' ' || c == '\t' || c.is_control()
+    }) {
+        return Err("contains a disallowed character (/, \\, @, ?, #, whitespace, or control)".into());
+    }
+    let (host, port_str) = addr.rsplit_once(':')
+        .ok_or_else(|| "missing ':port' suffix".to_string())?;
+    if host.is_empty() {
+        return Err("empty host before ':'".into());
+    }
+    let port: u16 = port_str.parse()
+        .map_err(|_| format!("port '{}' is not a u16", port_str))?;
+    if port == 0 {
+        return Err("port 0 is not a valid destination".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod validate_advertise_addr_tests {
+    use super::validate_advertise_addr;
+
+    #[test]
+    fn accepts_dns_and_ip() {
+        validate_advertise_addr("node1.example.com:7900").unwrap();
+        validate_advertise_addr("10.0.0.1:7900").unwrap();
+    }
+
+    #[test]
+    fn rejects_url_smuggling() {
+        for bad in [
+            "evil.com/path:7900",
+            "user@evil.com:7900",
+            "host:7900/foo",
+            "host with space:7900",
+            "no-port-here",
+            "host:99999",
+            "host:0",
+            ":7900",
+            "",
+        ] {
+            assert!(
+                validate_advertise_addr(bad).is_err(),
+                "expected '{}' to be rejected",
+                bad,
+            );
+        }
+    }
 }

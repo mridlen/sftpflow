@@ -202,13 +202,17 @@ impl RaftLogReader<TypeConfig> for SledStore {
         &mut self,
         range: RB,
     ) -> Result<Vec<Entry<TypeConfig>>, StorageError<u64>> {
+        // saturating_add so a `Bound::Excluded(u64::MAX)` /
+        // `Bound::Included(u64::MAX)` from openraft (rare, but
+        // possible during snapshot edge cases) doesn't panic in
+        // debug builds or wrap to 0 in release.
         let start = match range.start_bound() {
             std::ops::Bound::Included(&i) => log_key(i),
-            std::ops::Bound::Excluded(&i) => log_key(i + 1),
+            std::ops::Bound::Excluded(&i) => log_key(i.saturating_add(1)),
             std::ops::Bound::Unbounded     => log_key(0),
         };
         let end = match range.end_bound() {
-            std::ops::Bound::Included(&i) => log_key(i + 1),
+            std::ops::Bound::Included(&i) => log_key(i.saturating_add(1)),
             std::ops::Bound::Excluded(&i) => log_key(i),
             std::ops::Bound::Unbounded     => log_key(u64::MAX),
         };
@@ -343,7 +347,7 @@ impl RaftStorage<TypeConfig> for SledStore {
         // the high-water mark so get_log_state() still answers
         // correctly after the entries themselves are gone.
         let start = log_key(0);
-        let end   = log_key(log_id.index + 1);
+        let end   = log_key(log_id.index.saturating_add(1));
         let keys: Vec<_> = self
             .db
             .log

@@ -455,12 +455,26 @@ impl Transport for SftpTransport {
         &self,
         remote_path: &str,
     ) -> Result<(), TransportError> {
-        self.sftp.remove_file(remote_path).await.map_err(|e| {
-            TransportError::Io(format!(
+        // Treat "no such file" as success so a re-run after a
+        // partial cleanup (where the source file was already
+        // removed in a prior run) succeeds idempotently.
+        // russh_sftp doesn't expose status codes through its public
+        // error type, so we substring-match on the formatted
+        // message — the StatusCode Display is `"No such file"`.
+        if let Err(e) = self.sftp.remove_file(remote_path).await {
+            let msg = e.to_string();
+            if msg.to_ascii_lowercase().contains("no such file") {
+                info!(
+                    "sftp delete: remote '{}' already absent — treating as success",
+                    remote_path,
+                );
+                return Ok(());
+            }
+            return Err(TransportError::Io(format!(
                 "failed to delete remote file '{}': {}",
-                remote_path, e
-            ))
-        })?;
+                remote_path, e,
+            )));
+        }
         Ok(())
     }
 }

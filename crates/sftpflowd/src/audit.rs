@@ -20,7 +20,7 @@
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use log::{error, info};
+use log::{error, info, warn};
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 
@@ -55,8 +55,15 @@ impl AuditDb {
 
         // WAL keeps the audit recorder from blocking concurrent
         // reads (a `show audit` query while another connection is
-        // mid-mutation).
-        conn.execute_batch("PRAGMA journal_mode=WAL;").ok();
+        // mid-mutation). Log the downgrade if the FS rejects WAL —
+        // operators should know if their durability story differs.
+        if let Err(e) = conn.execute_batch("PRAGMA journal_mode=WAL;") {
+            warn!(
+                "audit db at '{}': WAL mode could not be set: {} \
+                 (rollback-journal fallback in effect)",
+                path.display(), e,
+            );
+        }
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS audit_log (
