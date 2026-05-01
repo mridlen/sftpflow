@@ -578,6 +578,22 @@ pub struct ResponseEnvelope {
 pub enum ResponseOutcome {
     Success { result: Response },
     Failure { error: ProtoError },
+    /// Forward-compat shim: an older CLI talking to a newer daemon
+    /// may receive a `result` whose `kind` tag this CLI's `Response`
+    /// enum doesn't know how to decode. Rather than fail the whole
+    /// envelope parse (which would make every RPC look like a
+    /// protocol error), we capture the unknown shape here so the
+    /// CLI can surface a clear "this CLI is too old" message and
+    /// the operator knows what to upgrade.
+    ///
+    /// `value` is the raw JSON the daemon shipped under `value`
+    /// (None if the daemon sent only the `kind` tag, e.g. a
+    /// future unit variant). The CLI doesn't poke at it; it's
+    /// retained for diagnostics / forward-compat tunnelling.
+    UnknownSuccess {
+        kind:  String,
+        value: Option<serde_json::Value>,
+    },
 }
 
 impl serde::Serialize for ResponseOutcome {
@@ -591,30 +607,108 @@ impl serde::Serialize for ResponseOutcome {
             ResponseOutcome::Failure { error } => {
                 map.serialize_entry("error", error)?;
             }
+            ResponseOutcome::UnknownSuccess { kind, value } => {
+                // Re-emit the original adjacently-tagged shape so a
+                // round-trip is faithful: a CLI that captured the
+                // unknown variant could in theory re-ship it (e.g.
+                // through audit-log replay tooling).
+                let mut payload = serde_json::Map::new();
+                payload.insert("kind".to_string(), serde_json::Value::String(kind.clone()));
+                if let Some(v) = value {
+                    payload.insert("value".to_string(), v.clone());
+                }
+                map.serialize_entry("result", &serde_json::Value::Object(payload))?;
+            }
         }
         map.end()
     }
 }
 
+/// Snake-case names of every variant `Response` knows how to
+/// decode. Kept here because the deserializer needs to
+/// distinguish "unknown kind" (forward-compat case → fall back
+/// to UnknownSuccess) from "known kind with malformed value"
+/// (real bug → propagate the error). serde's "unknown variant"
+/// error message isn't reliable to match on, so we maintain
+/// this list explicitly. **Add a name here whenever you add a
+/// new variant to `Response`.**
+const KNOWN_RESPONSE_KINDS: &[&str] = &[
+    "pong",
+    "server_info",
+    "names",
+    "endpoint",
+    "key",
+    "feed",
+    "feed_summaries",
+    "ok",
+    "run_result",
+    "sync_report",
+    "run_history",
+    "cluster_status",
+    "cluster_token",
+    "cluster_ca_cert",
+    "backup_report",
+    "audit_log",
+    "dry_run_report",
+];
+
 impl<'de> serde::Deserialize<'de> for ResponseEnvelope {
     fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
-        // Deserialize via an intermediate Helper that captures both
-        // fields independently, then enforce "exactly one present"
-        // ourselves. This rejects malformed peers that ship both.
+        // Capture the raw envelope as a Value first so we can
+        // (a) enforce "exactly one of result / error" and
+        // (b) fall back to UnknownSuccess on unknown `kind` strings
+        //     in `result` without losing the rest of the envelope,
+        //     while still propagating real deserialize errors for
+        //     known kinds with malformed payloads.
         #[derive(Deserialize)]
         struct Helper {
             id:     u64,
             #[serde(default)]
-            result: Option<Response>,
+            result: Option<serde_json::Value>,
             #[serde(default)]
             error:  Option<ProtoError>,
         }
         let h = Helper::deserialize(de)?;
         match (h.result, h.error) {
-            (Some(r), None) => Ok(ResponseEnvelope {
-                id: h.id,
-                outcome: ResponseOutcome::Success { result: r },
-            }),
+            (Some(raw_result), None) => {
+                // Look at the `kind` tag first. If it's a name
+                // this CLI knows, deserialize strictly via Response
+                // and propagate any error (including a malformed
+                // `value` body — that's a real bug, NOT a forward-
+                // compat case). If the tag is unrecognized, lift
+                // it into UnknownSuccess so the caller can render a
+                // clean "upgrade me" message.
+                let kind_str = raw_result
+                    .as_object()
+                    .and_then(|o| o.get("kind"))
+                    .and_then(|k| k.as_str());
+                let is_known = match kind_str {
+                    Some(k) => KNOWN_RESPONSE_KINDS.iter().any(|&known| known == k),
+                    None    => false,
+                };
+
+                if is_known {
+                    let result = serde_json::from_value::<Response>(raw_result)
+                        .map_err(serde::de::Error::custom)?;
+                    Ok(ResponseEnvelope {
+                        id: h.id,
+                        outcome: ResponseOutcome::Success { result },
+                    })
+                } else {
+                    let kind = kind_str
+                        .ok_or_else(|| serde::de::Error::custom(
+                            "response.result is not an object with a `kind` tag",
+                        ))?
+                        .to_string();
+                    let value = raw_result
+                        .as_object()
+                        .and_then(|o| o.get("value").cloned());
+                    Ok(ResponseEnvelope {
+                        id: h.id,
+                        outcome: ResponseOutcome::UnknownSuccess { kind, value },
+                    })
+                }
+            }
             (None, Some(e)) => Ok(ResponseEnvelope {
                 id: h.id,
                 outcome: ResponseOutcome::Failure { error: e },
@@ -909,6 +1003,77 @@ mod tests {
             err.to_string().contains("BOTH `result` and `error`"),
             "wrong error: {}", err,
         );
+    }
+
+    #[test]
+    fn unknown_kind_with_value_decodes_as_unknown_success() {
+        // Forward-compat: a newer daemon ships a brand-new
+        // `Response` variant with a body. The CLI's older
+        // `Response` enum can't decode it — instead of failing
+        // the whole envelope, we lift it into UnknownSuccess so
+        // the caller can render a clear "upgrade me" error.
+        let json = r#"{"id":7,"result":{"kind":"future_thing","value":{"x":42}}}"#;
+        let env: ResponseEnvelope = serde_json::from_str(json).unwrap();
+        assert_eq!(env.id, 7);
+        match env.outcome {
+            ResponseOutcome::UnknownSuccess { kind, value } => {
+                assert_eq!(kind, "future_thing");
+                let v = value.expect("value should be captured");
+                assert_eq!(v.get("x").and_then(|x| x.as_i64()), Some(42));
+            }
+            other => panic!("expected UnknownSuccess, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unknown_kind_without_value_decodes_as_unknown_success() {
+        // Future-unit-variant case: the daemon ships only a
+        // `kind` tag (e.g. a new acknowledgement-only response).
+        let json = r#"{"id":11,"result":{"kind":"future_unit"}}"#;
+        let env: ResponseEnvelope = serde_json::from_str(json).unwrap();
+        match env.outcome {
+            ResponseOutcome::UnknownSuccess { kind, value } => {
+                assert_eq!(kind, "future_unit");
+                assert!(value.is_none());
+            }
+            other => panic!("expected UnknownSuccess, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn known_kind_with_bad_payload_still_errors() {
+        // We DON'T want UnknownSuccess to mask a real bug: a
+        // known kind whose `value` is malformed must still fail
+        // loud. Otherwise a daemon shipping a corrupt
+        // `run_result` would silently surface as UnknownSuccess
+        // and confuse the operator.
+        let json = r#"{"id":3,"result":{"kind":"run_result","value":{"feed":42}}}"#;
+        let err = serde_json::from_str::<ResponseEnvelope>(json).unwrap_err();
+        // The message wording isn't pinned, but it must NOT be
+        // the UnknownSuccess fallthrough — and the caller would
+        // see a deserialize failure proper.
+        assert!(
+            !err.to_string().contains("no `kind` tag"),
+            "expected real deserialize error, got UnknownSuccess fallthrough: {}",
+            err,
+        );
+    }
+
+    #[test]
+    fn unknown_success_round_trips_through_serialize() {
+        // A captured UnknownSuccess can be re-serialized to the
+        // wire and the bytes round-trip. Useful for tooling that
+        // logs / replays envelopes through an old CLI.
+        let env = ResponseEnvelope {
+            id: 99,
+            outcome: ResponseOutcome::UnknownSuccess {
+                kind:  "from_the_future".to_string(),
+                value: Some(serde_json::json!({"hello": "world"})),
+            },
+        };
+        let json = serde_json::to_string(&env).unwrap();
+        let parsed: ResponseEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, env);
     }
 
     #[test]

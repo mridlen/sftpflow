@@ -1239,6 +1239,21 @@ pub fn cluster_leave(state: &DaemonState) -> Result<Response, ProtoError> {
             Ok(result)
         }
         sftpflow_proto::ResponseOutcome::Failure { error } => Err(error),
+        // We're the daemon, so the leader we forwarded to is also a
+        // daemon — both sides know the same Response variants. An
+        // UnknownSuccess here would mean a peer ran a future
+        // version with a brand-new variant; surface as a clear
+        // protocol error rather than silently dropping the leave.
+        sftpflow_proto::ResponseOutcome::UnknownSuccess { kind, .. } => {
+            Err(ProtoError::new(
+                error_code::INTERNAL_ERROR,
+                format!(
+                    "leader returned unknown response kind '{}' for ClusterLeave \
+                     — peer is running a newer protocol than this node",
+                    kind,
+                ),
+            ))
+        }
     }
 }
 

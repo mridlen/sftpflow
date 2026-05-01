@@ -1312,6 +1312,14 @@ fn record_audit(
     let live_outcome = match &response.outcome {
         sftpflow_proto::ResponseOutcome::Success { .. } => "ok".to_string(),
         sftpflow_proto::ResponseOutcome::Failure { error } => format!("err:{}", error.code),
+        // The daemon never constructs UnknownSuccess itself — it
+        // arises only on the deserialize side when a CLI sees a
+        // newer daemon's response. The match arm exists only to
+        // keep this exhaustive against future ResponseOutcome
+        // additions.
+        sftpflow_proto::ResponseOutcome::UnknownSuccess { kind, .. } => {
+            format!("unknown:{}", kind)
+        }
     };
     let outcome = if dry_run {
         format!("dry-run:{}", live_outcome)

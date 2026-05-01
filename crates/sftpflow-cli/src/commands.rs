@@ -84,6 +84,11 @@ fn report_rpc_err(out: Output, err: &RpcError, exit_code: &mut i32) {
             Some("CLI config: ~/.sftpflow/config.yaml"),
         ),
         RpcError::Proto(_) => ("RPC_PROTO", None, None), // shouldn't be reached
+        RpcError::UnknownResponseKind(_) => (
+            "RPC_UNKNOWN_RESPONSE",
+            Some("upgrade the CLI to match the daemon's protocol version"),
+            None,
+        ),
     };
     out.error_full(code, format!("{}", err), hint, details);
     *exit_code = 1;

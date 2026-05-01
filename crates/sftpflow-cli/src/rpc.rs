@@ -61,6 +61,12 @@ pub enum RpcError {
     Proto(ProtoError),
     UnexpectedEof,
     ConnectionNotConfigured(String),
+    /// The daemon returned a successful envelope whose `kind`
+    /// string this CLI's `Response` enum doesn't recognize. Means
+    /// the daemon is newer than the CLI; operator action is to
+    /// upgrade the CLI. Carries the unknown `kind` for the error
+    /// message.
+    UnknownResponseKind(String),
 }
 
 impl std::fmt::Display for RpcError {
@@ -70,6 +76,13 @@ impl std::fmt::Display for RpcError {
             RpcError::Proto(e) => write!(f, "RPC error {}: {}", e.code, e.message),
             RpcError::UnexpectedEof => write!(f, "daemon closed connection unexpectedly"),
             RpcError::ConnectionNotConfigured(msg) => write!(f, "{}", msg),
+            RpcError::UnknownResponseKind(kind) => write!(
+                f,
+                "daemon returned an unrecognized response kind '{}' — \
+                 this CLI is older than the daemon; consider upgrading \
+                 the CLI",
+                kind,
+            ),
         }
     }
 }
@@ -312,11 +325,17 @@ impl RpcClient {
             ResponseOutcome::Failure { error } => {
                 debug!("rpc: received id={} err code={}", response.id, error.code);
             }
+            ResponseOutcome::UnknownSuccess { kind, .. } => {
+                debug!("rpc: received id={} unknown kind={}", response.id, kind);
+            }
         }
 
         match response.outcome {
             ResponseOutcome::Success { result } => Ok(result),
             ResponseOutcome::Failure { error } => Err(RpcError::Proto(error)),
+            ResponseOutcome::UnknownSuccess { kind, .. } => {
+                Err(RpcError::UnknownResponseKind(kind))
+            }
         }
     }
 }
