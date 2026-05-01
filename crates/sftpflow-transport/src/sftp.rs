@@ -24,7 +24,6 @@ use russh::client;
 use russh::keys::ssh_key;
 use russh::keys::PrivateKeyWithHashAlg;
 use russh_sftp::client::SftpSession;
-use tokio::io::AsyncReadExt;
 
 use sftpflow_core::Endpoint;
 
@@ -336,36 +335,40 @@ impl Transport for SftpTransport {
         remote_path: &str,
         local_path: &Path,
     ) -> Result<(), TransportError> {
-        // Read the remote file contents
-        let mut remote_file =
-            self.sftp.open(remote_path).await.map_err(|e| {
-                TransportError::Io(format!(
-                    "failed to open remote file '{}': {}",
-                    remote_path, e
-                ))
-            })?;
+        // Stream the remote file directly to disk. Earlier versions
+        // slurped the whole file into a Vec<u8> with `read_to_end`,
+        // which OOM'd the daemon on multi-GB feeds. tokio::io::copy
+        // moves bytes through an internal buffer (~8 KiB by default).
+        let mut remote_file = self.sftp.open(remote_path).await.map_err(|e| {
+            TransportError::Io(format!(
+                "failed to open remote file '{}': {}",
+                remote_path, e
+            ))
+        })?;
 
-        let mut contents = Vec::new();
-        remote_file
-            .read_to_end(&mut contents)
-            .await
-            .map_err(|e| {
-                TransportError::Io(format!(
-                    "failed to read remote file '{}': {}",
-                    remote_path, e
-                ))
-            })?;
+        let mut local_file = tokio::fs::File::create(local_path).await.map_err(|e| {
+            TransportError::Io(format!(
+                "failed to create local file '{}': {}",
+                local_path.display(), e,
+            ))
+        })?;
 
-        // Write to local file
-        tokio::fs::write(local_path, &contents)
-            .await
-            .map_err(|e| {
-                TransportError::Io(format!(
-                    "failed to write local file '{}': {}",
-                    local_path.display(),
-                    e
-                ))
-            })?;
+        tokio::io::copy(&mut remote_file, &mut local_file).await.map_err(|e| {
+            TransportError::Io(format!(
+                "failed to stream remote '{}' -> local '{}': {}",
+                remote_path, local_path.display(), e,
+            ))
+        })?;
+
+        // Flush kernel buffers so the file is fully on disk before
+        // any process step / upload phase tries to read it back.
+        use tokio::io::AsyncWriteExt;
+        local_file.flush().await.map_err(|e| {
+            TransportError::Io(format!(
+                "failed to flush local file '{}': {}",
+                local_path.display(), e,
+            ))
+        })?;
 
         Ok(())
     }
@@ -375,40 +378,73 @@ impl Transport for SftpTransport {
         local_path: &Path,
         remote_path: &str,
     ) -> Result<(), TransportError> {
-        // Read local file
-        let contents =
-            tokio::fs::read(local_path).await.map_err(|e| {
-                TransportError::Io(format!(
-                    "failed to read local file '{}': {}",
-                    local_path.display(),
-                    e
-                ))
-            })?;
-
-        // Write to remote via SFTP
+        // Stream local file → remote .partial → rename.
+        //
+        // Two improvements over the old slurp-and-write_all path:
+        //   1. tokio::io::copy bounds memory at the buffer size,
+        //      not the file size, so multi-GB uploads don't OOM.
+        //   2. We write to `<remote>.partial` and SFTP-rename to
+        //      the final name only after a successful flush, so a
+        //      mid-stream failure doesn't leave a half-written file
+        //      under the canonical name. The next run sees no
+        //      destination file and retries cleanly.
         use tokio::io::AsyncWriteExt;
-        let mut remote_file =
-            self.sftp.create(remote_path).await.map_err(|e| {
-                TransportError::Io(format!(
-                    "failed to create remote file '{}': {}",
-                    remote_path, e
-                ))
-            })?;
 
-        remote_file
-            .write_all(&contents)
-            .await
-            .map_err(|e| {
-                TransportError::Io(format!(
-                    "failed to write remote file '{}': {}",
-                    remote_path, e
-                ))
-            })?;
+        let partial_path = format!("{}.partial", remote_path);
+
+        let mut local_file = tokio::fs::File::open(local_path).await.map_err(|e| {
+            TransportError::Io(format!(
+                "failed to open local file '{}': {}",
+                local_path.display(), e,
+            ))
+        })?;
+
+        let mut remote_file = self.sftp.create(&partial_path).await.map_err(|e| {
+            TransportError::Io(format!(
+                "failed to create remote file '{}': {}",
+                partial_path, e,
+            ))
+        })?;
+
+        if let Err(e) = tokio::io::copy(&mut local_file, &mut remote_file).await {
+            // Best-effort cleanup: remove the partial so the next
+            // run isn't blocked on a stale half-write. Failures here
+            // are logged and ignored — the original error is more
+            // important.
+            let _ = remote_file.shutdown().await;
+            if let Err(rm) = self.sftp.remove_file(&partial_path).await {
+                warn!(
+                    "sftp upload: failed to cleanup partial '{}' after error: {}",
+                    partial_path, rm,
+                );
+            }
+            return Err(TransportError::Io(format!(
+                "failed to stream local '{}' -> remote '{}': {}",
+                local_path.display(), partial_path, e,
+            )));
+        }
 
         remote_file.shutdown().await.map_err(|e| {
             TransportError::Io(format!(
                 "failed to flush remote file '{}': {}",
-                remote_path, e
+                partial_path, e,
+            ))
+        })?;
+
+        // Drop the file handle before rename so the SFTP server
+        // sees the file as closed (some servers refuse to rename
+        // an open file).
+        drop(remote_file);
+
+        // Some servers refuse rename when the target already
+        // exists; remove an existing destination first. Best-effort:
+        // a "no such file" failure is fine.
+        let _ = self.sftp.remove_file(remote_path).await;
+
+        self.sftp.rename(partial_path.clone(), remote_path.to_string()).await.map_err(|e| {
+            TransportError::Io(format!(
+                "failed to rename '{}' -> '{}': {}",
+                partial_path, remote_path, e,
             ))
         })?;
 

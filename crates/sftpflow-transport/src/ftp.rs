@@ -90,19 +90,52 @@ impl FtpClient {
         }
     }
 
-    fn retr_as_buffer(&mut self, path: &str) -> Result<Vec<u8>, suppaftp::FtpError> {
-        let cursor = match self {
-            FtpClient::Plain(s) => s.retr_as_buffer(path)?,
-            FtpClient::Tls(s)   => s.retr_as_buffer(path)?,
+    /// Stream a remote file into `local_path`. Uses suppaftp's
+    /// `retr` callback variant so the full file never materializes
+    /// in memory — only one transfer-buffer chunk at a time.
+    fn retr_to_file(&mut self, remote: &str, local_path: &std::path::Path) -> Result<(), suppaftp::FtpError> {
+        let mut local = std::fs::File::create(local_path).map_err(|e| {
+            suppaftp::FtpError::ConnectionError(std::io::Error::new(
+                e.kind(),
+                format!("create local file '{}': {}", local_path.display(), e),
+            ))
+        })?;
+        // suppaftp's retr() callback returns FtpResult<D>. Wrap any
+        // local std::io::Error into FtpError::ConnectionError so the
+        // closure's signature matches.
+        let copy = |reader: &mut dyn std::io::Read| -> suppaftp::FtpResult<()> {
+            std::io::copy(reader, &mut local)
+                .map(|_| ())
+                .map_err(suppaftp::FtpError::ConnectionError)
         };
-        Ok(cursor.into_inner())
+        match self {
+            FtpClient::Plain(s) => s.retr(remote, copy)?,
+            FtpClient::Tls(s)   => s.retr(remote, copy)?,
+        }
+        Ok(())
     }
 
-    fn put_file(&mut self, path: &str, contents: &[u8]) -> Result<u64, suppaftp::FtpError> {
-        let mut reader = std::io::Cursor::new(contents);
+    /// Stream a local file as the body of a STOR. suppaftp's
+    /// `put_file` already takes `&mut R: Read` and pumps a buffer
+    /// internally, so we just open the local file and hand it
+    /// over — no whole-file Vec.
+    fn put_from_file(&mut self, remote: &str, local_path: &std::path::Path) -> Result<u64, suppaftp::FtpError> {
+        let mut f = std::fs::File::open(local_path).map_err(|e| {
+            suppaftp::FtpError::ConnectionError(std::io::Error::new(
+                e.kind(),
+                format!("open local file '{}': {}", local_path.display(), e),
+            ))
+        })?;
         match self {
-            FtpClient::Plain(s) => s.put_file(path, &mut reader),
-            FtpClient::Tls(s)   => s.put_file(path, &mut reader),
+            FtpClient::Plain(s) => s.put_file(remote, &mut f),
+            FtpClient::Tls(s)   => s.put_file(remote, &mut f),
+        }
+    }
+
+    fn rename(&mut self, from: &str, to: &str) -> Result<(), suppaftp::FtpError> {
+        match self {
+            FtpClient::Plain(s) => s.rename(from, to),
+            FtpClient::Tls(s)   => s.rename(from, to),
         }
     }
 
@@ -391,23 +424,21 @@ impl Transport for FtpTransport {
         remote_path: &str,
         local_path: &Path,
     ) -> Result<(), TransportError> {
+        // Stream the remote file straight to disk via retr_to_file.
+        // Earlier code slurped the whole response into a Vec<u8>,
+        // which OOM'd on multi-GB transfers.
         let inner = Arc::clone(&self.inner);
         let remote = remote_path.to_string();
         let local = local_path.to_path_buf();
         tokio::task::spawn_blocking(move || -> Result<(), TransportError> {
             let mut guard = inner.lock().unwrap();
-            let bytes = guard.retr_as_buffer(&remote).map_err(|e| {
+            // retr_to_file() in this file
+            guard.retr_to_file(&remote, &local).map_err(|e| {
                 TransportError::Io(format!(
-                    "FTP RETR '{}' failed: {}", remote, e,
+                    "FTP RETR '{}' -> '{}' failed: {}",
+                    remote, local.display(), e,
                 ))
-            })?;
-            std::fs::write(&local, &bytes).map_err(|e| {
-                TransportError::Io(format!(
-                    "failed to write local file '{}': {}",
-                    local.display(), e,
-                ))
-            })?;
-            Ok(())
+            })
         })
         .await
         .map_err(|e| TransportError::Io(format!("blocking task panicked: {}", e)))?
@@ -418,20 +449,40 @@ impl Transport for FtpTransport {
         local_path: &Path,
         remote_path: &str,
     ) -> Result<(), TransportError> {
+        // Stream local file → `<remote>.partial` → rename. Same
+        // motivation as the SFTP path: a mid-transfer error must
+        // not leave a half-written file under the canonical name,
+        // and the upload must not buffer the whole file in memory.
         let inner = Arc::clone(&self.inner);
         let remote = remote_path.to_string();
+        let partial = format!("{}.partial", remote_path);
         let local = local_path.to_path_buf();
         tokio::task::spawn_blocking(move || -> Result<(), TransportError> {
-            let bytes = std::fs::read(&local).map_err(|e| {
-                TransportError::Io(format!(
-                    "failed to read local file '{}': {}",
-                    local.display(), e,
-                ))
-            })?;
             let mut guard = inner.lock().unwrap();
-            guard.put_file(&remote, &bytes).map_err(|e| {
+            // put_from_file() in this file
+            if let Err(e) = guard.put_from_file(&partial, &local) {
+                // Best-effort cleanup so the next run doesn't trip
+                // over a stale `.partial`. rm() failures are logged
+                // but not propagated — the original STOR error is
+                // the relevant signal.
+                if let Err(rm) = guard.rm(&partial) {
+                    warn!(
+                        "ftp upload: cleanup of partial '{}' failed: {}",
+                        partial, rm,
+                    );
+                }
+                return Err(TransportError::Io(format!(
+                    "FTP STOR '{}' failed: {}", partial, e,
+                )));
+            }
+            // Some servers reject rename when the destination
+            // already exists; try to remove first. NoSuchFile-style
+            // failures are expected and ignored.
+            let _ = guard.rm(&remote);
+            guard.rename(&partial, &remote).map_err(|e| {
                 TransportError::Io(format!(
-                    "FTP STOR '{}' failed: {}", remote, e,
+                    "FTP RNFR/RNTO '{}' -> '{}' failed: {}",
+                    partial, remote, e,
                 ))
             })?;
             Ok(())
