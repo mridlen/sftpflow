@@ -22,11 +22,17 @@
 //     FTPS; HTTPS in v1 always validates certs.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use log::info;
+use log::{info, warn};
+use rustls::client::danger::{
+    HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
+};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
 use ureq::Agent;
 
 /// Cap initial TCP/TLS connect to a remote HTTP source. Slower than
@@ -81,6 +87,9 @@ impl HttpTransport {
             }
         };
 
+        let is_https  = matches!(endpoint.protocol, Protocol::Https);
+        let verify_tls = endpoint.verify_tls.unwrap_or(true);
+
         let base_url = match endpoint.port {
             Some(p) => format!("{}://{}:{}", scheme, host, p),
             None    => format!("{}://{}", scheme, host),
@@ -106,11 +115,25 @@ impl HttpTransport {
 
         // Cap connect + per-socket-op timeouts so a black-holed remote
         // can't pin a tokio blocking-pool thread indefinitely.
-        let agent = ureq::AgentBuilder::new()
+        let mut builder = ureq::AgentBuilder::new()
             .timeout_connect(HTTP_CONNECT_TIMEOUT)
             .timeout_read(HTTP_IO_TIMEOUT)
-            .timeout_write(HTTP_IO_TIMEOUT)
-            .build();
+            .timeout_write(HTTP_IO_TIMEOUT);
+
+        // Honor `verify_tls=false` for HTTPS endpoints. Earlier
+        // versions silently ignored this flag — operators who turned
+        // it off still got cert validation, which surprises folks
+        // pointing the daemon at vendor endpoints with self-signed
+        // certs. We mirror the FTPS implementation: verify by default,
+        // opt-out per endpoint, with a loud warning. tls_config is a
+        // no-op for plain `http://` URLs.
+        if is_https {
+            // build_https_tls_config() - below
+            let tls = build_https_tls_config(verify_tls)?;
+            builder = builder.tls_config(Arc::new(tls));
+        }
+
+        let agent = builder.build();
 
         Ok(HttpTransport {
             agent,
@@ -132,6 +155,90 @@ impl HttpTransport {
 
 fn missing(name: &str, field: &str) -> TransportError {
     TransportError::MissingField(name.to_string(), field.to_string())
+}
+
+// ============================================================
+// HTTPS rustls config
+// ============================================================
+
+/// Build a `rustls::ClientConfig` for HTTPS, honoring the endpoint's
+/// `verify_tls` setting. Mirrors the FTPS path in ftp.rs so both
+/// flavors of TLS-bearing transport behave consistently — verify by
+/// default, opt-out with a loud warning.
+fn build_https_tls_config(verify_tls: bool) -> Result<ClientConfig, TransportError> {
+    // Install ring as the process-wide crypto provider on first call.
+    // Idempotent: if FTPS already installed it, the second install
+    // returns Err and we ignore.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let config = if verify_tls {
+        let mut roots = RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth()
+    } else {
+        warn!(
+            "HTTPS endpoint configured with verify_tls=false; \
+             server certificate will NOT be validated"
+        );
+        ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifyHttps))
+            .with_no_client_auth()
+    };
+
+    Ok(config)
+}
+
+/// Cert verifier that accepts every certificate. Only wired up
+/// when the operator explicitly opts in via `verify_tls=false` on
+/// the endpoint. Lives next to its single call site so the
+/// `dangerous()` is visible at the use point.
+#[derive(Debug)]
+struct NoVerifyHttps;
+
+impl ServerCertVerifier for NoVerifyHttps {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::ECDSA_NISTP521_SHA512,
+            SignatureScheme::ED25519,
+        ]
+    }
 }
 
 // ============================================================

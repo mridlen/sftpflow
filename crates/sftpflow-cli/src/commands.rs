@@ -1992,7 +1992,11 @@ pub fn add_process(args: &[&str], state: &mut ShellState) {
 
     let step = match action {
         "encrypt" => ProcessStep::Encrypt { key: key_name },
-        "decrypt" => ProcessStep::Decrypt { key: key_name },
+        // verify_with starts unset; operators add verifier keys via
+        // a separate edit-mode command (added in a follow-up CLI
+        // change). Configs that don't set it keep the legacy
+        // no-signature-verification behavior.
+        "decrypt" => ProcessStep::Decrypt { key: key_name, verify_with: None },
         other => {
             out.error_coded(
                 "USAGE",

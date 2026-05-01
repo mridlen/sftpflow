@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use log::{info, warn};
+use log::{error, info, warn};
 use tokio::sync::{Mutex, OnceCell};
 
 use sftpflow_cluster::node::{ClusterHandle, ClusterNode, StartConfig};
@@ -578,19 +578,61 @@ fn make_seed_join_handler(
                     assigned_node_id, advertise_addr,
                 );
                 if let Err(e) = handle.add_learner(assigned_node_id, member).await {
-                    warn!("join: add_learner({}) failed: {}", assigned_node_id, e);
-                    return;
-                }
-                let mut voters: BTreeSet<u64> =
-                    handle.members().keys().copied().collect();
-                voters.insert(assigned_node_id);
-                info!("join: promoting voter set to {:?}", voters);
-                if let Err(e) = handle.change_membership(voters).await {
-                    warn!(
-                        "join: change_membership for node_id={} failed: {}",
+                    error!(
+                        "join: add_learner({}) failed: {} — joiner will sit \
+                         outside the cluster; operator must re-issue the join",
                         assigned_node_id, e,
                     );
+                    return;
                 }
+
+                // Promote learner → voter, retrying with bounded
+                // backoff so a transient leader change doesn't leave
+                // the joiner permanently stuck as a learner. Each
+                // attempt re-reads `handle.members()` because the
+                // voter set may have shifted while we waited.
+                const MAX_ATTEMPTS: u32 = 5;
+                const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
+                let mut backoff = INITIAL_BACKOFF;
+                let mut last_err = String::new();
+                for attempt in 1..=MAX_ATTEMPTS {
+                    let mut voters: BTreeSet<u64> =
+                        handle.members().keys().copied().collect();
+                    voters.insert(assigned_node_id);
+                    info!(
+                        "join: promoting voter set to {:?} (attempt {}/{})",
+                        voters, attempt, MAX_ATTEMPTS,
+                    );
+                    match handle.change_membership(voters).await {
+                        Ok(()) => {
+                            info!(
+                                "join: node_id={} promoted to voter on attempt {}",
+                                assigned_node_id, attempt,
+                            );
+                            return;
+                        }
+                        Err(e) => {
+                            last_err = e.to_string();
+                            if attempt < MAX_ATTEMPTS {
+                                warn!(
+                                    "join: change_membership for node_id={} \
+                                     attempt {}/{} failed: {} — retrying in {:?}",
+                                    assigned_node_id, attempt, MAX_ATTEMPTS,
+                                    last_err, backoff,
+                                );
+                                tokio::time::sleep(backoff).await;
+                                backoff = (backoff * 2).min(Duration::from_secs(8));
+                            }
+                        }
+                    }
+                }
+                error!(
+                    "join: change_membership for node_id={} failed after {} \
+                     attempts (last error: {}); joiner is now a permanent \
+                     learner — operator should run `cluster remove {}` and \
+                     reissue the join",
+                    assigned_node_id, MAX_ATTEMPTS, last_err, assigned_node_id,
+                );
             });
 
             // membership_json is reserved for M13/M14 (the joiner

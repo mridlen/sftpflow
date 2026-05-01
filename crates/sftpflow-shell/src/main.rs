@@ -123,18 +123,21 @@ fn bridge_tcp(addr: &str) -> io::Result<()> {
     let stream = TcpStream::connect(addr)?;
     info!("connected via tcp to {}", addr);
 
-    // We need three handles to the same socket:
-    //   - reader: socket -> stdout
-    //   - writer: stdin  -> socket
-    //   - shutter: signals "no more input" to the daemon when stdin EOFs
+    // We need handles to the same socket for both directions of
+    // the pump, plus two shutdown closures so each pump direction
+    // can signal the other when its side of the conversation ends.
     let reader = stream.try_clone()?;
     let writer = stream.try_clone()?;
-    let shutter = stream;
+    let shutter_w = stream.try_clone()?;
+    let shutter_r = stream;
 
     // pump() - below
-    pump(reader, writer, move || {
-        let _ = shutter.shutdown(TcpShutdown::Write);
-    })
+    pump(
+        reader,
+        writer,
+        move || { let _ = shutter_w.shutdown(TcpShutdown::Write); },
+        move || { let _ = shutter_r.shutdown(TcpShutdown::Both); },
+    )
 }
 
 // ---- Unix domain socket ----
@@ -146,11 +149,15 @@ fn bridge_unix(path: &str) -> io::Result<()> {
 
     let reader = stream.try_clone()?;
     let writer = stream.try_clone()?;
-    let shutter = stream;
+    let shutter_w = stream.try_clone()?;
+    let shutter_r = stream;
 
-    pump(reader, writer, move || {
-        let _ = shutter.shutdown(std::net::Shutdown::Write);
-    })
+    pump(
+        reader,
+        writer,
+        move || { let _ = shutter_w.shutdown(std::net::Shutdown::Write); },
+        move || { let _ = shutter_r.shutdown(std::net::Shutdown::Both); },
+    )
 }
 
 // ============================================================
@@ -158,11 +165,17 @@ fn bridge_unix(path: &str) -> io::Result<()> {
 // closes the socket (stdout side ends).
 // ============================================================
 
-fn pump<R, W, S>(reader: R, writer: W, shutdown_write: S) -> io::Result<()>
+fn pump<R, W, SW, SB>(
+    reader:           R,
+    writer:           W,
+    shutdown_write:   SW,
+    shutdown_both:    SB,
+) -> io::Result<()>
 where
-    R: Read + Send + 'static,
-    W: Write + Send + 'static,
-    S: FnOnce() + Send + 'static,
+    R:  Read  + Send + 'static,
+    W:  Write + Send + 'static,
+    SW: FnOnce() + Send + 'static,
+    SB: FnOnce() + Send + 'static,
 {
     // stdin -> socket
     let stdin_thread = thread::spawn(move || {
@@ -182,6 +195,10 @@ where
         let mut r = reader;
         let mut stdout = io::stdout().lock();
         io::copy(&mut r, &mut stdout)?;
+        // Make sure the final reply byte hits the wire before we
+        // return — without this, a small response can be lost when
+        // the process exits with bytes still in the BufWriter.
+        stdout.flush()?;
         Ok(())
     });
 
@@ -192,10 +209,18 @@ where
         Err(_) => Err(io::Error::other("stdout pump thread panicked")),
     };
 
-    // Best-effort: let the stdin pump wind down. If stdin is still
-    // open (e.g. a user who never typed Ctrl-D), it won't finish until
-    // process exit closes its FD for it — that's fine, we return here
-    // and let the process terminate.
+    // Tear down both directions so the stdin pump's next write
+    // returns BrokenPipe and the thread can exit. Without this the
+    // stdin reader would block until the OS closed our stdin FD on
+    // process exit — fine in production, but surprising under
+    // tests / under a parent that wraps us.
+    shutdown_both();
+
+    // Best effort: give the stdin thread a chance to observe the
+    // shutdown and exit. If it's stuck on a blocking stdin read
+    // that will never unblock (e.g. an interactive user who hasn't
+    // typed Ctrl-D), join() would block forever — so we don't
+    // wait. Process exit will reclaim the thread.
     drop(stdin_thread);
 
     stdout_result

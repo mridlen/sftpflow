@@ -320,10 +320,28 @@ pub fn rename_key(
     for (_feed_name, feed) in state.config.feeds.iter_mut() {
         for step in feed.process.iter_mut() {
             match step {
-                ProcessStep::Encrypt { key } | ProcessStep::Decrypt { key } => {
+                ProcessStep::Encrypt { key } => {
                     if *key == from {
                         *key = to.clone();
                         ref_count += 1;
+                    }
+                }
+                ProcessStep::Decrypt { key, verify_with } => {
+                    if *key == from {
+                        *key = to.clone();
+                        ref_count += 1;
+                    }
+                    // verify_with is a list of public-key names —
+                    // sweep those too so a renamed verifier key
+                    // doesn't silently drop signature verification
+                    // on the next run.
+                    if let Some(verifiers) = verify_with {
+                        for v in verifiers.iter_mut() {
+                            if *v == from {
+                                *v = to.clone();
+                                ref_count += 1;
+                            }
+                        }
                     }
                 }
             }
@@ -1653,7 +1671,15 @@ fn feeds_referencing_key(config: &Config, key: &str) -> Vec<String> {
     let mut out = Vec::new();
     for (feed_name, feed) in config.feeds.iter() {
         let hits = feed.process.iter().any(|step| match step {
-            ProcessStep::Encrypt { key: k } | ProcessStep::Decrypt { key: k } => k == key,
+            ProcessStep::Encrypt { key: k } => k == key,
+            ProcessStep::Decrypt { key: k, verify_with } => {
+                k == key
+                    || verify_with
+                        .as_deref()
+                        .unwrap_or(&[])
+                        .iter()
+                        .any(|v| v == key)
+            }
         });
         if hits {
             out.push(feed_name.clone());

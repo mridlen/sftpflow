@@ -382,15 +382,33 @@ pub enum ProcessStep {
     #[serde(rename = "encrypt")]
     Encrypt { key: String },
     /// Decrypt files using a PGP private key.
+    ///
+    /// `verify_with`, when present and non-empty, requires the
+    /// PGP message to carry at least one valid signature from one
+    /// of the named public keys; messages with no good signature
+    /// from this set are rejected and the feed fails. When `None`
+    /// or empty, decryption proceeds without checking signatures
+    /// (the legacy behavior — kept so existing configs keep
+    /// working, but operators handling sensitive data should
+    /// always set this).
     #[serde(rename = "decrypt")]
-    Decrypt { key: String },
+    Decrypt {
+        key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        verify_with: Option<Vec<String>>,
+    },
 }
 
 impl std::fmt::Display for ProcessStep {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ProcessStep::Encrypt { key } => write!(f, "encrypt key:{}", key),
-            ProcessStep::Decrypt { key } => write!(f, "decrypt key:{}", key),
+            ProcessStep::Decrypt { key, verify_with } => match verify_with {
+                Some(keys) if !keys.is_empty() => {
+                    write!(f, "decrypt key:{} verify_with:{}", key, keys.join(","))
+                }
+                _ => write!(f, "decrypt key:{}", key),
+            },
         }
     }
 }

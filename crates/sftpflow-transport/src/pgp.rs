@@ -184,9 +184,17 @@ pub fn encrypt_files(
 /// using the private key material in `key_contents`. Replaces each
 /// file with its plaintext equivalent; the `.pgp`/`.gpg`/`.asc`
 /// extension is stripped from the output filename when present.
+///
+/// `verifier_pems` are PEM-encoded public keys to validate
+/// signatures against. When the slice is non-empty, the message
+/// MUST carry at least one good signature from one of those keys
+/// or decryption fails. When empty, signatures are not checked
+/// (legacy behavior, kept so configs without `verify_with` keep
+/// working).
 pub fn decrypt_files(
     key_name: &str,
     key_contents: &str,
+    verifier_pems: &[&str],
     staging_dir: &Path,
     files: &[String],
 ) -> Result<Vec<String>, PgpError> {
@@ -200,6 +208,17 @@ pub fn decrypt_files(
                 .to_string(),
         ));
     }
+
+    // Parse verifier certs once. We require all verifier_pems to
+    // parse — a typo in the config is much more likely than a
+    // genuinely-bad PEM at run time, so silent-skip would mask
+    // operator errors.
+    let mut verifier_certs: Vec<Cert> = Vec::with_capacity(verifier_pems.len());
+    for (idx, pem) in verifier_pems.iter().enumerate() {
+        let label = format!("verify_with[{}]", idx);
+        verifier_certs.push(parse_cert(&label, pem)?);
+    }
+    let require_signature = !verifier_certs.is_empty();
 
     let mut new_names: Vec<String> = Vec::with_capacity(files.len());
 
@@ -217,7 +236,11 @@ pub fn decrypt_files(
         })?;
 
         let policy = StandardPolicy::new();
-        let helper = PrivateKeyDecryptor { cert: cert.clone() };
+        let helper = PrivateKeyDecryptor {
+            cert: cert.clone(),
+            verifier_certs: verifier_certs.clone(),
+            require_signature,
+        };
 
         let mut decryptor = DecryptorBuilder::from_bytes(&ciphertext[..])
             .map_err(|e| {
@@ -311,7 +334,18 @@ fn strip_pgp_extension(name: &str) -> String {
 // ============================================================
 
 struct PrivateKeyDecryptor {
+    /// Private key used to decrypt the session key.
     cert: Cert,
+    /// Public-key certs whose signatures we'll accept. Empty when
+    /// the operator didn't configure verify_with — equivalent to
+    /// "don't check signatures".
+    verifier_certs: Vec<Cert>,
+    /// When true, decryption fails unless at least one signature
+    /// in the message is verified against `verifier_certs`. Set
+    /// from `!verifier_certs.is_empty()`; the field is explicit so
+    /// future configs (e.g. "always require" without naming
+    /// verifiers) can be expressed without a behavior flip.
+    require_signature: bool,
 }
 
 impl VerificationHelper for PrivateKeyDecryptor {
@@ -319,14 +353,39 @@ impl VerificationHelper for PrivateKeyDecryptor {
         &mut self,
         _ids: &[openpgp::KeyHandle],
     ) -> openpgp::Result<Vec<Cert>> {
-        // v1 does not verify signatures on decrypted messages.
-        Ok(Vec::new())
+        // Hand sequoia every configured verifier so it can match
+        // signature key IDs against the user's chosen anchors.
+        Ok(self.verifier_certs.clone())
     }
 
-    fn check(&mut self, _structure: MessageStructure) -> openpgp::Result<()> {
-        // Accept any message structure. Signature verification lands
-        // in a later milestone if we ever need it.
-        Ok(())
+    fn check(&mut self, structure: MessageStructure) -> openpgp::Result<()> {
+        if !self.require_signature {
+            return Ok(());
+        }
+        // Walk the message layers; a signed-and-encrypted PGP
+        // message has a SignatureGroup layer that we expect to
+        // contain at least one GoodChecksum. Anything else (no
+        // signatures, all bad/missing keys) is a hard fail.
+        use openpgp::parse::stream::MessageLayer;
+        let mut saw_good_signature = false;
+        for layer in structure.into_iter() {
+            if let MessageLayer::SignatureGroup { results } = layer {
+                for r in results {
+                    if r.is_ok() {
+                        saw_good_signature = true;
+                    }
+                }
+            }
+        }
+        if saw_good_signature {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "decrypt: message has no good signature from any \
+                 configured verify_with key — refusing to deliver \
+                 unverified plaintext"
+            ))
+        }
     }
 }
 
@@ -459,10 +518,11 @@ mod tests {
         assert!(staging.path().join("payload.txt.pgp").exists());
         assert!(!staging.path().join("payload.txt").exists());
 
-        // Decrypt with the private key.
+        // Decrypt with the private key (no signature requirement).
         let decrypted = decrypt_files(
             "test-key",
             &private_key,
+            &[],
             staging.path(),
             &encrypted,
         )
@@ -475,6 +535,38 @@ mod tests {
     }
 
     #[test]
+    fn decrypt_unsigned_rejected_when_verify_with_set() {
+        // Encrypt without signing, then try to decrypt while
+        // demanding a signature from any of the verify_with keys.
+        // Must fail loudly — the regression we care about is
+        // silent acceptance of unsigned messages.
+        let (public_key, private_key) = generate_test_keys();
+        let (verifier_pub, _) = generate_test_keys();
+
+        let staging = TempDir::new().unwrap();
+        let plaintext = b"unsigned payload\n";
+        std::fs::write(staging.path().join("p.txt"), plaintext).unwrap();
+
+        let encrypted = encrypt_files(
+            "test-key", &public_key, staging.path(),
+            &["p.txt".to_string()],
+        )
+        .expect("encrypt");
+
+        let err = decrypt_files(
+            "test-key", &private_key,
+            &[verifier_pub.as_str()],
+            staging.path(),
+            &encrypted,
+        )
+        .unwrap_err();
+        match err {
+            PgpError::Crypto(_) => {} // expected — sequoia surfaces verify failures here
+            other => panic!("expected Crypto error, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn decrypt_rejects_public_key() {
         let (public_key, _) = generate_test_keys();
         let staging = TempDir::new().unwrap();
@@ -483,6 +575,7 @@ mod tests {
         let err = decrypt_files(
             "pub-only",
             &public_key,
+            &[],
             staging.path(),
             &["foo.txt.pgp".to_string()],
         )

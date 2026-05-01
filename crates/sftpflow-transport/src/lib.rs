@@ -691,16 +691,35 @@ fn validate_process_keys(
     feed: &Feed,
     keys: &BTreeMap<String, PgpKey>,
 ) -> Result<(), String> {
-    for step in &feed.process {
-        let key_name = match step {
-            ProcessStep::Encrypt { key } | ProcessStep::Decrypt { key } => key,
-        };
+    // Every key referenced by a process step (the primary key, plus
+    // any verify_with public keys on a Decrypt) must exist in the
+    // keyring with non-empty contents. Fail fast before any network
+    // I/O so a misconfigured feed surfaces at validate time, not
+    // mid-transfer.
+    let check_key = |name: &str, keys: &BTreeMap<String, PgpKey>| -> Result<(), String> {
         let pgp_key = keys
-            .get(key_name)
-            .ok_or_else(|| format!("pgp key '{}' not found", key_name))?;
+            .get(name)
+            .ok_or_else(|| format!("pgp key '{}' not found", name))?;
         let contents = pgp_key.contents.as_deref().unwrap_or("");
         if contents.trim().is_empty() {
-            return Err(format!("pgp key '{}' has no contents", key_name));
+            return Err(format!("pgp key '{}' has no contents", name));
+        }
+        Ok(())
+    };
+
+    for step in &feed.process {
+        match step {
+            ProcessStep::Encrypt { key } => {
+                check_key(key, keys)?;
+            }
+            ProcessStep::Decrypt { key, verify_with } => {
+                check_key(key, keys)?;
+                if let Some(verifiers) = verify_with {
+                    for v in verifiers {
+                        check_key(v, keys)?;
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -734,13 +753,22 @@ fn apply_process_pipeline(
                 // pgp.rs — encrypt_files
                 pgp::encrypt_files(key, contents, staging_dir, &files)
             }
-            ProcessStep::Decrypt { key } => {
+            ProcessStep::Decrypt { key, verify_with } => {
                 let contents = keys
                     .get(key)
                     .and_then(|k| k.contents.as_deref())
                     .unwrap_or("");
+                // Resolve verify_with names to their PEM contents.
+                // validate_process_keys() above guarantees each name
+                // is present and non-empty by the time we get here.
+                let verifier_pems: Vec<&str> = verify_with
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .filter_map(|n| keys.get(n).and_then(|k| k.contents.as_deref()))
+                    .collect();
                 // pgp.rs — decrypt_files
-                pgp::decrypt_files(key, contents, staging_dir, &files)
+                pgp::decrypt_files(key, contents, &verifier_pems, staging_dir, &files)
             }
         };
 
