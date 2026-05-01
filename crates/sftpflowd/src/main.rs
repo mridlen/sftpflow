@@ -541,7 +541,10 @@ fn cmd_init(daemon: DaemonArgs, args: InitArgs) -> Result<(), String> {
 
     maybe_spawn_health(&daemon.health_bind, shared.clone());
 
-    let serve_result = server::run(&ndjson_addr, shared)
+    let shutdown = server::Shutdown::new();
+    install_shutdown_signal_handler(rt.handle().clone(), shutdown.clone());
+
+    let serve_result = server::run(&ndjson_addr, shared, shutdown)
         .map_err(|e| format!("NDJSON server: {}", e));
 
     // Explicit teardown order: drop cluster node first (aborts
@@ -797,7 +800,10 @@ fn cmd_join(daemon: DaemonArgs, args: JoinArgs) -> Result<(), String> {
 
     maybe_spawn_health(&daemon.health_bind, shared.clone());
 
-    let serve_result = server::run(&ndjson_addr, shared)
+    let shutdown = server::Shutdown::new();
+    install_shutdown_signal_handler(rt.handle().clone(), shutdown.clone());
+
+    let serve_result = server::run(&ndjson_addr, shared, shutdown)
         .map_err(|e| format!("NDJSON server: {}", e));
 
     drop(cluster_node);
@@ -1133,7 +1139,12 @@ fn cmd_run_cluster(
 
     maybe_spawn_health(&daemon.health_bind, shared.clone());
 
-    let serve_result = server::run(&socket_addr, shared)
+    // Reuse the daemon's tokio runtime to host the SIGINT/SIGTERM
+    // handler. install_shutdown_signal_handler() - below.
+    let shutdown = server::Shutdown::new();
+    install_shutdown_signal_handler(rt.handle().clone(), shutdown.clone());
+
+    let serve_result = server::run(&socket_addr, shared, shutdown)
         .map_err(|e| format!("NDJSON server: {}", e));
 
     // Same teardown order as cmd_init/cmd_join: drop the cluster
@@ -1243,8 +1254,67 @@ fn cmd_run_legacy(daemon: DaemonArgs) -> Result<(), String> {
 
     maybe_spawn_health(&daemon.health_bind, shared.clone());
 
-    server::run(&socket_addr, shared)
-        .map_err(|e| format!("server error: {}", e))
+    // Hook SIGINT / SIGTERM (Ctrl-C on Windows) so a graceful
+    // stop drains in-flight RPCs instead of dropping them with
+    // partial writes. install_shutdown_signal_handler() - below.
+    let shutdown = server::Shutdown::new();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("could not start signal-handler runtime: {}", e))?;
+    install_shutdown_signal_handler(rt.handle().clone(), shutdown.clone());
+    let serve_result = server::run(&socket_addr, shared, shutdown)
+        .map_err(|e| format!("server error: {}", e));
+    drop(rt);
+    serve_result
+}
+
+// ============================================================
+// install_shutdown_signal_handler - cooperative graceful stop
+// ============================================================
+//
+// Spawns a tokio task on the supplied runtime that awaits
+// SIGINT or SIGTERM (Ctrl-C on Windows) and flips the daemon's
+// shutdown flag. The accept loops in server.rs poll the flag
+// and break out, then drain in-flight RPCs before returning.
+//
+// Idempotent: a second SIGINT after the first re-flips the
+// flag (no effect) but does NOT escalate to a hard kill —
+// operators who want to abandon in-flight work can SIGKILL the
+// process from outside.
+
+fn install_shutdown_signal_handler(
+    rt:       tokio::runtime::Handle,
+    shutdown: server::Shutdown,
+) {
+    rt.spawn(async move {
+        if let Err(e) = wait_for_shutdown_signal().await {
+            warn!("shutdown signal handler installation failed: {}", e);
+            return;
+        }
+        info!("shutdown signal received; stopping accept loop");
+        shutdown.signal();
+    });
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() -> std::io::Result<()> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint  = signal(SignalKind::interrupt())?;
+    tokio::select! {
+        _ = sigterm.recv() => Ok(()),
+        _ = sigint.recv()  => Ok(()),
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() -> std::io::Result<()> {
+    // Windows: Ctrl-C is the only signal we get. SIGTERM has no
+    // direct equivalent; service-managed deployments use the SCM
+    // stop verb which we don't currently hook into (out of scope
+    // for v1).
+    tokio::signal::ctrl_c().await
 }
 
 // ============================================================

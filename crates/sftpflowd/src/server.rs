@@ -14,6 +14,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -42,6 +43,139 @@ use crate::cluster_runtime::ClusterContext; // cluster_runtime.rs - runtime clus
 use crate::handlers; // handlers.rs - RPC method implementations
 use crate::history::RunDb; // history.rs - SQLite run history
 use crate::secrets::SecretStore; // secrets.rs - sealed credential store
+
+// ============================================================
+// Shutdown coordination
+// ============================================================
+
+/// Signaling primitive shared between the signal-handler task and
+/// the listener accept loops. Carries:
+///
+///   - a boolean flag the signal handler flips to ask the daemon
+///     to stop accepting new connections,
+///   - an in-flight connection counter so the post-loop drain can
+///     wait for outstanding NDJSON RPCs to finish (or time out).
+///
+/// Cheap to clone (two `Arc`s); the daemon hands one clone to the
+/// signal-handler task and one to `server::run`.
+#[derive(Clone)]
+pub struct Shutdown {
+    flag:      Arc<AtomicBool>,
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl Shutdown {
+    pub fn new() -> Self {
+        Self {
+            flag:      Arc::new(AtomicBool::new(false)),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Flip the shutdown flag. Idempotent — repeat calls are no-ops.
+    pub fn signal(&self) {
+        self.flag.store(true, Ordering::SeqCst);
+    }
+
+    /// Has shutdown been requested?
+    pub fn is_signaled(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+
+    /// Build a guard that increments the in-flight counter on
+    /// creation and decrements on drop. Connection workers hold
+    /// one of these for the duration of their handler so the
+    /// drain phase can wait for them.
+    fn enter_connection(&self) -> ConnectionGuard {
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        ConnectionGuard { in_flight: Arc::clone(&self.in_flight) }
+    }
+
+    /// Block the calling thread until the in-flight counter hits
+    /// zero or `max_wait` elapses. Returns `true` if all
+    /// connections finished cleanly, `false` on timeout.
+    fn drain(&self, max_wait: Duration) -> bool {
+        let start = Instant::now();
+        let poll  = Duration::from_millis(50);
+        loop {
+            let n = self.in_flight.load(Ordering::SeqCst);
+            if n == 0 {
+                return true;
+            }
+            if start.elapsed() >= max_wait {
+                warn!(
+                    "drain: {} in-flight connection(s) still open after {:?}; \
+                     abandoning",
+                    n, max_wait,
+                );
+                return false;
+            }
+            std::thread::sleep(poll);
+        }
+    }
+}
+
+impl Default for Shutdown {
+    fn default() -> Self { Self::new() }
+}
+
+/// RAII guard returned by `Shutdown::enter_connection`. Decrements
+/// the in-flight counter on drop so the count tracks the actual
+/// set of running handlers, even if a handler panics or returns
+/// via `?` mid-RPC.
+struct ConnectionGuard {
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn drain_returns_immediately_when_no_in_flight() {
+        let s = Shutdown::new();
+        let started = std::time::Instant::now();
+        assert!(s.drain(Duration::from_secs(1)));
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn drain_waits_for_guards_to_drop() {
+        let s = Shutdown::new();
+        let g1 = s.enter_connection();
+        let g2 = s.enter_connection();
+        assert_eq!(s.in_flight.load(Ordering::SeqCst), 2);
+        let s_clone = s.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            drop(g1);
+            std::thread::sleep(Duration::from_millis(150));
+            drop(g2);
+            // Touch the clone so it isn't optimized away.
+            let _ = s_clone.is_signaled();
+        });
+        // Drain must wait for both guards to drop and only then
+        // return Ok.
+        assert!(s.drain(Duration::from_secs(2)));
+        assert_eq!(s.in_flight.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn drain_times_out_when_guards_outlive_window() {
+        let s = Shutdown::new();
+        let _g = s.enter_connection();
+        // Tight deadline: guard never drops, so drain should
+        // give up and return false.
+        assert!(!s.drain(Duration::from_millis(120)));
+    }
+}
 
 // ============================================================
 // Shared daemon state
@@ -135,14 +269,21 @@ pub fn build_shared_state(
 }
 
 /// Parse `addr` ("unix:/path", "tcp:host:port", or "host:port") and
-/// run the appropriate accept loop until the listener errors out.
+/// run the appropriate accept loop until shutdown is signaled.
+///
+/// `shutdown` is the cooperative-stop primitive. The daemon
+/// installs a SIGINT/SIGTERM handler on its tokio runtime that
+/// flips the flag; the accept loops poll it, stop accepting new
+/// connections, and drain in-flight NDJSON sessions before this
+/// function returns.
 ///
 /// Takes a pre-built `SharedDaemonState` so the daemon can wire up
 /// the cluster forward handler against the same Arc before serving
 /// begins. Use `build_shared_state` to construct one.
 pub fn run(
-    addr:  &str,
-    state: SharedDaemonState,
+    addr:     &str,
+    state:    SharedDaemonState,
+    shutdown: Shutdown,
 ) -> std::io::Result<()> {
     // Split into (scheme, rest). Anything without a known scheme
     // prefix is treated as a bare "host:port" and defaults to TCP.
@@ -153,15 +294,15 @@ pub fn run(
     };
 
     match scheme {
-        "tcp" => serve_tcp(rest, state),
+        "tcp" => serve_tcp(rest, state, shutdown),
         "unix" => {
             #[cfg(unix)]
             {
-                serve_unix(rest, state)
+                serve_unix(rest, state, shutdown)
             }
             #[cfg(not(unix))]
             {
-                let _ = (rest, state); // silence unused warnings on windows
+                let _ = (rest, state, shutdown); // silence unused warnings on windows
                 Err(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
                     "unix sockets are not supported on this platform; use tcp:",
@@ -189,19 +330,49 @@ const NDJSON_READ_TIMEOUT: Duration = Duration::from_secs(600);
 /// on a populated daemon).
 const NDJSON_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 
-fn serve_tcp(addr: &str, state: SharedDaemonState) -> std::io::Result<()> {
+/// How often the accept loop wakes up to check the shutdown flag
+/// when no connection is pending. 100ms keeps shutdown responsive
+/// (operators won't notice the lag) without burning CPU on idle.
+const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Cap on how long the post-loop drain waits for in-flight RPCs
+/// to finish before forcibly returning. Operators getting a stuck
+/// shutdown after this should escalate to SIGKILL — but we want
+/// the soft path to handle the common case of "operator pressed
+/// Ctrl-C while a feed transfer was running".
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn serve_tcp(
+    addr:     &str,
+    state:    SharedDaemonState,
+    shutdown: Shutdown,
+) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr)?;
     info!("tcp listener bound to {}", addr);
 
-    for incoming in listener.incoming() {
-        match incoming {
-            Ok(stream) => {
-                let peer = stream.peer_addr().ok();
-                info!("connection accepted from {:?}", peer);
+    // Non-blocking + poll pattern: the std `for incoming` loop
+    // would block on accept forever and never observe the shutdown
+    // flag. Switching the listener to non-blocking and polling at
+    // SHUTDOWN_POLL_INTERVAL trades a little CPU for clean
+    // teardown.
+    listener.set_nonblocking(true)?;
+
+    loop {
+        if shutdown.is_signaled() {
+            info!("tcp: shutdown signaled, stopping accept loop");
+            break;
+        }
+        match listener.accept() {
+            Ok((stream, addr)) => {
+                info!("connection accepted from {:?}", addr);
+                // Worker threads inherit blocking semantics by
+                // default; flip back so subsequent read/write
+                // timeouts behave normally.
+                if let Err(e) = stream.set_nonblocking(false) {
+                    warn!("tcp: set_nonblocking(false) failed: {}", e);
+                }
                 // Cap how long a stalled CLI can hold this worker
-                // thread blocked on read or write. Errors logged
-                // and ignored — a kernel that rejects timeouts is
-                // not a fatal startup condition.
+                // thread blocked on read or write.
                 if let Err(e) = stream.set_read_timeout(Some(NDJSON_READ_TIMEOUT)) {
                     warn!("tcp: set_read_timeout failed: {}", e);
                 }
@@ -209,15 +380,26 @@ fn serve_tcp(addr: &str, state: SharedDaemonState) -> std::io::Result<()> {
                     warn!("tcp: set_write_timeout failed: {}", e);
                 }
                 let state = Arc::clone(&state);
+                let guard = shutdown.enter_connection();
                 std::thread::spawn(move || {
                     if let Err(e) = handle_tcp(stream, state) {
                         warn!("connection handler error: {}", e);
                     }
+                    drop(guard);
                 });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(SHUTDOWN_POLL_INTERVAL);
             }
             Err(e) => warn!("accept error: {}", e),
         }
     }
+
+    let drained = shutdown.drain(DRAIN_TIMEOUT);
+    info!(
+        "tcp: shutdown complete (clean drain: {})",
+        if drained { "yes" } else { "no" },
+    );
     Ok(())
 }
 
@@ -235,7 +417,11 @@ fn handle_tcp(stream: TcpStream, state: SharedDaemonState) -> std::io::Result<()
 // ============================================================
 
 #[cfg(unix)]
-fn serve_unix(path: &str, state: SharedDaemonState) -> std::io::Result<()> {
+fn serve_unix(
+    path:     &str,
+    state:    SharedDaemonState,
+    shutdown: Shutdown,
+) -> std::io::Result<()> {
     // Best-effort cleanup of a stale socket file from a previous run.
     // If we can't remove it, the bind() below will surface the error.
     let _ = std::fs::remove_file(path);
@@ -258,10 +444,19 @@ fn serve_unix(path: &str, state: SharedDaemonState) -> std::io::Result<()> {
         }
     }
 
-    for incoming in listener.incoming() {
-        match incoming {
-            Ok(stream) => {
+    listener.set_nonblocking(true)?;
+
+    loop {
+        if shutdown.is_signaled() {
+            info!("unix: shutdown signaled, stopping accept loop");
+            break;
+        }
+        match listener.accept() {
+            Ok((stream, _addr)) => {
                 info!("unix connection accepted");
+                if let Err(e) = stream.set_nonblocking(false) {
+                    warn!("unix: set_nonblocking(false) failed: {}", e);
+                }
                 // Same per-connection read/write caps as the TCP
                 // path. UnixStream supports set_read_timeout /
                 // set_write_timeout via the same API as TcpStream.
@@ -272,15 +467,40 @@ fn serve_unix(path: &str, state: SharedDaemonState) -> std::io::Result<()> {
                     warn!("unix: set_write_timeout failed: {}", e);
                 }
                 let state = Arc::clone(&state);
+                let guard = shutdown.enter_connection();
                 std::thread::spawn(move || {
                     if let Err(e) = handle_unix(stream, state) {
                         warn!("connection handler error: {}", e);
                     }
+                    drop(guard);
                 });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(SHUTDOWN_POLL_INTERVAL);
             }
             Err(e) => warn!("accept error: {}", e),
         }
     }
+
+    let drained = shutdown.drain(DRAIN_TIMEOUT);
+
+    // Best-effort: remove the socket file so a follow-up start
+    // doesn't have to step over our corpse. The startup path
+    // already does `remove_file(path)` before binding, so this is
+    // belt-and-suspenders, but a clean unlink also tells operators
+    // (and external monitors that watch the socket file) that we
+    // shut down deliberately.
+    if let Err(e) = std::fs::remove_file(path) {
+        // ENOENT is expected if a concurrent operator already
+        // cleaned it up; lower other errors to debug.
+        if e.kind() != std::io::ErrorKind::NotFound {
+            warn!("unix: removing socket file '{}' on shutdown: {}", path, e);
+        }
+    }
+    info!(
+        "unix: shutdown complete (clean drain: {})",
+        if drained { "yes" } else { "no" },
+    );
     Ok(())
 }
 
