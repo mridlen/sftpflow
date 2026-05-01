@@ -18,7 +18,7 @@
 // best-effort observability surface, not a transactional gate.
 
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Mutex;
 
 use log::{error, info, warn};
 use rusqlite::{Connection, params};
@@ -31,10 +31,18 @@ use sftpflow_proto::{AuditEntry, Request};
 // ============================================================
 
 /// Thin wrapper around a SQLite connection holding the audit log.
-/// Mirrors the shape of `RunDb` (history.rs) so the two are easy
-/// to compare side-by-side.
+/// Mirrors the shape of `RunDb` (history.rs).
+///
+/// The connection is wrapped in an internal `Mutex` so audit
+/// writes can be performed via `&self` from a thread that holds
+/// only an `Arc<AuditDb>` — NOT the daemon-state mutex. The
+/// previous design had AuditDb owned directly by `DaemonState`,
+/// which meant every `record()` was implicitly serialized behind
+/// the daemon mutex; now the daemon-state lock is released
+/// before the SQLite INSERT and only the audit-internal mutex
+/// is held.
 pub struct AuditDb {
-    conn: Connection,
+    conn: Mutex<Connection>,
 }
 
 impl AuditDb {
@@ -81,7 +89,21 @@ impl AuditDb {
         ).map_err(|e| format!("failed to initialize audit schema: {}", e))?;
 
         info!("audit log database opened at '{}'", path.display());
-        Ok(AuditDb { conn })
+        Ok(AuditDb { conn: Mutex::new(conn) })
+    }
+
+    /// Acquire the inner connection, recovering from a poisoned
+    /// mutex (a previous panic mid-insert). The audit log is
+    /// best-effort, so a partial write that triggered a panic
+    /// shouldn't prevent the next event from being recorded.
+    fn lock_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        match self.conn.lock() {
+            Ok(g) => g,
+            Err(poison) => {
+                warn!("audit: recovering from poisoned audit-db mutex");
+                poison.into_inner()
+            }
+        }
     }
 
     // --------------------------------------------------------
@@ -99,7 +121,8 @@ impl AuditDb {
         args_hash: &str,
         outcome:   &str,
     ) {
-        let res = self.conn.execute(
+        let conn = self.lock_conn();
+        let res = conn.execute(
             "INSERT INTO audit_log (ts_unix, ts_iso, caller, rpc, args_hash, outcome)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![ts_unix, ts_iso, caller, rpc, args_hash, outcome],
@@ -127,7 +150,8 @@ impl AuditDb {
         let limit = limit.unwrap_or(50) as i64;
         let since = since_unix.unwrap_or(i64::MIN);
 
-        let mut stmt = self.conn.prepare(
+        let conn = self.lock_conn();
+        let mut stmt = conn.prepare(
             "SELECT id, ts_unix, ts_iso, caller, rpc, args_hash, outcome
              FROM audit_log
              WHERE ts_unix >= ?1
@@ -177,10 +201,14 @@ impl AuditDb {
 // non-mutating anyway.
 
 pub fn args_hash(request: &Request) -> String {
-    match serde_json::to_vec(request) {
+    // Wrap the serialized JSON in `Zeroizing` so PutSecret { value }
+    // and similar variants don't leave plaintext copies on the heap
+    // after the hash is computed. The hash itself is one-way; only
+    // the intermediate buffer is sensitive.
+    match serde_json::to_vec(request).map(zeroize::Zeroizing::new) {
         Ok(bytes) => {
             let mut hasher = Sha256::new();
-            hasher.update(&bytes);
+            hasher.update(bytes.as_slice());
             let digest = hasher.finalize();
             let mut s = String::with_capacity(64);
             for b in digest {
@@ -197,55 +225,10 @@ pub fn args_hash(request: &Request) -> String {
     }
 }
 
-// ============================================================
-// now_unix_and_iso - paired wall-clock + ISO 8601 timestamp
-// ============================================================
-//
-// Server.rs's audit hook calls this once per mutating RPC. Pairing
-// the two values keeps `ts_iso` consistent with `ts_unix` for the
-// same row (no risk of formatting them at slightly different
-// instants and producing a mismatch).
-
-pub fn now_unix_and_iso() -> (i64, String) {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    (secs, iso8601_from_unix(secs))
-}
-
-/// Format `unix_secs` as `YYYY-MM-DDTHH:MM:SSZ` (UTC). Mirrors
-/// handlers::iso8601_now's algorithm; duplicated here so audit
-/// timestamps don't depend on handlers.rs internals.
-fn iso8601_from_unix(unix_secs: i64) -> String {
-    let secs = unix_secs.max(0) as u64;
-    let days_since_epoch = secs / 86400;
-    let time_of_day      = secs % 86400;
-    let hours   = time_of_day / 3600;
-    let minutes = (time_of_day % 3600) / 60;
-    let seconds = time_of_day % 60;
-    let (y, m, d) = civil_from_days(days_since_epoch as i64);
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        y, m, d, hours, minutes, seconds,
-    )
-}
-
-/// Days since 1970-01-01 → (year, month, day). Howard Hinnant's
-/// civil-from-days algorithm; same one used in handlers.rs.
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y   = (yoe as i64) + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp  = (5 * doy + 2) / 153;
-    let d   = doy - (153 * mp + 2) / 5 + 1;
-    let m   = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y   = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
-}
+// now_unix_and_iso lives in crate::time_fmt; re-export it here so
+// existing call sites that did `audit::now_unix_and_iso()` keep
+// working without churn.
+pub use crate::time_fmt::now_unix_and_iso;
 
 // ============================================================
 // Tests

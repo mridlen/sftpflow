@@ -84,7 +84,11 @@ pub struct DaemonState {
     pub run_db: Option<RunDb>,
     /// SQLite audit log. None if DB failed to open — mutations
     /// still apply, just not recorded. Best-effort by design.
-    pub audit_db: Option<AuditDb>,
+    /// Wrapped in `Arc` so the dispatch hook can clone a handle
+    /// out under the daemon mutex, drop the mutex, and then
+    /// INSERT through only the audit-internal lock — earlier
+    /// versions held the daemon mutex through the whole INSERT.
+    pub audit_db: Option<Arc<AuditDb>>,
     /// Sealed credential store. None if no passphrase was configured
     /// at startup — secret RPCs then fail with CONFIG_ERROR and feeds
     /// that use `*_ref` fields will fail to resolve at run time.
@@ -112,7 +116,7 @@ pub struct DaemonState {
 pub fn build_shared_state(
     config:   Config,
     run_db:   Option<RunDb>,
-    audit_db: Option<AuditDb>,
+    audit_db: Option<Arc<AuditDb>>,
     secrets:  Option<SecretStore>,
     cluster:  Option<ClusterContext>,
     paths:    DaemonPaths,
@@ -481,28 +485,66 @@ fn dispatch_local_inner(env: RequestEnvelope, state: &SharedDaemonState) -> Resp
         }
 
         // ---- feeds (mutate) ----
+        // Each mutation drops the daemon mutex BEFORE firing the
+        // best-effort dkron HTTP sync. Used to be inline inside the
+        // handler, which serialized every PutFeed/DeleteFeed behind
+        // a 10s-timeout HTTP call.
         Request::PutFeed { name, feed } => {
-            let mut guard = state.lock().unwrap();
-            if let Some(rsp) = enforce_leader(id, &guard) { return rsp; }
-            result_to_envelope(id, handlers::put_feed(&mut guard, name, feed))
+            let (result, dkron_task) = {
+                let mut guard = state.lock().unwrap();
+                if let Some(rsp) = enforce_leader(id, &guard) { return rsp; }
+                let result = handlers::put_feed(&mut guard, name.clone(), feed);
+                let task = match &result {
+                    Ok(_)  => handlers::dkron_sync_task(&guard, &name),
+                    Err(_) => None,
+                };
+                (result, task)
+            };
+            if let Some(task) = dkron_task { task.run(); }
+            result_to_envelope(id, result)
         }
         Request::DeleteFeed { name } => {
-            let mut guard = state.lock().unwrap();
-            if let Some(rsp) = enforce_leader(id, &guard) { return rsp; }
-            if dry_run {
-                result_to_envelope(id, handlers::delete_feed_dry_run(&guard, &name))
-            } else {
-                result_to_envelope(id, handlers::delete_feed(&mut guard, &name))
-            }
+            let (result, dkron_task) = {
+                let mut guard = state.lock().unwrap();
+                if let Some(rsp) = enforce_leader(id, &guard) { return rsp; }
+                if dry_run {
+                    return result_to_envelope(id, handlers::delete_feed_dry_run(&guard, &name));
+                }
+                let result = handlers::delete_feed(&mut guard, &name);
+                let task = match &result {
+                    Ok(_)  => handlers::dkron_delete_task(&guard, &name),
+                    Err(_) => None,
+                };
+                (result, task)
+            };
+            if let Some(task) = dkron_task { task.run(); }
+            result_to_envelope(id, result)
         }
         Request::RenameFeed { from, to } => {
-            let mut guard = state.lock().unwrap();
-            if let Some(rsp) = enforce_leader(id, &guard) { return rsp; }
-            if dry_run {
-                result_to_envelope(id, handlers::rename_feed_dry_run(&guard, &from, &to))
-            } else {
-                result_to_envelope(id, handlers::rename_feed(&mut guard, from, to))
-            }
+            let (result, delete_task, sync_task) = {
+                let mut guard = state.lock().unwrap();
+                if let Some(rsp) = enforce_leader(id, &guard) { return rsp; }
+                if dry_run {
+                    return result_to_envelope(id, handlers::rename_feed_dry_run(&guard, &from, &to));
+                }
+                let from_name = from.clone();
+                let to_name = to.clone();
+                let result = handlers::rename_feed(&mut guard, from, to);
+                let (del, syn) = match &result {
+                    Ok(_) => (
+                        handlers::dkron_delete_task(&guard, &from_name),
+                        handlers::dkron_sync_task(&guard, &to_name),
+                    ),
+                    Err(_) => (None, None),
+                };
+                (result, del, syn)
+            };
+            // Order matters: delete the old jobs before publishing
+            // the new ones, otherwise a brief window leaves both
+            // schedules competing for the same feed work.
+            if let Some(t) = delete_task { t.run(); }
+            if let Some(t) = sync_task { t.run(); }
+            result_to_envelope(id, result)
         }
 
         // ---- execution ----
@@ -547,11 +589,20 @@ fn dispatch_local_inner(env: RequestEnvelope, state: &SharedDaemonState) -> Resp
         // ---- scheduler ----
         // Leader-gated: dkron is a shared external system; only the
         // leader should reconcile schedules. M14 retires dkron and
-        // makes the leader the scheduler natively.
+        // makes the leader the scheduler natively. The full
+        // reconcile is HTTP-heavy — snapshot under the lock, drop
+        // the lock, run reconciliation outside.
         Request::SyncSchedules => {
-            let guard = state.lock().unwrap();
-            if let Some(rsp) = enforce_leader(id, &guard) { return rsp; }
-            ResponseEnvelope::success(id, handlers::sync_schedules(&guard))
+            let prep = {
+                let guard = state.lock().unwrap();
+                if let Some(rsp) = enforce_leader(id, &guard) { return rsp; }
+                handlers::prepare_sync_schedules(&guard)
+            };
+            let response = match prep {
+                Some(p)  => handlers::execute_sync_schedules(p),
+                None     => handlers::sync_schedules_disabled(),
+            };
+            ResponseEnvelope::success(id, response)
         }
 
         // ---- run history ----
@@ -1019,11 +1070,16 @@ fn record_audit(
     let args_hash = audit::args_hash(request);
     let (ts_unix, ts_iso) = audit::now_unix_and_iso();
 
-    let guard = match state.lock() {
-        Ok(g)  => g,
+    // Clone the AuditDb handle out under the daemon mutex, drop
+    // the daemon mutex, and only THEN do the SQLite INSERT (which
+    // takes the audit DB's own internal lock). The previous code
+    // held the daemon mutex across the INSERT, serializing every
+    // mutation behind audit-DB I/O.
+    let db = match state.lock() {
+        Ok(g)  => g.audit_db.as_ref().map(Arc::clone),
         Err(_) => return, // poisoned mutex; daemon is going down anyway
     };
-    if let Some(ref db) = guard.audit_db {
+    if let Some(db) = db {
         db.record(ts_unix, &ts_iso, caller, rpc, &args_hash, &outcome);
     }
 }

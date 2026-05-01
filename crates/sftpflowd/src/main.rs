@@ -58,6 +58,7 @@ mod handlers;        // handlers.rs - RPC method implementations
 mod health;          // health.rs - HTTP /healthz + /readyz probe endpoints
 mod history;         // history.rs - SQLite run history persistence
 mod secrets;         // secrets.rs - sealed credential store (age-encrypted)
+mod time_fmt;        // time_fmt.rs - shared UTC ISO 8601 timestamp helpers
 mod server;          // server.rs - listener + connection handling + dispatch
 mod node_state;      // node_state.rs - per-node persistent state (M12+)
 mod cluster_runtime; // cluster_runtime.rs - async Raft orchestration (M12+)
@@ -1059,19 +1060,28 @@ fn cmd_run_cluster(
         // error in that case rather than silently breaking joins.
         let store = secret_store.as_mut()
             .expect("checked above that bootstrap has Some(store)");
-        let token_b64 = store.get(node_state::CLUSTER_TOKEN_SECRET_KEY)
-            .ok_or_else(|| format!(
-                "sealed store has no '{}' entry — was this node initialized \
-                 with `sftpflowd init`? (manual recovery: rewrite via `sftpflow \
-                 secret add` is not enough; the secret must be the original \
-                 32 raw bytes minted at init time)",
-                node_state::CLUSTER_TOKEN_SECRET_KEY,
-            ))?
-            .to_string();
+        // Wrap both intermediates in `Zeroizing` so the base64
+        // text and decoded raw bytes are scrubbed when the scope
+        // ends. Without this they linger in heap allocations
+        // until the allocator reuses the slot, leaving sensitive
+        // material exposed to a coredump or process inspection.
+        let token_b64 = zeroize::Zeroizing::new(
+            store.get(node_state::CLUSTER_TOKEN_SECRET_KEY)
+                .ok_or_else(|| format!(
+                    "sealed store has no '{}' entry — was this node initialized \
+                     with `sftpflowd init`? (manual recovery: rewrite via `sftpflow \
+                     secret add` is not enough; the secret must be the original \
+                     32 raw bytes minted at init time)",
+                    node_state::CLUSTER_TOKEN_SECRET_KEY,
+                ))?
+                .to_string()
+        );
         use base64::Engine as _;
-        let token_bytes = base64::engine::general_purpose::STANDARD.decode(&token_b64)
-            .map_err(|e| format!("decoding sealed token secret: {}", e))?;
-        let token_secret = sftpflow_cluster::token::TokenSecret::from_bytes(&token_bytes)
+        let token_bytes = zeroize::Zeroizing::new(
+            base64::engine::general_purpose::STANDARD.decode(token_b64.as_str())
+                .map_err(|e| format!("decoding sealed token secret: {}", e))?
+        );
+        let token_secret = sftpflow_cluster::token::TokenSecret::from_bytes(token_bytes.as_slice())
             .map_err(|e| format!("rebuilding token secret from sealed bytes: {}", e))?;
 
         info!("cluster restart: bootstrap-node path (CA key + token secret loaded)");
@@ -1389,11 +1399,11 @@ fn build_daemon_paths(
 /// failure — the daemon must NEVER refuse to start because the audit
 /// log is unhappy; mutations still apply, they just don't get
 /// recorded until the operator fixes the underlying issue.
-fn open_audit_db(path: &std::path::Path) -> Option<audit::AuditDb> {
+fn open_audit_db(path: &std::path::Path) -> Option<std::sync::Arc<audit::AuditDb>> {
     match audit::AuditDb::open(path) {
         Ok(db) => {
             info!("audit log database ready at '{}'", path.display());
-            Some(db)
+            Some(std::sync::Arc::new(db))
         }
         Err(e) => {
             warn!(

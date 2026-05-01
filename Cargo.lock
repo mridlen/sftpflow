@@ -4033,6 +4033,7 @@ dependencies = [
  "tokio",
  "ureq",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

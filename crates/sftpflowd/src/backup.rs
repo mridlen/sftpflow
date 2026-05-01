@@ -181,9 +181,15 @@ pub fn run_backup_hot(
         }
     }
 
+    // Wrap the archive file in a HashingWriter that updates a
+    // sha256 + byte counter during write. Earlier code re-read
+    // the entire archive from disk after the fact to compute the
+    // hash — doubled I/O and held the whole archive in RAM
+    // momentarily. HashingWriter() is at the bottom of this file.
     let archive_file = fs::File::create(out_path)
         .map_err(|e| format!("creating archive {}: {}", out_path.display(), e))?;
-    let gz_writer  = GzEncoder::new(archive_file, Compression::default());
+    let hashing = HashingWriter::new(archive_file);
+    let gz_writer  = GzEncoder::new(hashing, Compression::default());
     let mut tar    = tar::Builder::new(gz_writer);
     // tar 0.4 default mode follows symlinks; we prefer to never
     // dereference a key file that someone replaced with a symlink.
@@ -193,17 +199,17 @@ pub fn run_backup_hot(
     let mut entries: Vec<FileEntry> = Vec::with_capacity(file_specs.len());
 
     for (src, archive_path) in &file_specs {
-        let bytes = fs::read(src)
-            .map_err(|e| format!("read {}: {}", src.display(), e))?;
-        let sha256 = sha256_hex(&bytes);
-
-        append_bytes_to_tar(&mut tar, archive_path, &bytes, now, /*sensitive=*/ archive_is_sensitive(archive_path))?;
-
-        entries.push(FileEntry {
-            archive_path: archive_path.clone(),
-            size:         bytes.len() as u64,
-            sha256,
-        });
+        // Stream the source file through both the tar writer and
+        // a sha256 hasher in one pass. append_streaming_to_tar()
+        // is at the bottom of this file.
+        let entry = append_streaming_to_tar(
+            &mut tar,
+            src,
+            archive_path,
+            now,
+            archive_is_sensitive(archive_path),
+        )?;
+        entries.push(entry);
     }
 
     // Write the manifest LAST so it can list every file we appended.
@@ -223,15 +229,13 @@ pub fn run_backup_hot(
     let gz_writer = tar
         .into_inner()
         .map_err(|e| format!("finalizing tar: {}", e))?;
-    gz_writer
+    let hashing = gz_writer
         .finish()
         .map_err(|e| format!("finalizing gz: {}", e))?;
 
-    // ---- 5. Re-read archive for hash + size in the report ----
-    let archive_bytes = fs::read(out_path)
-        .map_err(|e| format!("re-reading archive for hash: {}", e))?;
-    let archive_size   = archive_bytes.len() as u64;
-    let archive_sha256 = sha256_hex(&archive_bytes);
+    // ---- 5. Hash + size are already known from the streaming
+    //         tee — no second read of the archive needed.
+    let (archive_size, archive_sha256) = hashing.finalize();
 
     info!(
         "backup: wrote {} ({} files, {} bytes, sha256={})",
@@ -754,6 +758,117 @@ fn sha256_hex(bytes: &[u8]) -> String {
         s.push_str(&format!("{:02x}", b));
     }
     s
+}
+
+/// Format a Sha256 finalization as lowercase hex.
+fn sha256_finalize_hex(hasher: Sha256) -> String {
+    let digest = hasher.finalize();
+    let mut s = String::with_capacity(64);
+    for b in digest {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
+}
+
+// ============================================================
+// HashingWriter - tee-write that updates sha256 + byte counter
+// ============================================================
+
+/// Wraps an underlying `Write` and updates a sha256 + size
+/// counter for every byte that flows through. Used to compute
+/// the archive-level checksum during write so the post-write
+/// step doesn't have to re-read the whole file. Cheap: sha256
+/// is several GB/s on commodity hardware, far below the
+/// gzip-encoder's compression cost.
+struct HashingWriter<W: Write> {
+    inner:   W,
+    hasher:  Sha256,
+    written: u64,
+}
+
+impl<W: Write> HashingWriter<W> {
+    fn new(inner: W) -> Self {
+        Self { inner, hasher: Sha256::new(), written: 0 }
+    }
+
+    /// Consume the writer and return (bytes_written, sha256_hex).
+    /// Note: this does NOT flush — caller is responsible for
+    /// finalizing any wrapping writers (GzEncoder, etc.) first
+    /// so all bytes have actually been pushed through us.
+    fn finalize(self) -> (u64, String) {
+        (self.written, sha256_finalize_hex(self.hasher))
+    }
+}
+
+impl<W: Write> Write for HashingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        self.written += n as u64;
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+// ============================================================
+// append_streaming_to_tar - per-file streaming with hash + size
+// ============================================================
+
+/// Tee a source file through both the tar builder and a sha256
+/// hasher in a single pass. Avoids materializing the whole file
+/// in memory and avoids a second walk just to compute the hash.
+///
+/// We need the size up-front for the tar header, so this stat()s
+/// once before opening the file. The window between stat() and
+/// open() is tolerated — the source files we back up
+/// (config.yaml, sealed secrets, raft sled DB pages) don't
+/// change underneath us during a hot backup.
+fn append_streaming_to_tar<W: Write>(
+    tar:          &mut tar::Builder<W>,
+    src:          &Path,
+    archive_path: &str,
+    mtime_unix:   i64,
+    sensitive:    bool,
+) -> Result<FileEntry, String> {
+    let meta = fs::metadata(src)
+        .map_err(|e| format!("stat {}: {}", src.display(), e))?;
+    let size = meta.len();
+
+    let file = fs::File::open(src)
+        .map_err(|e| format!("open {}: {}", src.display(), e))?;
+    // Tee the file bytes through a sha256 hasher as the tar
+    // builder reads them. HashingReader is private to this fn.
+    struct HashingReader<R: std::io::Read> {
+        inner: R,
+        hasher: Sha256,
+    }
+    impl<R: std::io::Read> std::io::Read for HashingReader<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.hasher.update(&buf[..n]);
+            Ok(n)
+        }
+    }
+    let mut reader = HashingReader { inner: file, hasher: Sha256::new() };
+
+    let mut header = tar::Header::new_gnu();
+    header.set_size(size);
+    header.set_mode(if sensitive { 0o600 } else { 0o644 });
+    header.set_mtime(mtime_unix.max(0) as u64);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_cksum();
+
+    tar.append_data(&mut header, archive_path, &mut reader)
+        .map_err(|e| format!("tar append {}: {}", archive_path, e))?;
+
+    Ok(FileEntry {
+        archive_path: archive_path.to_string(),
+        size,
+        sha256: sha256_finalize_hex(reader.hasher),
+    })
 }
 
 // ============================================================

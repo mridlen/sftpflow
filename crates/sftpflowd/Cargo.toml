@@ -54,4 +54,8 @@ tar      = { workspace = true }
 flate2   = { workspace = true }
 sha2     = { workspace = true }
 tempfile = { workspace = true }
+# Scrub sensitive material (decoded token secret bytes, the
+# args_hash JSON serialization for PutSecret) before the
+# allocation is freed.
+zeroize  = { workspace = true }
 

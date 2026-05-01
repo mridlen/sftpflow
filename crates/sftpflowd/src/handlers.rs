@@ -19,7 +19,7 @@
 // that into a ResponseEnvelope.
 
 use std::collections::BTreeMap;
-use std::time::{Instant, SystemTime};
+use std::time::Instant;
 
 use log::{error, info, warn};
 
@@ -42,6 +42,7 @@ use crate::backup; // backup.rs - hot snapshot + cold restore
 use crate::dkron::DkronClient; // dkron.rs
 use crate::secrets::SecretStore; // secrets.rs
 use crate::server::{DaemonPaths, DaemonState};
+use crate::time_fmt::iso8601_now; // time_fmt.rs - shared UTC helpers
 
 // ============================================================
 // Helpers
@@ -359,28 +360,62 @@ pub fn rename_key(
 // ============================================================
 // Scheduler sync (best-effort after feed mutations)
 // ============================================================
+//
+// dkron HTTP calls used to fire from inside the handlers, while
+// the daemon mutex was held — every PutFeed/DeleteFeed serialized
+// behind a (potentially slow, with timeouts capped at ~10 s)
+// HTTP round-trip. The new pattern: handlers return a `DkronTask`
+// describing the work, and the dispatch wrapper executes it AFTER
+// dropping the daemon lock. See server.rs for the call pattern.
 
-/// If a dkron_url is configured, sync a single feed's schedules
-/// to dkron. Logs warnings on failure but never propagates errors.
-fn maybe_sync_feed(state: &DaemonState, feed_name: &str) {
-    if let Some(ref dkron_url) = state.dkron_url {
-        let client = DkronClient::new(dkron_url); // dkron.rs
-        if let Some(feed) = state.config.feeds.get(feed_name) {
-            client.sync_feed(feed_name, feed);
+/// Deferred dkron work, snapshotted under the daemon mutex but
+/// executed without it. `run()` performs the actual HTTP and never
+/// propagates errors — failures are logged and dropped, matching
+/// the prior "best-effort" semantics.
+pub enum DkronTask {
+    /// Push a single feed's schedules to dkron.
+    SyncFeed { url: String, feed_name: String, feed: sftpflow_core::Feed },
+    /// Remove every dkron job belonging to a feed.
+    DeleteFeedJobs { url: String, feed_name: String },
+}
+
+impl DkronTask {
+    /// Run the HTTP work. Caller has already dropped the daemon
+    /// mutex; the dkron client's own timeouts cap how long this
+    /// blocks the dispatch thread.
+    pub fn run(self) {
+        match self {
+            DkronTask::SyncFeed { url, feed_name, feed } => {
+                let client = DkronClient::new(&url); // dkron.rs
+                client.sync_feed(&feed_name, &feed);
+            }
+            DkronTask::DeleteFeedJobs { url, feed_name } => {
+                let client = DkronClient::new(&url); // dkron.rs
+                if let Err(e) = client.delete_feed_jobs(&feed_name) {
+                    warn!("dkron: failed to delete jobs for '{}': {}", feed_name, e);
+                } else {
+                    info!("dkron: deleted jobs for '{}'", feed_name);
+                }
+            }
         }
     }
 }
 
-/// If a dkron_url is configured, delete all dkron jobs for a feed.
-fn maybe_delete_feed_jobs(state: &DaemonState, feed_name: &str) {
-    if let Some(ref dkron_url) = state.dkron_url {
-        let client = DkronClient::new(dkron_url); // dkron.rs
-        if let Err(e) = client.delete_feed_jobs(feed_name) {
-            warn!("dkron: failed to delete jobs for '{}': {}", feed_name, e);
-        } else {
-            info!("dkron: deleted jobs for '{}'", feed_name);
-        }
-    }
+/// Build a `DkronTask::SyncFeed` for a feed that just got
+/// inserted/updated. Returns None when no dkron is configured or
+/// when the feed isn't in the live config (e.g. a put that
+/// failed validation before mutating the BTreeMap).
+pub fn dkron_sync_task(state: &DaemonState, feed_name: &str) -> Option<DkronTask> {
+    let url  = state.dkron_url.as_ref()?.clone();
+    let feed = state.config.feeds.get(feed_name)?.clone();
+    Some(DkronTask::SyncFeed { url, feed_name: feed_name.to_string(), feed })
+}
+
+/// Build a `DkronTask::DeleteFeedJobs` for a feed that was just
+/// deleted. Returns None when no dkron is configured.
+pub fn dkron_delete_task(state: &DaemonState, feed_name: &str) -> Option<DkronTask> {
+    let url = state.dkron_url.as_ref()?.clone();
+    Some(DkronTask::DeleteFeedJobs { url, feed_name: feed_name.to_string() })
 }
 
 // ============================================================
@@ -428,7 +463,9 @@ pub fn put_feed(
         name,
         if existed { "updated" } else { "created" }
     );
-    maybe_sync_feed(state, &name);
+    // Dkron sync happens at the dispatch layer after the daemon
+    // mutex is released — see server.rs RunFeedNow / PutFeed
+    // dispatch arms and `dkron_sync_task` above.
     Ok(Response::Ok)
 }
 
@@ -468,7 +505,7 @@ pub fn delete_feed(
         "deleted feed '{}' (swept {} dangling nextstep ref(s))",
         name, dangling,
     );
-    maybe_delete_feed_jobs(state, name);
+    // Dkron job removal happens at the dispatch layer.
     Ok(Response::Ok)
 }
 
@@ -514,8 +551,8 @@ pub fn rename_feed(
         "renamed feed '{}' -> '{}', updated {} nextstep reference(s)",
         from, to, ref_count
     );
-    maybe_delete_feed_jobs(state, &from);
-    maybe_sync_feed(state, &to);
+    // The dispatch layer handles both the delete-old + sync-new
+    // dkron tasks after the mutex is released. See server.rs.
     Ok(Response::Ok)
 }
 
@@ -635,45 +672,8 @@ pub fn record_run_history(
     }
 }
 
-/// Format the current wall-clock time as ISO 8601 UTC.
-fn iso8601_now() -> String {
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = now.as_secs();
-
-    // Manual UTC formatting to avoid pulling in chrono.
-    // Good enough for logging — not for leap-second correctness.
-    let days_since_epoch = secs / 86400;
-    let time_of_day      = secs % 86400;
-    let hours   = time_of_day / 3600;
-    let minutes = (time_of_day % 3600) / 60;
-    let seconds = time_of_day % 60;
-
-    // Convert days since 1970-01-01 to Y-M-D using a civil calendar algorithm.
-    let (y, m, d) = civil_from_days(days_since_epoch as i64);
-
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        y, m, d, hours, minutes, seconds
-    )
-}
-
-/// Convert days since 1970-01-01 to (year, month, day).
-/// Algorithm from Howard Hinnant's chrono-compatible date library.
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y   = (yoe as i64) + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp  = (5 * doy + 2) / 153;
-    let d   = doy - (153 * mp + 2) / 5 + 1;
-    let m   = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y   = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
-}
+// iso8601_now / civil_from_days now live in time_fmt.rs and are
+// imported at the top of this file.
 
 // ============================================================
 // Scheduler
@@ -867,27 +867,46 @@ pub fn get_audit_log(
 // Scheduler
 // ============================================================
 
-/// Full reconciliation of feed schedules ↔ dkron jobs.
-/// Returns a SyncReport with counts. If no dkron_url is configured,
-/// returns a report with all zeros and an informational error.
-pub fn sync_schedules(state: &DaemonState) -> Response {
-    match &state.dkron_url {
-        Some(dkron_url) => {
-            info!("sync_schedules: reconciling against {}", dkron_url);
-            let client = DkronClient::new(dkron_url); // dkron.rs
-            let report = client.reconcile_all(&state.config.feeds);
-            Response::SyncReport(report)
-        }
-        None => {
-            info!("sync_schedules: no dkron_url configured");
-            Response::SyncReport(SyncReport {
-                created: 0,
-                updated: 0,
-                deleted: 0,
-                errors: vec!["no dkron_url configured; scheduler sync disabled".to_string()],
-            })
-        }
-    }
+/// Snapshot of what `sync_schedules` needs after the daemon
+/// mutex is released. None when dkron isn't configured (the
+/// dispatch layer then short-circuits to the "no dkron_url"
+/// SyncReport without doing any HTTP).
+pub struct SyncSchedulesPrep {
+    pub url:   String,
+    pub feeds: BTreeMap<String, sftpflow_core::Feed>,
+}
+
+/// Phase 1: snapshot the feeds map under the daemon lock so the
+/// (potentially slow) HTTP reconciliation in `execute_sync_schedules`
+/// runs without holding the mutex.
+pub fn prepare_sync_schedules(state: &DaemonState) -> Option<SyncSchedulesPrep> {
+    let url = state.dkron_url.as_ref()?.clone();
+    Some(SyncSchedulesPrep {
+        url,
+        feeds: state.config.feeds.clone(),
+    })
+}
+
+/// Phase 2: run the dkron reconciliation. Caller has already
+/// dropped the daemon mutex; this function blocks on dkron's
+/// own (capped) HTTP timeouts only.
+pub fn execute_sync_schedules(prep: SyncSchedulesPrep) -> Response {
+    info!("sync_schedules: reconciling against {}", prep.url);
+    let client = DkronClient::new(&prep.url); // dkron.rs
+    let report = client.reconcile_all(&prep.feeds);
+    Response::SyncReport(report)
+}
+
+/// "no dkron_url" reply for the dispatch site to use when
+/// `prepare_sync_schedules` returned None.
+pub fn sync_schedules_disabled() -> Response {
+    info!("sync_schedules: no dkron_url configured");
+    Response::SyncReport(SyncReport {
+        created: 0,
+        updated: 0,
+        deleted: 0,
+        errors: vec!["no dkron_url configured; scheduler sync disabled".to_string()],
+    })
 }
 
 // ============================================================
