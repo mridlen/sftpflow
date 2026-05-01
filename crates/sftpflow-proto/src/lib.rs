@@ -864,6 +864,92 @@ mod tests {
     // ---- request round-trips ----
 
     #[test]
+    fn known_response_kinds_covers_every_variant() {
+        // Compile-time exhaustiveness via `match` plus a runtime
+        // check that each variant's serialized `kind` string is
+        // listed in KNOWN_RESPONSE_KINDS. Without this, a future
+        // contributor adding a new Response variant would silently
+        // route legitimate responses through UnknownSuccess on the
+        // CLI side.
+        //
+        // Strategy: build one instance of each variant with empty
+        // / default contents, serialize to a Value, read the
+        // `kind` field, assert membership in the constant. The
+        // match arms here force the test to be updated whenever
+        // a new variant is added — that's the whole point.
+        fn one_of_each() -> Vec<Response> {
+            vec![
+                Response::Pong,
+                Response::ServerInfo(ServerInfo {
+                    version: String::new(),
+                    hostname: String::new(),
+                    uptime_seconds: 0,
+                }),
+                Response::Names(Vec::new()),
+                Response::Endpoint(None),
+                Response::Key(None),
+                Response::Feed(None),
+                Response::FeedSummaries(Vec::new()),
+                Response::Ok,
+                Response::RunResult(RunResult {
+                    feed: String::new(),
+                    status: RunStatus::Success,
+                    files_transferred: 0,
+                    message: None,
+                }),
+                Response::SyncReport(SyncReport {
+                    created: 0, updated: 0, deleted: 0, errors: Vec::new(),
+                }),
+                Response::RunHistory(Vec::new()),
+                Response::ClusterStatus(ClusterStatus {
+                    cluster_id: String::new(),
+                    self_id: 0,
+                    leader_id: None,
+                    members: Vec::new(),
+                    responder_uptime_secs: 0,
+                    responder_last_log_index: None,
+                    responder_last_applied_index: None,
+                    responder_is_leader: false,
+                }),
+                Response::ClusterToken(ClusterToken {
+                    token: String::new(),
+                    expires_at_unix: 0,
+                }),
+                Response::ClusterCaCert(String::new()),
+                Response::BackupReport(BackupReport {
+                    archive_path: String::new(),
+                    archive_size: 0,
+                    archive_sha256: String::new(),
+                    file_count: 0,
+                    cluster_id: None,
+                    node_id: None,
+                }),
+                Response::AuditLog(Vec::new()),
+                Response::DryRunReport(DryRunReport {
+                    summary: String::new(),
+                    effects: Vec::new(),
+                    warnings: Vec::new(),
+                }),
+            ]
+        }
+
+        for resp in one_of_each() {
+            let v = serde_json::to_value(&resp).expect("serialize variant");
+            let kind = v.get("kind")
+                .and_then(|k| k.as_str())
+                .unwrap_or_else(|| panic!("variant {:?} did not serialize with `kind`", resp));
+            assert!(
+                KNOWN_RESPONSE_KINDS.iter().any(|k| *k == kind),
+                "variant {:?} serializes as kind={:?} but that's not in \
+                 KNOWN_RESPONSE_KINDS — add it to the constant in lib.rs \
+                 or the CLI will silently route this response through \
+                 UnknownSuccess",
+                resp, kind,
+            );
+        }
+    }
+
+    #[test]
     fn ping_request_serializes_predictably() {
         let env = RequestEnvelope {
             id: 1,

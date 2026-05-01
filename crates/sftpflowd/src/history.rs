@@ -76,21 +76,41 @@ impl RunDb {
         ).map_err(|e| format!("failed to initialize runs schema: {}", e))?;
 
         // Migration: older databases don't have `started_unix`.
-        // Add it as nullable with a 0 default so existing rows
-        // sort to the bottom of the recency window. New writes
-        // populate the column from a real wall-clock value.
-        // Errors here are swallowed because the column-already-
-        // exists case returns a "duplicate column name" error
-        // every time the daemon starts.
-        let _ = conn.execute_batch(
+        // Add it with a 0 default so existing rows sort to the
+        // bottom of the recency window; new writes populate it
+        // from a real wall-clock value.
+        //
+        // The column-already-exists case is the common one (every
+        // restart hits it after the first migration). Match on
+        // SQLite's "duplicate column" error and swallow JUST that;
+        // any other failure (disk full, permission, schema lock)
+        // would silently break every subsequent INSERT — surface
+        // those loudly so an operator notices in the logs.
+        if let Err(e) = conn.execute_batch(
             "ALTER TABLE runs ADD COLUMN started_unix INTEGER NOT NULL DEFAULT 0;"
-        );
+        ) {
+            let msg = e.to_string().to_lowercase();
+            if msg.contains("duplicate column") {
+                // expected: column was already added on a prior run
+            } else {
+                warn!(
+                    "run history at '{}': could not add `started_unix` column: {} \
+                     — subsequent INSERTs will fail until this is resolved",
+                    path.display(), e,
+                );
+            }
+        }
         // Build the new index even when ALTER above no-op'd, so
         // an upgraded daemon picks up the unix-ordered index.
-        let _ = conn.execute_batch(
+        if let Err(e) = conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_runs_feed_unix
                 ON runs (feed, started_unix DESC);"
-        );
+        ) {
+            warn!(
+                "run history at '{}': could not create unix-ordered index: {}",
+                path.display(), e,
+            );
+        }
 
         info!("run history database opened at '{}'", path.display());
         Ok(RunDb { conn })

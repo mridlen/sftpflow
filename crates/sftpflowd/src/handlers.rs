@@ -594,8 +594,36 @@ pub fn prepare_run_feed(
     info!("run_feed_now requested for '{}'", name);
 
     let feed = feed.clone();
-    let mut endpoints = state.config.endpoints.clone();
-    let mut keys = state.config.keys.clone();
+
+    // Clone ONLY the endpoints + keys this feed references —
+    // cloning the entire registry on every RunFeedNow gets
+    // expensive on a daemon with hundreds of configured
+    // endpoints, and resolved-secret values would otherwise sit
+    // in the heap snapshot for the whole transfer.
+    let mut endpoints = BTreeMap::new();
+    for path in feed.sources.iter().chain(feed.destinations.iter()) {
+        if let Some(ep) = state.config.endpoints.get(&path.endpoint) {
+            endpoints.insert(path.endpoint.clone(), ep.clone());
+        }
+    }
+    let mut keys = BTreeMap::new();
+    for step in &feed.process {
+        let referenced = match step {
+            ProcessStep::Encrypt { key } => vec![key.clone()],
+            ProcessStep::Decrypt { key, verify_with } => {
+                let mut v = vec![key.clone()];
+                if let Some(verifiers) = verify_with {
+                    v.extend(verifiers.iter().cloned());
+                }
+                v
+            }
+        };
+        for k in referenced {
+            if let Some(pk) = state.config.keys.get(&k) {
+                keys.insert(k, pk.clone());
+            }
+        }
+    }
 
     // resolve_refs() - below
     if let Err(msg) = resolve_refs(&mut endpoints, &mut keys, state.secrets.as_ref()) {

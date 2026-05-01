@@ -274,6 +274,14 @@ pub fn decrypt_files(
             PgpError::Io(format!("fsync tempfile: {}", e))
         })?;
 
+        // Drop the decryptor (and the input File handle it owns)
+        // BEFORE persisting the tempfile onto the destination.
+        // On Windows when in_path == out_path, MoveFileEx fails
+        // with a sharing violation if the source file is still
+        // open — Linux happily renames over open files, but we
+        // want behavior to match across platforms.
+        drop(decryptor);
+
         // We need the input file gone (or replaced) before
         // writing the destination, especially in the in==out
         // case. The persist below handles both the collision
@@ -540,6 +548,45 @@ mod tests {
 
         let round_tripped =
             std::fs::read(staging.path().join("payload.txt")).unwrap();
+        assert_eq!(round_tripped, plaintext);
+    }
+
+    #[test]
+    fn decrypt_in_place_when_no_extension_to_strip() {
+        // Regression for the in==out case: when the encrypted
+        // file has no `.pgp`/`.gpg`/`.asc` extension, strip
+        // returns the same name, so decrypt's input and output
+        // paths are identical. The implementation must persist
+        // the plaintext over the original ciphertext without
+        // truncating it mid-read.
+        let (public_key, private_key) = generate_test_keys();
+        let staging = TempDir::new().unwrap();
+        let plaintext = b"plaintext payload, no .pgp suffix\n";
+        let file_name = "report"; // deliberately no extension
+        std::fs::write(staging.path().join(file_name), plaintext).unwrap();
+
+        let encrypted = encrypt_files(
+            "test-key", &public_key, staging.path(),
+            &[file_name.to_string()],
+        ).expect("encrypt");
+        // The encrypted name has `.pgp` appended — but rename
+        // back to the original (no-extension) name to simulate
+        // the in==out case at decrypt time.
+        let pgp_path = staging.path().join("report.pgp");
+        let collision_path = staging.path().join("report");
+        std::fs::rename(&pgp_path, &collision_path).unwrap();
+        // strip_pgp_extension("report") returns "report" — so
+        // decrypt's in_path == out_path.
+        let _ = encrypted; // silence unused (we renamed manually)
+
+        let decrypted = decrypt_files(
+            "test-key", &private_key, &[],
+            staging.path(),
+            &["report".to_string()],
+        ).expect("decrypt in-place must not truncate input");
+        assert_eq!(decrypted, vec!["report".to_string()]);
+
+        let round_tripped = std::fs::read(staging.path().join("report")).unwrap();
         assert_eq!(round_tripped, plaintext);
     }
 

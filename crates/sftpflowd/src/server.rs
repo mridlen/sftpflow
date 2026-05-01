@@ -14,7 +14,8 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -54,27 +55,70 @@ use crate::secrets::SecretStore; // secrets.rs - sealed credential store
 ///   - a boolean flag the signal handler flips to ask the daemon
 ///     to stop accepting new connections,
 ///   - an in-flight connection counter so the post-loop drain can
-///     wait for outstanding NDJSON RPCs to finish (or time out).
+///     wait for outstanding NDJSON RPCs to finish (or time out),
+///   - a registry of cloned stream handles so `signal()` can
+///     immediately break in-flight blocking reads via
+///     `shutdown(Both)`. Without this, a worker thread sitting in
+///     `read_line` waiting for the next request would sleep up to
+///     the per-RPC read timeout (10 minutes) before noticing
+///     shutdown, leaving the process zombied long after exit
+///     looks complete.
 ///
-/// Cheap to clone (two `Arc`s); the daemon hands one clone to the
-/// signal-handler task and one to `server::run`.
+/// Cheap to clone (a few `Arc`s); the daemon hands one clone to
+/// the signal-handler task and one to `server::run`.
 #[derive(Clone)]
 pub struct Shutdown {
     flag:      Arc<AtomicBool>,
     in_flight: Arc<AtomicUsize>,
+    /// Map of connection-id → cloned stream handle. Keyed by a
+    /// monotonic id from `next_stream_id` so each connection's
+    /// `Drop` can remove its own slot without invalidating other
+    /// guards' keys (a Vec<...> + swap_remove approach would
+    /// shift indices around).
+    streams:        Arc<Mutex<HashMap<u64, StreamHandle>>>,
+    next_stream_id: Arc<AtomicU64>,
+}
+
+/// Cloned stream handle we keep alive so `signal()` can call
+/// `shutdown(Both)` on it. We never read or write through these
+/// handles — they exist purely to break pending blocking reads
+/// on the worker thread's clone.
+enum StreamHandle {
+    Tcp(TcpStream),
+    #[cfg(unix)]
+    Unix(UnixStream),
 }
 
 impl Shutdown {
     pub fn new() -> Self {
         Self {
-            flag:      Arc::new(AtomicBool::new(false)),
-            in_flight: Arc::new(AtomicUsize::new(0)),
+            flag:           Arc::new(AtomicBool::new(false)),
+            in_flight:      Arc::new(AtomicUsize::new(0)),
+            streams:        Arc::new(Mutex::new(HashMap::new())),
+            next_stream_id: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    /// Flip the shutdown flag. Idempotent — repeat calls are no-ops.
+    /// Flip the shutdown flag and break any in-flight reads by
+    /// shutting down every registered stream. Idempotent — repeat
+    /// calls re-walk the registry (now empty after guards drop)
+    /// but otherwise are no-ops.
     pub fn signal(&self) {
         self.flag.store(true, Ordering::SeqCst);
+        // Break in-flight blocking reads. Failures are logged at
+        // debug level (the most common cause is a stream that
+        // already closed — fine).
+        let streams = self.streams.lock().unwrap();
+        for s in streams.values() {
+            let res = match s {
+                StreamHandle::Tcp(t) => t.shutdown(std::net::Shutdown::Both),
+                #[cfg(unix)]
+                StreamHandle::Unix(u) => u.shutdown(std::net::Shutdown::Both),
+            };
+            if let Err(e) = res {
+                debug!("shutdown: stream shutdown failed (likely already closed): {}", e);
+            }
+        }
     }
 
     /// Has shutdown been requested?
@@ -83,12 +127,28 @@ impl Shutdown {
     }
 
     /// Build a guard that increments the in-flight counter on
-    /// creation and decrements on drop. Connection workers hold
-    /// one of these for the duration of their handler so the
-    /// drain phase can wait for them.
-    fn enter_connection(&self) -> ConnectionGuard {
+    /// creation, registers a stream-shutdown handle, and on drop
+    /// both decrements the counter and drops the handle. Connection
+    /// workers hold one of these for the duration of their handler.
+    /// Register a new connection. The in-flight counter ALWAYS
+    /// increments — it's how `drain()` knows when the daemon can
+    /// safely exit. `handle` is optional because `try_clone` of
+    /// the stream might fail; in that case we still track the
+    /// connection but won't be able to break its blocking reads
+    /// on shutdown (the worker will exit when its read timeout
+    /// fires, up to NDJSON_READ_TIMEOUT later).
+    fn enter_connection(&self, handle: Option<StreamHandle>) -> ConnectionGuard {
         self.in_flight.fetch_add(1, Ordering::SeqCst);
-        ConnectionGuard { in_flight: Arc::clone(&self.in_flight) }
+        let stream_id = handle.map(|h| {
+            let id = self.next_stream_id.fetch_add(1, Ordering::SeqCst);
+            self.streams.lock().unwrap().insert(id, h);
+            id
+        });
+        ConnectionGuard {
+            in_flight: Arc::clone(&self.in_flight),
+            streams:   Arc::clone(&self.streams),
+            stream_id,
+        }
     }
 
     /// Block the calling thread until the in-flight counter hits
@@ -120,16 +180,32 @@ impl Default for Shutdown {
 }
 
 /// RAII guard returned by `Shutdown::enter_connection`. Decrements
-/// the in-flight counter on drop so the count tracks the actual
-/// set of running handlers, even if a handler panics or returns
-/// via `?` mid-RPC.
+/// the in-flight counter on drop AND removes the stream handle
+/// from the shutdown registry, so a long-lived daemon doesn't
+/// accumulate dead handles. Runs even if a handler panics or
+/// returns via `?` mid-RPC (Rust unwinds locals before unwinding
+/// the stack frame).
 struct ConnectionGuard {
     in_flight: Arc<AtomicUsize>,
+    streams:   Arc<Mutex<HashMap<u64, StreamHandle>>>,
+    /// `Some(id)` when this connection registered a stream handle
+    /// in the shutdown registry; `None` if `try_clone` failed at
+    /// accept time. Either way the `in_flight` counter is bumped
+    /// and decremented; only the stream-shutdown plumbing is
+    /// optional.
+    stream_id: Option<u64>,
 }
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        // Remove our slot so the registry stays bounded by the
+        // number of in-flight connections, not the lifetime-total
+        // accept count. HashMap::remove on a missing key is a
+        // no-op (which is what we want if signal() drained us).
+        if let Some(id) = self.stream_id {
+            self.streams.lock().unwrap().remove(&id);
+        }
     }
 }
 
@@ -149,8 +225,8 @@ mod shutdown_tests {
     #[test]
     fn drain_waits_for_guards_to_drop() {
         let s = Shutdown::new();
-        let g1 = s.enter_connection();
-        let g2 = s.enter_connection();
+        let g1 = s.enter_connection(None);
+        let g2 = s.enter_connection(None);
         assert_eq!(s.in_flight.load(Ordering::SeqCst), 2);
         let s_clone = s.clone();
         std::thread::spawn(move || {
@@ -168,9 +244,28 @@ mod shutdown_tests {
     }
 
     #[test]
+    fn guard_drops_even_on_panic() {
+        // ConnectionGuard's Drop must run when the worker thread
+        // panics, otherwise a panic mid-RPC would leak an entry
+        // in the in-flight counter and the drain would hang.
+        let s = Shutdown::new();
+        let s_in_thread = s.clone();
+        let h = std::thread::spawn(move || {
+            let _g = s_in_thread.enter_connection(None);
+            panic!("simulated worker panic");
+        });
+        // Catch the panic so the test process doesn't abort.
+        let _ = h.join();
+        assert_eq!(
+            s.in_flight.load(Ordering::SeqCst), 0,
+            "guard's Drop should have run despite the panic",
+        );
+    }
+
+    #[test]
     fn drain_times_out_when_guards_outlive_window() {
         let s = Shutdown::new();
-        let _g = s.enter_connection();
+        let _g = s.enter_connection(None);
         // Tight deadline: guard never drops, so drain should
         // give up and return false.
         assert!(!s.drain(Duration::from_millis(120)));
@@ -379,8 +474,22 @@ fn serve_tcp(
                 if let Err(e) = stream.set_write_timeout(Some(NDJSON_WRITE_TIMEOUT)) {
                     warn!("tcp: set_write_timeout failed: {}", e);
                 }
+                // Clone the stream into the shutdown registry so
+                // signal() can break a worker that's blocked in
+                // read_line waiting for the next request. A
+                // try_clone failure is non-fatal: we still track
+                // the connection in the in-flight counter so drain
+                // waits for it, but on shutdown the worker will
+                // only exit when its read timeout fires.
+                let registry_handle = match stream.try_clone() {
+                    Ok(c) => Some(StreamHandle::Tcp(c)),
+                    Err(e) => {
+                        warn!("tcp: stream try_clone for shutdown registry failed: {}", e);
+                        None
+                    }
+                };
                 let state = Arc::clone(&state);
-                let guard = shutdown.enter_connection();
+                let guard = shutdown.enter_connection(registry_handle);
                 std::thread::spawn(move || {
                     if let Err(e) = handle_tcp(stream, state) {
                         warn!("connection handler error: {}", e);
@@ -466,8 +575,18 @@ fn serve_unix(
                 if let Err(e) = stream.set_write_timeout(Some(NDJSON_WRITE_TIMEOUT)) {
                     warn!("unix: set_write_timeout failed: {}", e);
                 }
+                // See the TCP arm for the rationale: clone for the
+                // shutdown registry so signal() can break a worker
+                // blocked on read_line.
+                let registry_handle = match stream.try_clone() {
+                    Ok(c) => Some(StreamHandle::Unix(c)),
+                    Err(e) => {
+                        warn!("unix: stream try_clone for shutdown registry failed: {}", e);
+                        None
+                    }
+                };
                 let state = Arc::clone(&state);
-                let guard = shutdown.enter_connection();
+                let guard = shutdown.enter_connection(registry_handle);
                 std::thread::spawn(move || {
                     if let Err(e) = handle_unix(stream, state) {
                         warn!("connection handler error: {}", e);
