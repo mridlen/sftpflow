@@ -15,6 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// (UTC). Falls back to the epoch if the system clock is set
 /// before 1970, which is closer to "obviously wrong in the log"
 /// than crashing.
+#[allow(dead_code)] // exported for future callers; today everyone uses now_unix_and_iso
 pub fn iso8601_now() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)

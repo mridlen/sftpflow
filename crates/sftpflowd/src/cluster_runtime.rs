@@ -402,11 +402,9 @@ async fn start_with_join_handler(params: BootstrapParams) -> Result<ClusterNode,
     // here (we only call this once); ignore the result.
     let _ = handle_cell.set(node.handle());
 
-    // Give tonic a beat to actually bind. Without this, the
-    // initialize_solo → leader-election path sometimes loses a
-    // heartbeat against its own listener. Mirrors the 500ms pause
-    // in the three_node_cluster integration test.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // No post-start sleep needed: ClusterNode::start now binds the
+    // TCP listener synchronously before returning, so tonic is
+    // accepting connections by the time we get here.
 
     Ok(node)
 }

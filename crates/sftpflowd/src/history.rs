@@ -64,15 +64,33 @@ impl RunDb {
                 id                INTEGER PRIMARY KEY AUTOINCREMENT,
                 feed              TEXT    NOT NULL,
                 started_at        TEXT    NOT NULL,
+                started_unix      INTEGER NOT NULL DEFAULT 0,
                 duration_secs     REAL    NOT NULL,
                 status            TEXT    NOT NULL,
                 files_transferred INTEGER NOT NULL DEFAULT 0,
                 message           TEXT
             );
 
-            CREATE INDEX IF NOT EXISTS idx_runs_feed
-                ON runs (feed, started_at DESC);"
+            CREATE INDEX IF NOT EXISTS idx_runs_feed_unix
+                ON runs (feed, started_unix DESC);"
         ).map_err(|e| format!("failed to initialize runs schema: {}", e))?;
+
+        // Migration: older databases don't have `started_unix`.
+        // Add it as nullable with a 0 default so existing rows
+        // sort to the bottom of the recency window. New writes
+        // populate the column from a real wall-clock value.
+        // Errors here are swallowed because the column-already-
+        // exists case returns a "duplicate column name" error
+        // every time the daemon starts.
+        let _ = conn.execute_batch(
+            "ALTER TABLE runs ADD COLUMN started_unix INTEGER NOT NULL DEFAULT 0;"
+        );
+        // Build the new index even when ALTER above no-op'd, so
+        // an upgraded daemon picks up the unix-ordered index.
+        let _ = conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_runs_feed_unix
+                ON runs (feed, started_unix DESC);"
+        );
 
         info!("run history database opened at '{}'", path.display());
         Ok(RunDb { conn })
@@ -82,13 +100,18 @@ impl RunDb {
     // Write
     // --------------------------------------------------------
 
-    /// Record a completed feed run.
+    /// Record a completed feed run. `started_unix` should match
+    /// `started_at`'s wall-clock instant (both captured at the
+    /// same time by the caller); we store both so the ISO column
+    /// stays human-readable while the unix column gives a
+    /// type-correct sort order.
     pub fn record_run(
         &self,
-        feed_name: &str,
-        started_at: &str,
-        duration: Duration,
-        result: &RunResult,
+        feed_name:    &str,
+        started_at:   &str,
+        started_unix: i64,
+        duration:     Duration,
+        result:       &RunResult,
     ) {
         let status_str = match result.status {
             RunStatus::Success  => "success",
@@ -97,11 +120,12 @@ impl RunDb {
         };
 
         let res = self.conn.execute(
-            "INSERT INTO runs (feed, started_at, duration_secs, status, files_transferred, message)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO runs (feed, started_at, started_unix, duration_secs, status, files_transferred, message)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 feed_name,
                 started_at,
+                started_unix,
                 duration.as_secs_f64(),
                 status_str,
                 result.files_transferred as i64,
@@ -133,11 +157,16 @@ impl RunDb {
     ) -> Result<Vec<RunHistoryEntry>, String> {
         let limit = limit.unwrap_or(25) as i64;
 
+        // Order by the unix timestamp column so the sort is
+        // type-correct; older rows that predate the migration
+        // have started_unix=0 and tiebreak on rowid descending,
+        // which keeps newest-inserted at the top within that
+        // legacy bucket.
         let mut stmt = self.conn.prepare(
             "SELECT id, feed, started_at, duration_secs, status, files_transferred, message
              FROM runs
              WHERE feed = ?1
-             ORDER BY started_at DESC
+             ORDER BY started_unix DESC, id DESC
              LIMIT ?2"
         ).map_err(|e| format!("query error: {}", e))?;
 

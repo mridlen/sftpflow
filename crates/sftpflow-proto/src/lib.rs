@@ -554,7 +554,15 @@ fn is_false(b: &bool) -> bool { !*b }
 
 /// A response as it appears on the wire. Exactly one of
 /// `result` or `error` is present.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+///
+/// The shape on the wire is `{"id": N, "result": ...}` or
+/// `{"id": N, "error": ...}`. We hand-roll Deserialize so a buggy
+/// or hostile peer that ships BOTH fields gets a hard error
+/// instead of `serde(untagged)` silently picking whichever
+/// matched first — that ambiguity was the original bug and led
+/// to a "successful" response sometimes carrying an unobserved
+/// error or vice-versa.
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ResponseEnvelope {
     pub id: u64,
     #[serde(flatten)]
@@ -562,13 +570,65 @@ pub struct ResponseEnvelope {
 }
 
 /// The body of a ResponseEnvelope: either a successful Response or
-/// an error. Serialized untagged so the JSON shape is the familiar
-/// `{"id": N, "result": ...}` or `{"id": N, "error": ...}`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(untagged)]
+/// an error. We serialize via a manual impl that emits the
+/// historical shape (`result` xor `error` flat-merged into the
+/// envelope object) so the wire format stays compatible with
+/// existing CLIs.
+#[derive(Debug, Clone, PartialEq)]
 pub enum ResponseOutcome {
     Success { result: Response },
     Failure { error: ProtoError },
+}
+
+impl serde::Serialize for ResponseOutcome {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = ser.serialize_map(Some(1))?;
+        match self {
+            ResponseOutcome::Success { result } => {
+                map.serialize_entry("result", result)?;
+            }
+            ResponseOutcome::Failure { error } => {
+                map.serialize_entry("error", error)?;
+            }
+        }
+        map.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ResponseEnvelope {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        // Deserialize via an intermediate Helper that captures both
+        // fields independently, then enforce "exactly one present"
+        // ourselves. This rejects malformed peers that ship both.
+        #[derive(Deserialize)]
+        struct Helper {
+            id:     u64,
+            #[serde(default)]
+            result: Option<Response>,
+            #[serde(default)]
+            error:  Option<ProtoError>,
+        }
+        let h = Helper::deserialize(de)?;
+        match (h.result, h.error) {
+            (Some(r), None) => Ok(ResponseEnvelope {
+                id: h.id,
+                outcome: ResponseOutcome::Success { result: r },
+            }),
+            (None, Some(e)) => Ok(ResponseEnvelope {
+                id: h.id,
+                outcome: ResponseOutcome::Failure { error: e },
+            }),
+            (Some(_), Some(_)) => Err(serde::de::Error::custom(
+                "response envelope has BOTH `result` and `error` fields; \
+                 exactly one must be present",
+            )),
+            (None, None) => Err(serde::de::Error::custom(
+                "response envelope has NEITHER `result` nor `error`; \
+                 exactly one must be present",
+            )),
+        }
+    }
 }
 
 impl ResponseEnvelope {
@@ -835,6 +895,32 @@ mod tests {
 
         let parsed: ResponseEnvelope = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, env);
+    }
+
+    #[test]
+    fn response_envelope_rejects_both_result_and_error() {
+        // Regression: previously the envelope used #[serde(untagged)]
+        // and silently picked Success when both fields were present
+        // (or vice versa, depending on declaration order). The new
+        // custom Deserialize requires exactly one.
+        let json = r#"{"id":1,"result":{"kind":"pong"},"error":{"code":1000,"message":"x"}}"#;
+        let err = serde_json::from_str::<ResponseEnvelope>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("BOTH `result` and `error`"),
+            "wrong error: {}", err,
+        );
+    }
+
+    #[test]
+    fn response_envelope_rejects_neither_result_nor_error() {
+        // Same protection in the other direction: a malformed peer
+        // shipping just `{"id": N}` should fail loud.
+        let json = r#"{"id":1}"#;
+        let err = serde_json::from_str::<ResponseEnvelope>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("NEITHER `result` nor `error`"),
+            "wrong error: {}", err,
+        );
     }
 
     #[test]

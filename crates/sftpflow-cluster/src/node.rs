@@ -42,7 +42,7 @@ use crate::tls;
 use crate::token::{TokenSecret, UsedNonces};
 use crate::transport::{
     no_forward_handler,
-    run_grpc_server,
+    run_grpc_server_with_listener,
     AdminServiceImpl,
     BootstrapServiceImpl,
     JoinHandler,
@@ -219,8 +219,18 @@ impl ClusterNode {
         );
 
         let bind_addr = cfg.bind_addr;
+        // Bind the TCP listener synchronously so the gRPC server
+        // is accepting connections by the time start() returns.
+        // Earlier code spawned tonic's serve(addr) and slept 500ms
+        // hoping the listener was up by then — racy on slow boxes.
+        let listener = tokio::net::TcpListener::bind(bind_addr).await
+            .map_err(|e| ClusterError::Raft(format!(
+                "could not bind cluster gRPC listener on {}: {}", bind_addr, e,
+            )))?;
         let server_task = tokio::spawn(async move {
-            run_grpc_server(bind_addr, tls_cfg, raft_svc, admin_svc, bootstrap_svc, forward_svc).await
+            run_grpc_server_with_listener(
+                listener, tls_cfg, raft_svc, admin_svc, bootstrap_svc, forward_svc,
+            ).await
         });
 
         // Touch unused field so compiler doesn't complain in M12

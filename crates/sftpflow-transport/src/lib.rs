@@ -386,8 +386,15 @@ pub async fn run_feed(
     // ---- phase 1: download from sources ----
     // Track which files came from which source so we can delete later.
     let mut downloaded_files: Vec<String> = Vec::new();
-    // Track source files per FeedPath for deletion phase.
-    let mut source_file_map: Vec<(&FeedPath, Vec<String>)> = Vec::new();
+    // Track source files per FeedPath for the deletion phase. When
+    // `delete_source_after_transfer` is on we also keep the
+    // phase-1 transport alive so phase 3 doesn't pay a fresh
+    // connect+auth round-trip per source. The transport stays
+    // open across the process pipeline + upload phase, which is
+    // a few seconds in practice.
+    let want_keep_for_cleanup = feed.flags.delete_source_after_transfer;
+    let mut source_file_map: Vec<(&FeedPath, Vec<String>, Option<Box<dyn Transport>>)>
+        = Vec::new();
 
     for src in &feed.sources {
         info!(
@@ -462,7 +469,10 @@ pub async fn run_feed(
                 "run_feed '{}': no files found at {}:{}",
                 feed_name, src.endpoint, src.path
             );
-            source_file_map.push((src, Vec::new()));
+            // No files → no cleanup work for this source, so we
+            // can drop the connection now even if delete-after-
+            // transfer is on.
+            source_file_map.push((src, Vec::new(), None));
             continue;
         }
 
@@ -528,7 +538,11 @@ pub async fn run_feed(
             src_files.push(file_name.clone());
         }
 
-        source_file_map.push((src, src_files));
+        // Keep the transport for phase 3 only when cleanup will
+        // need it. Otherwise drop the connection immediately so we
+        // don't tie up a session across the upload phase.
+        let kept = if want_keep_for_cleanup { Some(transport) } else { None };
+        source_file_map.push((src, src_files, kept));
     }
 
     // If no files were downloaded from any source, return Noaction
@@ -550,14 +564,32 @@ pub async fn run_feed(
     // operates on whatever set of filenames phase 1 produced (or the
     // previous step left behind), and returns the new filename list
     // that the next step / upload phase should use.
+    //
+    // PGP work is CPU-bound and synchronous (sequoia is sync). Run
+    // it on the blocking-thread pool so a multi-GB encrypt doesn't
+    // block the tokio reactor and stall every other async task on
+    // the runtime (the same runtime serves the gRPC + dispatch
+    // forwarding paths in cluster mode).
     if !feed.process.is_empty() {
-        match apply_process_pipeline(
-            feed_name,
-            &feed.process,
-            keys,
-            staging_dir.path(),
-            downloaded_files.clone(),
-        ) {
+        let feed_name_owned = feed_name.to_string();
+        let steps           = feed.process.clone();
+        let keys_owned      = keys.clone();
+        let staging_path    = staging_dir.path().to_path_buf();
+        let files_in        = downloaded_files.clone();
+        let pipeline_result = tokio::task::spawn_blocking(move || {
+            apply_process_pipeline(
+                &feed_name_owned,
+                &steps,
+                &keys_owned,
+                &staging_path,
+                files_in,
+            )
+        }).await;
+        let pipeline_result = match pipeline_result {
+            Ok(r)  => r,
+            Err(e) => Err(format!("process pipeline task panicked: {}", e)),
+        };
+        match pipeline_result {
             Ok(new_files) => {
                 downloaded_files = new_files;
             }
@@ -663,38 +695,44 @@ pub async fn run_feed(
             feed_name
         );
 
-        for (src, files) in &source_file_map {
+        for (src, files, kept_transport) in source_file_map.into_iter() {
             if files.is_empty() {
                 continue;
             }
 
-            let ep = match endpoints.get(&src.endpoint) {
-                Some(ep) => ep,
+            // Reuse the phase-1 transport when we kept it. Falling
+            // back to a fresh connect handles the case where it was
+            // dropped (delete_source_after_transfer=false) or
+            // somehow turned None — defense in depth.
+            let transport: Box<dyn Transport> = match kept_transport {
+                Some(t) => t,
                 None => {
-                    warn!(
-                        "run_feed '{}': source endpoint '{}' missing from \
-                         config during cleanup; skipping",
-                        feed_name, src.endpoint,
-                    );
-                    continue;
+                    let ep = match endpoints.get(&src.endpoint) {
+                        Some(ep) => ep,
+                        None => {
+                            warn!(
+                                "run_feed '{}': source endpoint '{}' missing \
+                                 from config during cleanup; skipping",
+                                feed_name, src.endpoint,
+                            );
+                            continue;
+                        }
+                    };
+                    match connect_endpoint(&src.endpoint, ep).await {
+                        Ok(t) => t,
+                        Err(e) => {
+                            warn!(
+                                "run_feed '{}': could not reconnect to '{}' \
+                                 for source cleanup: {}",
+                                feed_name, src.endpoint, e,
+                            );
+                            continue;
+                        }
+                    }
                 }
             };
-            let transport =
-                match connect_endpoint(&src.endpoint, ep).await {
-                    Ok(t) => t,
-                    Err(e) => {
-                        // Non-fatal: files were transferred but
-                        // source cleanup failed
-                        warn!(
-                        "run_feed '{}': could not reconnect to '{}' \
-                         for source cleanup: {}",
-                        feed_name, src.endpoint, e
-                    );
-                        continue;
-                    }
-                };
 
-            for file_name in files {
+            for file_name in &files {
                 let remote_path = transport.remote_path(&src.path, file_name);
                 if let Err(e) =
                     transport.delete(&remote_path).await

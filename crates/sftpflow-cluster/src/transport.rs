@@ -621,6 +621,32 @@ pub async fn run_grpc_server(
         .await
 }
 
+/// Variant of `run_grpc_server` that takes a pre-bound TCP
+/// listener. Lets `ClusterNode::start` bind synchronously before
+/// returning so the caller doesn't need a post-start sleep to
+/// "let tonic catch up" — the listener is already accepting
+/// connections when `start` returns.
+pub async fn run_grpc_server_with_listener(
+    listener:      tokio::net::TcpListener,
+    tls_cfg:       ServerTlsConfig,
+    raft_svc:      RaftServiceImpl,
+    admin_svc:     AdminServiceImpl,
+    bootstrap_svc: BootstrapServiceImpl,
+    forward_svc:   NdjsonForwardServiceImpl,
+) -> Result<(), tonic::transport::Error> {
+    let local = listener.local_addr().ok();
+    log::info!("cluster gRPC server listening (pre-bound) on {:?}", local);
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    Server::builder()
+        .tls_config(tls_cfg)?
+        .add_service(RaftServiceServer::new(raft_svc))
+        .add_service(AdminServiceServer::new(admin_svc))
+        .add_service(BootstrapServiceServer::new(bootstrap_svc))
+        .add_service(NdjsonForwardServiceServer::new(forward_svc))
+        .serve_with_incoming(incoming)
+        .await
+}
+
 // Suppress unused warnings on RemoteError import (kept for future
 // use when we forward leader-side errors back to the caller).
 #[allow(dead_code)]

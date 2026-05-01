@@ -15,7 +15,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -176,6 +176,19 @@ pub fn run(
 // TCP listener
 // ============================================================
 
+/// Per-connection read timeout. Caps how long a stalled CLI can
+/// pin a daemon worker thread waiting for the next NDJSON line.
+/// Long enough to outlast a slow human typing in an interactive
+/// session, short enough that a half-open TCP from a crashed CLI
+/// doesn't survive forever.
+const NDJSON_READ_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Per-connection write timeout. A misbehaving peer that stops
+/// reading would otherwise block our writer indefinitely (NDJSON
+/// responses are small but can fan up to ~1 MiB for ListSecrets
+/// on a populated daemon).
+const NDJSON_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+
 fn serve_tcp(addr: &str, state: SharedDaemonState) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr)?;
     info!("tcp listener bound to {}", addr);
@@ -185,6 +198,16 @@ fn serve_tcp(addr: &str, state: SharedDaemonState) -> std::io::Result<()> {
             Ok(stream) => {
                 let peer = stream.peer_addr().ok();
                 info!("connection accepted from {:?}", peer);
+                // Cap how long a stalled CLI can hold this worker
+                // thread blocked on read or write. Errors logged
+                // and ignored — a kernel that rejects timeouts is
+                // not a fatal startup condition.
+                if let Err(e) = stream.set_read_timeout(Some(NDJSON_READ_TIMEOUT)) {
+                    warn!("tcp: set_read_timeout failed: {}", e);
+                }
+                if let Err(e) = stream.set_write_timeout(Some(NDJSON_WRITE_TIMEOUT)) {
+                    warn!("tcp: set_write_timeout failed: {}", e);
+                }
                 let state = Arc::clone(&state);
                 std::thread::spawn(move || {
                     if let Err(e) = handle_tcp(stream, state) {
@@ -239,6 +262,15 @@ fn serve_unix(path: &str, state: SharedDaemonState) -> std::io::Result<()> {
         match incoming {
             Ok(stream) => {
                 info!("unix connection accepted");
+                // Same per-connection read/write caps as the TCP
+                // path. UnixStream supports set_read_timeout /
+                // set_write_timeout via the same API as TcpStream.
+                if let Err(e) = stream.set_read_timeout(Some(NDJSON_READ_TIMEOUT)) {
+                    warn!("unix: set_read_timeout failed: {}", e);
+                }
+                if let Err(e) = stream.set_write_timeout(Some(NDJSON_WRITE_TIMEOUT)) {
+                    warn!("unix: set_write_timeout failed: {}", e);
+                }
                 let state = Arc::clone(&state);
                 std::thread::spawn(move || {
                     if let Err(e) = handle_unix(stream, state) {
@@ -572,14 +604,14 @@ fn dispatch_local_inner(env: RequestEnvelope, state: &SharedDaemonState) -> Resp
             };
 
             // execute_run_feed() in handlers.rs - no daemon lock held here
-            let (result, duration, started_at, feed_name) =
+            let (result, duration, started_at, started_unix, feed_name) =
                 handlers::execute_run_feed(prep);
 
             // record_run_history() in handlers.rs
             {
                 let guard = state.lock().unwrap();
                 handlers::record_run_history(
-                    &guard, &feed_name, &started_at, duration, &result,
+                    &guard, &feed_name, &started_at, started_unix, duration, &result,
                 );
             }
 

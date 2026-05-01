@@ -17,7 +17,6 @@
 // keys only.
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use log::{info, warn};
@@ -114,18 +113,19 @@ pub fn encrypt_files(
         let new_name = format!("{}.pgp", file_name);
         let out_path = staging_dir.join(&new_name);
 
-        let plaintext = fs::read(&in_path).map_err(|e| {
-            PgpError::Io(format!(
-                "read {}: {}",
-                in_path.display(),
-                e
-            ))
+        // Stream input → sequoia pipeline → output file. The
+        // earlier code buffered the full plaintext AND the full
+        // ciphertext in two separate Vec<u8>s, peak ~2x file size
+        // in RAM. Using io::copy through the LiteralWriter caps
+        // memory at sequoia's internal buffer (a few KB).
+        let mut in_file = fs::File::open(&in_path).map_err(|e| {
+            PgpError::Io(format!("read {}: {}", in_path.display(), e))
         })?;
-
-        // ---- streaming encrypt pipeline ----
-        let mut sink = Vec::with_capacity(plaintext.len() + 512);
+        let mut out_file = fs::File::create(&out_path).map_err(|e| {
+            PgpError::Io(format!("create {}: {}", out_path.display(), e))
+        })?;
         {
-            let message = Message::new(&mut sink);
+            let message = Message::new(&mut out_file);
             let message = Armorer::new(message).build().map_err(|e| {
                 PgpError::Crypto(format!("armorer: {}", e))
             })?;
@@ -143,20 +143,18 @@ pub fn encrypt_files(
                 .map_err(|e| {
                     PgpError::Crypto(format!("literal writer: {}", e))
                 })?;
-            literal.write_all(&plaintext).map_err(|e| {
-                PgpError::Crypto(format!("literal write: {}", e))
+            std::io::copy(&mut in_file, &mut literal).map_err(|e| {
+                PgpError::Crypto(format!("literal stream copy: {}", e))
             })?;
             literal.finalize().map_err(|e| {
                 PgpError::Crypto(format!("finalize: {}", e))
             })?;
         }
-
-        fs::write(&out_path, &sink).map_err(|e| {
-            PgpError::Io(format!(
-                "write {}: {}",
-                out_path.display(),
-                e
-            ))
+        // Drop the input handle before we delete it (some
+        // platforms refuse to remove an open file).
+        drop(in_file);
+        out_file.sync_all().map_err(|e| {
+            PgpError::Io(format!("fsync {}: {}", out_path.display(), e))
         })?;
 
         // Remove the original plaintext — the pipeline replaces it.
@@ -227,12 +225,15 @@ pub fn decrypt_files(
         let new_name = strip_pgp_extension(file_name);
         let out_path = staging_dir.join(&new_name);
 
-        let ciphertext = fs::read(&in_path).map_err(|e| {
-            PgpError::Io(format!(
-                "read {}: {}",
-                in_path.display(),
-                e
-            ))
+        // Stream ciphertext through the decryptor into a tempfile
+        // sibling, then rename onto the final output path. Two
+        // benefits over the previous "read all → decrypt → write
+        // all" path: peak memory is ~one sequoia internal buffer
+        // (a few KB) instead of 2x file size, and the in==out
+        // case (no .pgp extension to strip) doesn't truncate the
+        // input mid-read.
+        let in_file = fs::File::open(&in_path).map_err(|e| {
+            PgpError::Io(format!("read {}: {}", in_path.display(), e))
         })?;
 
         let policy = StandardPolicy::new();
@@ -242,7 +243,7 @@ pub fn decrypt_files(
             require_signature,
         };
 
-        let mut decryptor = DecryptorBuilder::from_bytes(&ciphertext[..])
+        let mut decryptor = DecryptorBuilder::from_reader(in_file)
             .map_err(|e| {
                 PgpError::Crypto(format!(
                     "decryptor setup for {}: {}",
@@ -259,25 +260,33 @@ pub fn decrypt_files(
                 ))
             })?;
 
-        let mut plaintext = Vec::with_capacity(ciphertext.len());
-        std::io::copy(&mut decryptor, &mut plaintext).map_err(|e| {
+        // tempfile_in keeps the staging file on the same FS as the
+        // final destination so the post-decrypt rename is atomic.
+        let mut out_tmp = tempfile::NamedTempFile::new_in(staging_dir)
+            .map_err(|e| PgpError::Io(format!("create tempfile in staging: {}", e)))?;
+        std::io::copy(&mut decryptor, out_tmp.as_file_mut()).map_err(|e| {
             PgpError::Crypto(format!(
-                "read plaintext from {}: {}",
-                in_path.display(),
-                e
+                "stream plaintext from {}: {}",
+                in_path.display(), e,
             ))
         })?;
+        out_tmp.as_file().sync_all().map_err(|e| {
+            PgpError::Io(format!("fsync tempfile: {}", e))
+        })?;
 
-        fs::write(&out_path, &plaintext).map_err(|e| {
+        // We need the input file gone (or replaced) before
+        // writing the destination, especially in the in==out
+        // case. The persist below handles both the collision
+        // (overwrite) and the strip-suffix (rename) cases.
+        out_tmp.persist(&out_path).map_err(|e| {
             PgpError::Io(format!(
-                "write {}: {}",
-                out_path.display(),
-                e
+                "rename tempfile -> {}: {}",
+                out_path.display(), e,
             ))
         })?;
 
         // Remove the ciphertext unless the input and output paths
-        // collide (i.e. there was no pgp/gpg/asc extension to strip).
+        // collide (in which case persist() already replaced it).
         if in_path != out_path {
             if let Err(e) = fs::remove_file(&in_path) {
                 warn!(

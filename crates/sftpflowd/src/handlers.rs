@@ -42,7 +42,7 @@ use crate::backup; // backup.rs - hot snapshot + cold restore
 use crate::dkron::DkronClient; // dkron.rs
 use crate::secrets::SecretStore; // secrets.rs
 use crate::server::{DaemonPaths, DaemonState};
-use crate::time_fmt::iso8601_now; // time_fmt.rs - shared UTC helpers
+use crate::time_fmt::now_unix_and_iso; // time_fmt.rs - shared UTC helpers
 
 // ============================================================
 // Helpers
@@ -560,12 +560,16 @@ pub fn rename_feed(
 /// daemon mutex is released. Built under the lock by
 /// `prepare_run_feed` so the transfer runs without holding it.
 pub struct RunPrep {
-    pub feed_name:  String,
-    pub feed:       Feed,
-    pub endpoints:  BTreeMap<String, Endpoint>,
-    pub keys:       BTreeMap<String, PgpKey>,
-    pub started_at: String,
-    pub timer:      Instant,
+    pub feed_name:    String,
+    pub feed:         Feed,
+    pub endpoints:    BTreeMap<String, Endpoint>,
+    pub keys:         BTreeMap<String, PgpKey>,
+    pub started_at:   String,
+    /// Wall-clock unix-seconds captured at the same instant as
+    /// `started_at`. Stored on the run-history row so SQLite can
+    /// sort by a type-correct numeric column instead of a string.
+    pub started_unix: i64,
+    pub timer:        Instant,
 }
 
 /// Phase 1 of RunFeedNow: validate the feed exists, clone the
@@ -603,12 +607,14 @@ pub fn prepare_run_feed(
         ));
     }
 
+    let (started_unix, started_at) = now_unix_and_iso();
     Ok(RunPrep {
         feed_name:  name.to_string(),
         feed,
         endpoints,
         keys,
-        started_at: iso8601_now(),
+        started_at,
+        started_unix,
         timer:      Instant::now(),
     })
 }
@@ -619,8 +625,12 @@ pub fn prepare_run_feed(
 ///
 /// Returns the run result plus the timing/identity bits the caller
 /// needs to record the run in SQLite afterward.
-pub fn execute_run_feed(prep: RunPrep) -> (RunResult, std::time::Duration, String, String) {
-    let RunPrep { feed_name, feed, endpoints, keys, started_at, timer } = prep;
+pub fn execute_run_feed(
+    prep: RunPrep,
+) -> (RunResult, std::time::Duration, String, i64, String) {
+    let RunPrep {
+        feed_name, feed, endpoints, keys, started_at, started_unix, timer,
+    } = prep;
 
     // Build a single-threaded tokio runtime for the transfer.
     // The daemon is thread-per-connection, so each RunFeedNow
@@ -654,21 +664,22 @@ pub fn execute_run_feed(prep: RunPrep) -> (RunResult, std::time::Duration, Strin
         feed_name, result.status, result.files_transferred, duration.as_secs_f64()
     );
 
-    (result, duration, started_at, feed_name)
+    (result, duration, started_at, started_unix, feed_name)
 }
 
 /// Phase 3 of RunFeedNow: record the run in SQLite. Caller holds
 /// the daemon mutex briefly for this — it's a single INSERT.
 /// Best-effort: a missing `run_db` is silently skipped.
 pub fn record_run_history(
-    state: &DaemonState,
-    feed_name: &str,
-    started_at: &str,
-    duration: std::time::Duration,
-    result: &RunResult,
+    state:        &DaemonState,
+    feed_name:    &str,
+    started_at:   &str,
+    started_unix: i64,
+    duration:     std::time::Duration,
+    result:       &RunResult,
 ) {
     if let Some(ref db) = state.run_db {
-        db.record_run(feed_name, started_at, duration, result);
+        db.record_run(feed_name, started_at, started_unix, duration, result);
     }
 }
 
